@@ -168,12 +168,18 @@ class ChatlyticsAdapter:
         def _health() -> tuple[dict, int]:
             return {"status": "ok"}, 200
 
+        def _run_flask() -> None:
+            try:
+                app.run(
+                    host="0.0.0.0",
+                    port=self.webhook_port,
+                    use_reloader=False,
+                )
+            except Exception:
+                logger.exception("Webhook server crashed")
+
         self._webhook_server = threading.Thread(
-            target=lambda: app.run(
-                host="0.0.0.0",
-                port=self.webhook_port,
-                use_reloader=False,
-            ),
+            target=_run_flask,
             daemon=True,
         )
         self._webhook_server.start()
