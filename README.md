@@ -1,18 +1,16 @@
-# Chatlytics Hermes Adapter
+# chatlytics-hermes
 
 Hermes Agent platform adapter for Chatlytics WhatsApp.
 
 ## Install
 
 ```bash
-pip install .
+pip install chatlytics-hermes
 ```
 
-Or with dev dependencies:
+## Requirements
 
-```bash
-pip install -e ".[dev]"
-```
+- Python >= 3.10
 
 ## Configure
 
@@ -22,7 +20,7 @@ from chatlytics_adapter import ChatlyticsAdapter
 adapter = ChatlyticsAdapter(
     base_url="http://localhost:8050",
     api_key="your-api-key",
-    account_id="3cf11776_logan",   # optional — locks to one WAHA session
+    account_id="3cf11776_logan",   # optional -- locks to one WAHA session
     webhook_port=9090,             # inbound webhook listener port
 )
 ```
@@ -77,3 +75,21 @@ adapter = ChatlyticsAdapter(
 agent = Agent(platform=adapter)
 agent.run()
 ```
+
+## Entry Point
+
+```toml
+[project.entry-points."hermes.adapters"]
+chatlytics = "chatlytics_adapter:ChatlyticsAdapter"
+```
+
+## Development
+
+```bash
+pip install chatlytics-hermes[test]
+pytest
+```
+
+## License
+
+MIT
