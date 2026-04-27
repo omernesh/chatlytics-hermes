@@ -63,25 +63,19 @@ Point Chatlytics webhook config at `http://<host>:9090/webhook`.
 
 ## Integrate with Hermes Agent
 
-```python
-from hermes_agent import Agent
-from chatlytics_adapter import ChatlyticsAdapter
+This package is a standalone duck-typed shim — it talks to the Chatlytics
+gateway over HTTP and does not subclass Hermes's `BasePlatformAdapter`. To
+plug Chatlytics into an actual Hermes monorepo install you need a vendored
+adapter at `gateway/platforms/chatlytics.py` that subclasses
+`BasePlatformAdapter` and is registered in `gateway/run.py:_create_adapter()`.
+See phase 169 ("vendor into hpg6 Hermes") for that work.
 
-adapter = ChatlyticsAdapter(
-    base_url="http://localhost:8050",
-    api_key="your-api-key",
-)
+For ad-hoc scripts that just want an httpx wrapper around the Chatlytics
+gateway API without dragging in the full Hermes runtime, the standalone
+`ChatlyticsAdapter` in this package is sufficient — see the **Configure**
+and **Usage** sections above.
 
-agent = Agent(platform=adapter)
-agent.run()
-```
-
-## Entry Point
-
-```toml
-[project.entry-points."hermes.adapters"]
-chatlytics = "chatlytics_adapter:ChatlyticsAdapter"
-```
+Verified compatible with `hermes-agent==0.11.0` (tag `v2026.4.23`).
 
 ## Development
 

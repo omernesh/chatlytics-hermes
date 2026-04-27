@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chatlytics-hermes"
-version = "1.0.0"
+version = "1.1.0"
 description = "Hermes Agent platform adapter for Chatlytics WhatsApp"
 license = {text = "MIT"}
 readme = "README.md"
@@ -24,6 +24,3 @@ test = ["pytest>=8.0", "pytest-asyncio>=0.23", "respx>=0.21"]
 [project.urls]
 Homepage = "https://github.com/omernesh/openclaw-waha-plugin"
 Repository = "https://github.com/omernesh/openclaw-waha-plugin/tree/main/integrations/hermes"
-
-[project.entry-points."hermes.adapters"]
-chatlytics = "chatlytics_adapter:ChatlyticsAdapter"
