@@ -1,0 +1,21 @@
+{
+  "project_code": "HERMES",
+  "mode": "yolo",
+  "granularity": "standard",
+  "parallelization": true,
+  "commit_docs": true,
+  "model_profile": "balanced",
+  "workflow": {
+    "research": true,
+    "plan_check": true,
+    "verifier": true,
+    "nyquist_validation": false,
+    "auto_advance": true,
+    "skip_discuss": false,
+    "code_review": true,
+    "_auto_chain_active": false
+  },
+  "graphify": {
+    "enabled": false
+  }
+}
