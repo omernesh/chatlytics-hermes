@@ -1,0 +1,150 @@
+"""HERMES-01 acceptance tests for the chatlytics-hermes plugin contract.
+
+These tests cover ROADMAP Phase 1 acceptance criteria 1, 2, 3, 5 in
+pytest form.  Acceptance criterion 4 (clean-venv install with
+hermes-agent installed) runs out-of-process via the dockerized smoke
+documented in PLAN.md Task 3 and is exercised in HERMES-06 CI.
+
+The tests deliberately avoid invoking ``adapter_factory`` so that the
+suite runs without ``hermes-agent`` installed -- the import shim in
+``chatlytics_hermes.adapter`` lets the bare-import smoke (criterion 1)
+pass in any env.  HERMES-02 will add the first hermes-required
+integration test once ``connect()`` is implemented.
+"""
+
+from __future__ import annotations
+
+import sys
+import tomllib
+from pathlib import Path
+from typing import Any, Dict, List
+
+import yaml
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+class MockCtx:
+    """Minimal stand-in for the Hermes plugin registration context.
+
+    HERMES-01 only exercises ``register_platform``; later phases extend
+    this mock as additional ``ctx`` methods (``register_tool``,
+    ``register_route``, etc.) become required.
+    """
+
+    def __init__(self) -> None:
+        self.platforms: List[Dict[str, Any]] = []
+
+    def register_platform(self, **kwargs: Any) -> None:
+        self.platforms.append(kwargs)
+
+
+def test_register_is_callable() -> None:
+    """Acceptance criterion 1: the package exposes a callable ``register``."""
+    from chatlytics_hermes import register
+
+    assert callable(register)
+    assert register.__name__ == "register"
+
+
+def test_register_adds_chatlytics_platform() -> None:
+    """Acceptance criterion 2 (the ROADMAP-named test)."""
+    from chatlytics_hermes import register
+
+    ctx = MockCtx()
+    register(ctx)
+
+    assert len(ctx.platforms) == 1, (
+        "register() must call ctx.register_platform exactly once"
+    )
+
+    entry = ctx.platforms[0]
+    assert entry["name"] == "chatlytics"
+    assert entry["label"] == "Chatlytics WhatsApp"
+    assert callable(entry["adapter_factory"])
+    assert entry["required_env"] == ["CHATLYTICS_BASE_URL", "CHATLYTICS_API_KEY"]
+    assert entry["install_hint"].startswith("pip install")
+    assert "platform_hint" in entry
+    hint = entry["platform_hint"]
+    assert "Chatlytics" in hint or "WhatsApp" in hint
+
+
+def test_register_does_not_declare_deferred_hooks() -> None:
+    """Scope discipline: HERMES-01 must NOT register hooks owned by later phases.
+
+    HERMES-03 will add ``env_enablement_fn`` + the webhook config bridge,
+    HERMES-04 will add ``cron_deliver_env_var`` + ``standalone_sender_fn``.
+    Catching them here ensures the executor stuck to the locked scope.
+    """
+    from chatlytics_hermes import register
+
+    ctx = MockCtx()
+    register(ctx)
+    entry = ctx.platforms[0]
+
+    deferred_hooks = {
+        "env_enablement_fn",
+        "apply_yaml_config_fn",
+        "cron_deliver_env_var",
+        "standalone_sender_fn",
+        "check_fn",
+        "validate_config",
+        "is_connected",
+        "setup_fn",
+        "allowed_users_env",
+        "allow_all_env",
+    }
+    leaked = deferred_hooks & set(entry)
+    assert not leaked, f"HERMES-01 leaked hooks owned by later phases: {leaked}"
+
+
+def test_plugin_yaml_is_valid() -> None:
+    """Acceptance criterion 3: ``plugin.yaml`` is valid YAML with the right shape."""
+    manifest = yaml.safe_load((REPO_ROOT / "plugin.yaml").read_text(encoding="utf-8"))
+
+    assert manifest["name"] == "chatlytics"
+    assert manifest["kind"] == "platform"
+    assert manifest["version"] == "2.0.0"
+
+    required = {entry["name"] for entry in manifest["requires_env"]}
+    assert required == {"CHATLYTICS_BASE_URL", "CHATLYTICS_API_KEY"}
+
+    # Optional env should include the webhook + cron knobs that later
+    # phases consume.  Asserting the set keeps the manifest honest.
+    optional = {entry["name"] for entry in manifest["optional_env"]}
+    assert {
+        "CHATLYTICS_ACCOUNT_ID",
+        "CHATLYTICS_WEBHOOK_PORT",
+        "CHATLYTICS_WEBHOOK_SECRET",
+        "CHATLYTICS_HOME_CHANNEL",
+    } <= optional
+
+    # API key + webhook secret must be marked as password fields so the
+    # ``hermes config`` wizard masks them on entry.
+    by_name = {entry["name"]: entry for entry in (
+        manifest["requires_env"] + manifest["optional_env"]
+    )}
+    assert by_name["CHATLYTICS_API_KEY"]["password"] is True
+    assert by_name["CHATLYTICS_WEBHOOK_SECRET"]["password"] is True
+
+
+def test_pyproject_declares_hermes_entry_point() -> None:
+    """Acceptance criterion 5 + dependency-pin sanity in test form."""
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    entry_points = data["project"]["entry-points"]["hermes_agent.plugins"]
+    assert entry_points["chatlytics"] == "chatlytics_hermes:register"
+
+    project = data["project"]
+    assert project["version"] == "2.0.0"
+    assert project["name"] == "chatlytics-hermes"
+
+    deps = project["dependencies"]
+    assert any(dep.startswith("hermes-agent>=0.14") for dep in deps), (
+        "hermes-agent must be pinned to >=0.14,<0.15 per ROADMAP"
+    )
+    assert any(dep.startswith("httpx>=0.27") for dep in deps)
+    assert any(dep.startswith("aiohttp>=3.9") for dep in deps)
+    assert all(not dep.startswith("flask") for dep in deps), (
+        "flask must be removed; HERMES-03 uses aiohttp for the webhook server"
+    )
