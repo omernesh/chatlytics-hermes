@@ -1,5 +1,141 @@
 # Changelog
 
+## [2.1.0] -- 2026-05-17
+
+Tech-debt resolution + critical safety fixes carried over from the v2.0
+milestone-wide reviews. **Additive, not breaking.** v2.1.0 is a drop-in
+upgrade from v2.0.0 -- the 21-tool surface, the `BasePlatformAdapter`
+contract, the `register(ctx)` entry point, and every public API signature
+stay identical. Internal `_keep_typing` shape changed to match the
+upstream base coroutine signature; in-plugin callers transparently use
+the new `_typing_scope` async-cm helper, so no external migration is
+required.
+
+### Security
+
+- **BL-01 (BLOCKER) fixed.** `_keep_typing` was an `@asynccontextmanager`
+  in v2.0, but the upstream Hermes base calls it as
+  `asyncio.create_task(self._keep_typing(chat_id, metadata=..., stop_event=...))`
+  -- which would have crashed on the first production inbound message
+  with a `TypeError` (async-cm return value is not awaitable; chatlytics
+  also didn't accept the `metadata` kwarg). The fix rewrites the method
+  as a plain coroutine matching the base signature
+  `(self, chat_id, interval=30.0, metadata=None, stop_event=None)` and
+  extracts a new `_typing_scope` async-cm helper for the in-plugin tool
+  handler ergonomics. Hidden in v2.0 because `tests/test_inbound.py`
+  replaced `handle_message` with a recorder and never exercised the
+  base path.
+- **HI-01 (HIGH) fixed.** Tool surface exposed an arbitrary local-file
+  read primitive: the 5 media tools accepted `filePath` with zero
+  validation, so a prompt-injected `chatlytics_send_file(filePath="/etc/passwd")`
+  would have exfiltrated arbitrary host files to Chatlytics. v2.1.0
+  introduces a new env-configured allowlist
+  `CHATLYTICS_UPLOAD_ALLOWED_ROOTS` (OS-pathsep-separated absolute
+  paths). When unset, local-file uploads are default-deny; every
+  `filePath` value must resolve under a configured allowed root or the
+  tool returns `{"success": False, "error": "..."}` without opening or
+  uploading the file. URL-based uploads via `mediaUrl` are unaffected.
+- **HI-03 (HIGH) fixed.** Two of six media overrides
+  (`send_image`, `send_animation`) dropped `**kwargs` in v2.0, making
+  the plugin brittle to upstream `BasePlatformAdapter` signature
+  evolution (subsequent base-class kwargs would have been silently
+  unsupported). v2.1.0 brings all six media overrides to a consistent
+  shape with `**kwargs: Any` swallowed for forward-compat.
+
+### Added
+
+- `CHATLYTICS_UPLOAD_ALLOWED_ROOTS` env var -- OS-pathsep-separated
+  absolute paths under which media tools may read local files (default
+  deny when unset). See README "Security: filePath upload allowlist".
+- `scripts/smoke.sh --fast` flag -- host-venv pytest only, no docker.
+  ~10-20s vs ~60-90s for the full dockerized smoke. Opt-in; default
+  behavior unchanged for release-gate use.
+- `pip install --retries 3` on the dockerized smoke step -- transient
+  GitHub outages no longer look like plugin bugs.
+- `tests/test_live_loader.py` -- gateway-loader integration smoke
+  asserting `register(ctx)` runs against a real `PluginContext`-shaped
+  registry and all 21 tools land. Closes the test-harness gap that hid
+  BL-01.
+- `tests/test_concurrency.py` -- regression guard for the v2.0
+  `_resolve_media_url` `asyncio.to_thread` fix; verifies concurrent
+  media-tool calls don't serialize on file I/O.
+- `tests/test_observability.py` -- caplog-based assertions on log
+  levels, dropped-metadata WARNINGs, and api-key/Bearer-token absence
+  from log records.
+- `webhook_path` validation in `ChatlyticsAdapter.__init__` -- rejects
+  empty, missing leading slash, contains `?` / `#`, or collides with
+  the reserved `/health` route. Raises `ValueError` at construction
+  (fail-fast, matches Hermes conventions).
+- Conftest session-autouse `platform_registry` fixture is now
+  teardown-clean: snapshots the registry at session start, restores at
+  session end. Two pytest runs in succession produce identical results.
+- `tests/_fixtures.py::FakePlatformConfig` -- single source of truth
+  for the test fake; previously duplicated across 7 test files.
+
+### Changed
+
+- `send_typing` transport-error log level: WARNING -> DEBUG (log
+  hygiene; users were seeing routine gateway flakiness at WARN). The
+  WARNING level is reserved for truly unexpected states.
+- `chatlytics_login` semantics: when the upstream API returns
+  `{"success": True, "webhook_registered": False}`, the tool now
+  returns `{"success": False, "error": "webhook_registered=false"}`
+  -- aligns with the Chatlytics Claude Code MCP bundle's behavior so
+  agents on either surface see consistent results.
+- Success-shape coercion is now a single canonical helper used by
+  `_make_send_result`, `_standalone_send`, and `tools._ok` (MD-01
+  cross-phase consistency dedup). Identical observable behavior across
+  all three call sites.
+
+### Fixed
+
+- Silent `ctx.get_platform("chatlytics")` failures inside
+  `_make_tool_handler` now emit a DEBUG log so operators can diagnose
+  toolset misconfiguration without attaching a debugger.
+- `send()` reserved-name metadata keys (e.g. caller passing `chatId`
+  or `text` in `**extras`) now emit a WARNING per dropped key instead
+  of silently discarding.
+- `plugin.yaml` `optional_env` descriptions no longer leak internal
+  phase identifiers (`(HERMES-03)`, `(HERMES-04)` stripped). Closes
+  PR-review **MED-04** -- end users in `hermes config` UI now see
+  feature-oriented descriptions instead of milestone metadata.
+- Conftest cross-test pollution: re-running the suite twice in a row
+  no longer leaves a dirty platform registry between runs.
+
+### Docs
+
+- README has a `## What's new in v2.1` section near the top calling
+  out the security fixes and the upgrade recommendation.
+- README "Tool catalog" clarifies the `chatlytics_actions` (GET
+  gateway action catalog) vs `chatlytics_dispatch` (POST generic
+  action invocation) semantic split (closes 05-MED-01 docs).
+- README has a `## Known issues` section documenting that
+  `filename` for URL-path documents may or may not be honored by the
+  Chatlytics gateway (closes 04-LOW-02 docs; tracks upstream).
+
+### Test infra
+
+- Conftest teardown contract added (closes 02-MED-02).
+- `_FakePlatformConfig` consolidated into `tests/_fixtures.py`
+  (closes PR-review cross-cutting fixture-duplication nit).
+- 88 tests total (was 65 in v2.0): +12 live-loader, +5 path-traversal
+  negatives, +3 concurrency, +7 observability, -4 retired duplicates.
+
+### Internal
+
+- Log hygiene sweep across `adapter.py`, `client.py`, `tools.py`,
+  `inbound.py` -- no api_key or full phone numbers surface in any log
+  record (verified by `tests/test_observability.py::test_no_api_key_in_any_log_record`).
+- Documented loader contract findings in
+  `src/chatlytics_hermes/__init__.py` docstring (Phase 7).
+- `_typing_scope` async-cm extracted so in-plugin tool handlers keep
+  `async with self._typing_scope(chat_id):` ergonomics while the
+  base-callable `_keep_typing` matches the upstream coroutine
+  contract.
+
+**Recommended for all users.** v2.0.0 has known BLOCKER + HIGH
+security issues fixed in this release.
+
 ## 2.0.0 (2026-05-17) -- BREAKING
 
 Full rebuild of `chatlytics-hermes` as a first-class Hermes Agent plugin
