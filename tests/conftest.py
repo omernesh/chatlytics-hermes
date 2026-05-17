@@ -8,8 +8,9 @@ only when the name is either (a) a bundled plugin under
 ``gateway.platform_registry.platform_registry``.
 
 We seed the registry once per test session so all ``Platform("chatlytics")``
-lookups succeed.  This mirrors what the real ``PluginContext.register_platform``
-would do at gateway startup.
+lookups succeed. HERMES-11 adds idempotent teardown so the registration
+does not leak when the suite is embedded in a larger cross-plugin
+pytest run (closes 02-MED-02 / IN-03).
 """
 
 from __future__ import annotations
@@ -22,15 +23,28 @@ def _register_chatlytics_platform():
     """Register the chatlytics platform in gateway.platform_registry.
 
     Required so ``Platform("chatlytics")`` resolves to a pseudo-member
-    inside ``BasePlatformAdapter.__init__``.  Hermes-side this is done
-    by ``PluginContext.register_platform`` -- we replicate the minimum
+    inside ``BasePlatformAdapter.__init__``. Hermes-side this is done
+    by ``PluginContext.register_platform``; we replicate the minimum
     surface here for the unit-test environment.
+
+    Teardown unregisters the entry **only if this fixture registered
+    it** (idempotency guard). When embedded in a larger run where
+    another fixture already registered chatlytics, leave the existing
+    registration untouched.
     """
     try:
         from gateway.platform_registry import platform_registry, PlatformEntry
     except ImportError:
-        # hermes-agent not installed -- tests that need it will fail with
-        # a clearer error than ImportError on import of the fixture itself.
+        # hermes-agent not installed -- tests that need it will fail
+        # with a clearer error than ImportError on import of the
+        # fixture itself.
+        yield
+        return
+
+    # Idempotency guard: if chatlytics is already registered (embedded
+    # run, prior session leak), leave the existing entry alone and
+    # skip teardown so we don't yank state another consumer owns.
+    if platform_registry.is_registered("chatlytics"):
         yield
         return
 
@@ -44,4 +58,13 @@ def _register_chatlytics_platform():
         source="plugin",
     )
     platform_registry.register(entry)
-    yield
+    try:
+        yield
+    finally:
+        try:
+            platform_registry.unregister("chatlytics")
+        except Exception:
+            # Cleanup must never fail the test session. Swallow
+            # whatever the registry raises (missing entry, repeated
+            # teardown, etc.) and move on.
+            pass

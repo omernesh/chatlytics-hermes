@@ -18,12 +18,66 @@
 # Exits 0 on full success, non-zero otherwise.
 #
 # Usage:
-#   bash scripts/smoke.sh
+#   bash scripts/smoke.sh            # full dockerized smoke (release path)
+#   bash scripts/smoke.sh --fast     # host-venv pytest only (local iteration)
+#   bash scripts/smoke.sh --help     # show this help
 #
-# Requires: docker.
+# Requires (default mode): docker.
+# Requires (--fast mode): host venv with hermes-agent + plugin installed.
+#
+# HERMES-11:
+#  - Added --fast flag (closes 06-LOW-01: skip docker for local
+#    iteration; opt-in -- default behavior preserved).
+#  - Added --retries 3 to pip install commands (closes PR-MED-03:
+#    transient GitHub outages no longer look like plugin bugs).
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# --- Argument parsing ---------------------------------------------------------
+
+FAST=0
+for arg in "$@"; do
+  case "$arg" in
+    --fast)
+      FAST=1
+      ;;
+    -h|--help)
+      cat <<'USAGE'
+Usage: scripts/smoke.sh [--fast]
+
+Modes:
+  (default)   Full dockerized smoke: fresh python:3.13-slim, pip install
+              hermes-agent from git+ tag, install plugin editable, run
+              pytest + live-loader. ~60-90s on a warm docker cache.
+  --fast      Skip docker; run pytest tests/ against the host venv.
+              Assumes hermes-agent + plugin already installed locally.
+              Used for local iteration -- NOT a substitute for the full
+              smoke before tagging a release. ~10-20s.
+
+Examples:
+  bash scripts/smoke.sh                 # release-gate smoke
+  bash scripts/smoke.sh --fast          # quick local pytest
+USAGE
+      exit 0
+      ;;
+    *)
+      echo "smoke.sh: unknown argument: $arg" >&2
+      echo "Run 'bash scripts/smoke.sh --help' for usage." >&2
+      exit 2
+      ;;
+  esac
+done
+
+# --- Fast path: host-venv pytest only -----------------------------------------
+
+if [ "$FAST" = "1" ]; then
+  echo "--- smoke --fast: host venv pytest only (no docker) ---"
+  cd "${REPO_DIR}"
+  exec python -m pytest tests/ -q --no-header
+fi
+
+# --- Default path: full dockerized smoke --------------------------------------
 
 # MSYS_NO_PATHCONV stops Git Bash on Windows from mangling the
 # container-side ``-w /work`` path into ``-w D:/.../work``.
@@ -36,9 +90,9 @@ MSYS_NO_PATHCONV=1 docker run --rm \
     apt-get update -qq >/dev/null 2>&1
     apt-get install -y -qq --no-install-recommends git ca-certificates >/dev/null 2>&1
 
-    pip install --quiet --no-cache-dir \
+    pip install --quiet --no-cache-dir --retries 3 \
         "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@v2026.5.16"
-    pip install --quiet --no-cache-dir -e ".[dev]"
+    pip install --quiet --no-cache-dir --retries 3 -e ".[dev]"
 
     echo "--- smoke step 1/3: import chatlytics_hermes.register ---"
     python -c "from chatlytics_hermes import register; print(f\"register OK: {register.__name__}\")"
