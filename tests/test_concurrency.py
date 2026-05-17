@@ -30,6 +30,7 @@ import respx
 
 from chatlytics_hermes.adapter import ChatlyticsAdapter
 from chatlytics_hermes.client import ChatlyticsClient
+from tests._fixtures import FakePlatformConfig
 
 pytestmark = pytest.mark.asyncio
 
@@ -39,20 +40,9 @@ API_KEY = "test-api-key-concurrency"
 CHAT_ID = "120363100000000000@g.us"
 
 
-class _FakePlatformConfig:
-    """Minimal PlatformConfig stand-in (mirrors tests/test_inbound.py)."""
-
-    def __init__(self, extra: Dict[str, Any]) -> None:
-        self.extra = extra
-        self.enabled = True
-        self.token = None
-        self.api_key = extra.get("api_key")
-        self.home_channel = extra.get("home_channel")
-
-
 def _make_adapter(*, upload_root: str = "") -> ChatlyticsAdapter:
     return ChatlyticsAdapter(
-        _FakePlatformConfig(
+        FakePlatformConfig(
             extra={
                 "base_url": BASE_URL,
                 "api_key": API_KEY,

@@ -17,6 +17,7 @@ import pytest
 import respx
 
 from chatlytics_hermes.adapter import ChatlyticsAdapter, ChatlyticsConnectError
+from tests._fixtures import FakePlatformConfig
 
 BASE_URL = "https://gateway.test.chatlytics.ai"
 API_KEY = "test-api-key-abc123"
@@ -27,28 +28,10 @@ CHAT_ID = "chat-001"
 EXPECTED_AUTH = f"Bearer {API_KEY}"
 
 
-class _FakePlatformConfig:
-    """Minimal PlatformConfig stand-in for tests.
-
-    We do not import the real PlatformConfig because the adapter only
-    touches ``getattr(config, "extra", {})``.  A namespace object is
-    sufficient and keeps tests insulated from upstream PlatformConfig
-    field churn.
-    """
-
-    def __init__(self, extra: Dict[str, Any]) -> None:
-        self.extra = extra
-        # Fields the base BasePlatformAdapter.__init__ accesses.
-        self.enabled = True
-        self.token = None
-        self.api_key = extra.get("api_key")
-        self.home_channel = extra.get("home_channel")
-
-
 @pytest.fixture
 def adapter() -> ChatlyticsAdapter:
     return ChatlyticsAdapter(
-        _FakePlatformConfig(
+        FakePlatformConfig(
             extra={
                 "base_url": BASE_URL,
                 "api_key": API_KEY,

@@ -29,6 +29,7 @@ from chatlytics_hermes.tools import (
     SEND_SCHEMA,
     chatlytics_login,
 )
+from tests._fixtures import FakePlatformConfig
 
 # Module-level marker omitted: section 1 + 2 tests are sync; section 3
 # login-semantics tests are async and individually marked.
@@ -38,30 +39,19 @@ BASE_URL = "https://gateway.test.chatlytics.ai"
 API_KEY = "test-api-key-validation"
 
 
-class _FakePlatformConfig:
-    """Minimal PlatformConfig stand-in for tests.
+def _make_config(**overrides: Any) -> FakePlatformConfig:
+    """Build a FakePlatformConfig with the standard base_url/api_key
+    pre-populated; tests override ``webhook_path`` etc.
 
-    Mirrors the helper in ``tests/test_outbound.py``; Phase 11 will
-    consolidate the duplication (out of scope here).
+    Phase 11 (HERMES-11) consolidated the previously copy-pasted
+    ``_FakePlatformConfig`` shim into ``tests/_fixtures.FakePlatformConfig``.
     """
-
-    def __init__(self, extra: Dict[str, Any]) -> None:
-        self.extra = extra
-        self.enabled = True
-        self.token = None
-        self.api_key = extra.get("api_key")
-        self.home_channel = extra.get("home_channel")
-
-
-def _make_config(**overrides: Any) -> _FakePlatformConfig:
-    """Build a _FakePlatformConfig with the standard base_url/api_key
-    pre-populated; tests override ``webhook_path`` etc."""
     extra: Dict[str, Any] = {
         "base_url": BASE_URL,
         "api_key": API_KEY,
     }
     extra.update(overrides)
-    return _FakePlatformConfig(extra=extra)
+    return FakePlatformConfig(extra=extra)
 
 
 # ---------------------------------------------------------------------------

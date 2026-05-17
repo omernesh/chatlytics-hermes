@@ -29,22 +29,12 @@ import respx
 from aiohttp.test_utils import unused_port
 
 from chatlytics_hermes.adapter import ChatlyticsAdapter
+from tests._fixtures import FakePlatformConfig
 
 BASE_URL = "https://gateway.test.chatlytics.ai"
 API_KEY = "test-api-key-abc123"
 CHAT_ID = "chat-001"
 WEBHOOK_SECRET = "shhh-very-secret"
-
-
-class _FakePlatformConfig:
-    """Minimal PlatformConfig stand-in (see tests/test_outbound.py)."""
-
-    def __init__(self, extra: Dict[str, Any]) -> None:
-        self.extra = extra
-        self.enabled = True
-        self.token = None
-        self.api_key = extra.get("api_key")
-        self.home_channel = extra.get("home_channel")
 
 
 def _make_adapter(
@@ -59,7 +49,7 @@ def _make_adapter(
     }
     if with_secret:
         extra["webhook_secret"] = WEBHOOK_SECRET
-    return ChatlyticsAdapter(_FakePlatformConfig(extra=extra))
+    return ChatlyticsAdapter(FakePlatformConfig(extra=extra))
 
 
 @pytest.fixture

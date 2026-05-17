@@ -37,6 +37,7 @@ import respx
 from chatlytics_hermes import register
 from chatlytics_hermes.adapter import ChatlyticsAdapter
 from chatlytics_hermes.tools import TOOLS
+from tests._fixtures import FakePlatformConfig
 
 pytestmark = pytest.mark.asyncio
 
@@ -115,17 +116,6 @@ class _CapturingContext:
 # --- Adapter construction helper (matches test_inbound._make_adapter) ---
 
 
-class _FakePlatformConfig:
-    """Minimal PlatformConfig stand-in (mirrors tests/test_inbound.py)."""
-
-    def __init__(self, extra: Dict[str, Any]) -> None:
-        self.extra = extra
-        self.enabled = True
-        self.token = None
-        self.api_key = extra.get("api_key")
-        self.home_channel = extra.get("home_channel")
-
-
 def _make_adapter(*, webhook_port: int = 0) -> ChatlyticsAdapter:
     """Construct an adapter against test-safe config (no real network).
 
@@ -139,7 +129,7 @@ def _make_adapter(*, webhook_port: int = 0) -> ChatlyticsAdapter:
         "webhook_port": webhook_port,
         "webhook_path": "/webhook",
     }
-    return ChatlyticsAdapter(_FakePlatformConfig(extra=extra))
+    return ChatlyticsAdapter(FakePlatformConfig(extra=extra))
 
 
 # ---------------------------------------------------------------------
