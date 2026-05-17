@@ -1,0 +1,38 @@
+name: chatlytics
+label: Chatlytics WhatsApp
+kind: platform
+version: 2.0.0
+description: >
+  Chatlytics WhatsApp gateway adapter for Hermes Agent. Connects Hermes to
+  Chatlytics's REST API for inbound webhooks and outbound messages/media.
+author: Chatlytics
+
+# ``requires_env`` entries are surfaced in ``hermes config`` UI via the
+# platform-plugin env var injector in ``hermes_cli/config.py``.
+requires_env:
+  - name: CHATLYTICS_BASE_URL
+    description: "Chatlytics gateway base URL (e.g. https://gateway.chatlytics.ai)"
+    prompt: "Chatlytics base URL"
+    password: false
+  - name: CHATLYTICS_API_KEY
+    description: "API key for Chatlytics REST authentication (Bearer token)"
+    prompt: "Chatlytics API key"
+    password: true
+
+optional_env:
+  - name: CHATLYTICS_ACCOUNT_ID
+    description: "Default session/account ID for outbound sends"
+    prompt: "Default account/session ID (optional)"
+    password: false
+  - name: CHATLYTICS_WEBHOOK_PORT
+    description: "Local port for the aiohttp webhook listener (default: 8765, filled in HERMES-03)"
+    prompt: "Webhook listener port"
+    password: false
+  - name: CHATLYTICS_WEBHOOK_SECRET
+    description: "HMAC-SHA256 shared secret for X-Chatlytics-Signature verification (HERMES-03)"
+    prompt: "Webhook HMAC secret (optional)"
+    password: true
+  - name: CHATLYTICS_HOME_CHANNEL
+    description: "Default chat_id for cron/notification delivery (HERMES-04)"
+    prompt: "Home channel chat_id (optional)"
+    password: false
