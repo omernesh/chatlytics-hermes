@@ -283,6 +283,57 @@ async def test_tools_post_json_decode_failure_logs_at_debug(
 # ---------------------------------------------------------------------------
 
 
+async def test_keep_typing_first_fire_emits_exactly_one_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """WARNING-01 regression (HERMES-09 fix-pass).
+
+    The pre-fix code logged TWO WARNINGs on the exception path because
+    the ``except Exception`` block set ``initial_ok = False`` and the
+    fall-through ``if not initial_ok`` block fired again.  Post-fix the
+    flow uses ``try/except/else`` so exactly one WARNING surfaces per
+    first-fire-failure event.
+    """
+    adapter = _make_adapter()
+    adapter._client = ChatlyticsClient(base_url=BASE_URL, api_key=API_KEY)
+
+    # Force the degraded-status (non-exception) path -- the typing
+    # endpoint returns 503, which _send_typing_once turns into a
+    # ``False`` return without raising.  The else-branch fires exactly
+    # one WARNING.
+    with respx.mock(base_url=BASE_URL, assert_all_called=False) as router:
+        router.post("/api/v1/typing").mock(
+            return_value=httpx.Response(503, text="upstream broken")
+        )
+
+        with caplog.at_level(logging.WARNING, logger="chatlytics_hermes.adapter"):
+            stop = asyncio.Event()
+            task = asyncio.create_task(
+                adapter._keep_typing(
+                    CHAT_ID, interval=10.0, stop_event=stop
+                )
+            )
+            await asyncio.sleep(0.1)
+            stop.set()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    warnings = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING
+        and "send_typing initial fire" in r.getMessage()
+    ]
+    assert len(warnings) == 1, (
+        f"Expected exactly ONE first-fire WARNING (WARNING-01 fix); "
+        f"got {len(warnings)}: {[r.getMessage() for r in warnings]}"
+    )
+
+    await adapter._client.aclose()
+
+
 async def test_no_api_key_in_any_log_record(
     adapter: ChatlyticsAdapter,
     caplog: pytest.LogCaptureFixture,

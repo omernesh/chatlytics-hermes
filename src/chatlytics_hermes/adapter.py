@@ -469,9 +469,10 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
         Compatible with the base class signature (which uses ``metadata``)
         and the Chatlytics-specific ``duration`` knob (default 3.0 s).
-        ``metadata`` is accepted for API compatibility; the adapter
-        currently uses only ``duration``.  Errors are logged at DEBUG
-        and swallowed -- typing is a UX hint, not a critical path.
+        ``metadata`` is accepted for base-class signature parity; the
+        Chatlytics typing endpoint does not currently consume it.
+        Errors are logged at DEBUG and swallowed -- typing is a UX
+        hint, not a critical path.
 
         Operator-actionable surface area for sustained failures is in
         :meth:`_keep_typing`'s first-fire WARNING (HERMES-08 06-LOW-02),
@@ -974,26 +975,32 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # ``_send_typing_once`` helper so degraded sends (non-200 or
         # transport error) surface as WARNING here even though
         # :meth:`send_typing` itself stays quiet (DEBUG).
+        #
+        # HERMES-09 WARNING-01 fix: use try/except/else so the exception
+        # path emits exactly ONE WARNING (with traceback) and the
+        # degraded-status path emits exactly ONE WARNING (without
+        # traceback).  The previous flow logged twice on the exception
+        # branch because the post-try `if not initial_ok` block re-fired.
         try:
             initial_ok = await self._send_typing_once(chat_id, duration=30.0)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
-            initial_ok = False
             logger.warning(
                 "send_typing initial fire raised for chat %s; continuing heartbeat",
                 chat_id,
                 exc_info=True,
             )
-        if not initial_ok:
-            # 06-LOW-02: first-fire failure is operator-actionable --
-            # WARNING level so it surfaces in default logging configs.
-            # The DEBUG record from _send_typing_once carries the "why";
-            # this WARNING carries the "who".
-            logger.warning(
-                "send_typing initial fire failed for chat %s; continuing heartbeat",
-                chat_id,
-            )
+        else:
+            if not initial_ok:
+                # 06-LOW-02: first-fire failure is operator-actionable --
+                # WARNING level so it surfaces in default logging configs.
+                # The DEBUG record from _send_typing_once carries the
+                # "why"; this WARNING carries the "who".
+                logger.warning(
+                    "send_typing initial fire failed for chat %s; continuing heartbeat",
+                    chat_id,
+                )
 
         while True:
             if stop_event is not None and stop_event.is_set():
