@@ -1,0 +1,300 @@
+"""HERMES-04 acceptance tests for the chatlytics-hermes media surface.
+
+Seven ``respx``-mocked tests cover the 6 media handlers (``send_image``,
+``send_voice``, ``send_video``, ``send_document``, ``send_animation``,
+``send_image_file``) plus the ``_keep_typing`` 30s heartbeat
+asynccontextmanager.
+
+The 8th acceptance test (``_standalone_send`` cron hook) lives in
+``tests/test_cron.py`` because it does not require an adapter instance.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json as _json
+from pathlib import Path
+from typing import Any, Dict
+
+import httpx
+import pytest
+import respx
+
+from chatlytics_hermes.adapter import ChatlyticsAdapter
+
+BASE_URL = "https://gateway.test.chatlytics.ai"
+API_KEY = "test-api-key-abc123"
+CHAT_ID = "120363100000000000@g.us"
+EXPECTED_AUTH = f"Bearer {API_KEY}"
+
+
+class _FakePlatformConfig:
+    """Mirror of the test_outbound shim -- minimal PlatformConfig stand-in."""
+
+    def __init__(self, extra: Dict[str, Any]) -> None:
+        self.extra = extra
+        self.enabled = True
+        self.token = None
+        self.api_key = extra.get("api_key")
+        self.home_channel = extra.get("home_channel")
+
+
+@pytest.fixture
+def adapter() -> ChatlyticsAdapter:
+    return ChatlyticsAdapter(
+        _FakePlatformConfig(
+            extra={
+                "base_url": BASE_URL,
+                "api_key": API_KEY,
+                "account_id": "acct-1",
+            }
+        )
+    )
+
+
+@pytest.fixture
+def mock_router():
+    with respx.mock(base_url=BASE_URL, assert_all_called=False) as router:
+        yield router
+
+
+# --- AC-1: send_image(url) posts to /api/v1/send-media ----------------
+
+async def test_send_image_url_path(
+    adapter: ChatlyticsAdapter, mock_router: respx.MockRouter
+) -> None:
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    media_route = mock_router.post("/api/v1/send-media").mock(
+        return_value=httpx.Response(200, json={"success": True, "messageId": "m-img"})
+    )
+    await adapter.connect()
+    result = await adapter.send_image(
+        CHAT_ID, "https://cdn.test/x.png", caption="hi there"
+    )
+    assert result.success is True
+    assert result.message_id == "m-img"
+
+    body = _json.loads(media_route.calls.last.request.content)
+    assert body["chatId"] == CHAT_ID
+    assert body["mediaType"] == "image"
+    assert body["mediaUrl"] == "https://cdn.test/x.png"
+    assert body["caption"] == "hi there"
+    assert media_route.calls.last.request.headers["authorization"] == EXPECTED_AUTH
+    await adapter.disconnect()
+
+
+# --- AC-2: send_voice yields mediaType=voice (NOT "audio") -----------
+
+async def test_send_voice_yields_voice_message(
+    adapter: ChatlyticsAdapter, mock_router: respx.MockRouter
+) -> None:
+    """Regression guard: WhatsApp voice bubbles vs media-player audio.
+
+    Chatlytics distinguishes ``mediaType=voice`` (push-to-talk UX,
+    waveform) from ``mediaType=audio`` (full media player).  This
+    handler must always emit voice.
+    """
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    media_route = mock_router.post("/api/v1/send-media").mock(
+        return_value=httpx.Response(200, json={"success": True, "messageId": "m-voice"})
+    )
+    await adapter.connect()
+    result = await adapter.send_voice(CHAT_ID, "https://cdn.test/v.ogg")
+    assert result.success is True
+
+    body = _json.loads(media_route.calls.last.request.content)
+    assert body["mediaType"] == "voice", (
+        f"send_voice must emit mediaType=voice, got {body['mediaType']!r}"
+    )
+    assert body["mediaUrl"] == "https://cdn.test/v.ogg"
+    await adapter.disconnect()
+
+
+# --- AC-3: send_video -------------------------------------------------
+
+async def test_send_video(
+    adapter: ChatlyticsAdapter, mock_router: respx.MockRouter
+) -> None:
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    media_route = mock_router.post("/api/v1/send-media").mock(
+        return_value=httpx.Response(200, json={"success": True, "messageId": "m-vid"})
+    )
+    await adapter.connect()
+    result = await adapter.send_video(
+        CHAT_ID, "https://cdn.test/clip.mp4", caption="check this clip"
+    )
+    assert result.success is True
+
+    body = _json.loads(media_route.calls.last.request.content)
+    assert body["mediaType"] == "video"
+    assert body["mediaUrl"] == "https://cdn.test/clip.mp4"
+    assert body["caption"] == "check this clip"
+    await adapter.disconnect()
+
+
+# --- AC-4: send_document with filename --------------------------------
+
+async def test_send_document_with_filename(
+    adapter: ChatlyticsAdapter, mock_router: respx.MockRouter
+) -> None:
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    media_route = mock_router.post("/api/v1/send-media").mock(
+        return_value=httpx.Response(200, json={"success": True, "messageId": "m-doc"})
+    )
+    await adapter.connect()
+    result = await adapter.send_document(
+        CHAT_ID, "https://cdn.test/d.pdf", file_name="report.pdf"
+    )
+    assert result.success is True
+
+    body = _json.loads(media_route.calls.last.request.content)
+    assert body["mediaType"] == "file"
+    assert body["filename"] == "report.pdf"
+    assert body["mediaUrl"] == "https://cdn.test/d.pdf"
+    await adapter.disconnect()
+
+
+# --- AC-5: send_animation ---------------------------------------------
+
+async def test_send_animation(
+    adapter: ChatlyticsAdapter, mock_router: respx.MockRouter
+) -> None:
+    """Animation media type per Chatlytics convention.
+
+    The Chatlytics gateway delivers gif/mp4 animations under
+    ``mediaType=video`` (WhatsApp has no native GIF primitive -- clients
+    render short MP4s in a loop).  We accept either ``"video"`` or
+    ``"gif"`` for forward-compat with any future gateway change.
+    """
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    media_route = mock_router.post("/api/v1/send-media").mock(
+        return_value=httpx.Response(200, json={"success": True, "messageId": "m-ani"})
+    )
+    await adapter.connect()
+    result = await adapter.send_animation(
+        CHAT_ID, "https://cdn.test/a.gif", caption="lol"
+    )
+    assert result.success is True
+
+    body = _json.loads(media_route.calls.last.request.content)
+    assert body["mediaType"] in {"video", "gif"}, (
+        f"animation mediaType must be video or gif, got {body['mediaType']!r}"
+    )
+    assert body["mediaUrl"] == "https://cdn.test/a.gif"
+    await adapter.disconnect()
+
+
+# --- AC-6: send_image_file uploads local bytes ------------------------
+
+async def test_send_image_file_uploads_local_bytes(
+    adapter: ChatlyticsAdapter,
+    mock_router: respx.MockRouter,
+    tmp_path: Path,
+) -> None:
+    """Local-path variant reads bytes, uploads, then references returned URL."""
+    img_path = tmp_path / "x.png"
+    fake_png = b"\x89PNG\r\n\x1a\n" + b"some-bytes-x123"
+    img_path.write_bytes(fake_png)
+
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    upload_route = mock_router.post("/api/v1/upload").mock(
+        return_value=httpx.Response(
+            200, json={"url": "https://cdn.test/uploaded.png"}
+        )
+    )
+    media_route = mock_router.post("/api/v1/send-media").mock(
+        return_value=httpx.Response(
+            200, json={"success": True, "messageId": "m-imgfile"}
+        )
+    )
+
+    await adapter.connect()
+    result = await adapter.send_image_file(CHAT_ID, str(img_path), caption="local")
+    assert result.success is True
+    assert result.message_id == "m-imgfile"
+
+    # Upload was called with the file bytes.
+    assert upload_route.called
+    upload_req = upload_route.calls.last.request
+    # multipart body must contain the raw file bytes.
+    assert fake_png in upload_req.content
+    assert upload_req.headers["authorization"] == EXPECTED_AUTH
+
+    # Send-media references the returned URL.
+    media_body = _json.loads(media_route.calls.last.request.content)
+    assert media_body["mediaUrl"] == "https://cdn.test/uploaded.png"
+    assert media_body["mediaType"] == "image"
+    assert media_body["caption"] == "local"
+    await adapter.disconnect()
+
+
+# --- AC-7: _keep_typing heartbeats every interval --------------------
+
+async def test_keep_typing_heartbeats_every_30s(
+    adapter: ChatlyticsAdapter, mock_router: respx.MockRouter
+) -> None:
+    """asynccontextmanager fires immediately + reissues every interval seconds.
+
+    Uses ``interval=0.05`` to keep the test sub-second.  Asserts:
+
+    1. At least one typing call lands immediately on __aenter__
+       (the initial fire).
+    2. At least one additional typing call lands during a 0.12s body
+       sleep (>= 2 intervals worth), proving the heartbeat loop fires.
+    3. After __aexit__, no further typing calls land for at least
+       0.15s, proving the background task was cancelled cleanly.
+
+    The lower bound is ``>= 2`` (initial + 1 beat) rather than ``>= 3``
+    to tolerate scheduling jitter on busy CI runners.
+    """
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    typing_route = mock_router.post("/api/v1/typing").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    await adapter.connect()
+
+    async with adapter._keep_typing(CHAT_ID, interval=0.05):
+        await asyncio.sleep(0.12)
+        in_block = typing_route.call_count
+
+    assert in_block >= 2, (
+        f"Expected initial fire + at least one heartbeat, got {in_block} calls"
+    )
+
+    # After __aexit__, the background task must be cancelled -- no
+    # further typing calls land even if we wait a few intervals.
+    prior = typing_route.call_count
+    await asyncio.sleep(0.15)
+    assert typing_route.call_count == prior, (
+        f"Heartbeat continued after context-manager exit: "
+        f"{typing_route.call_count - prior} extra calls"
+    )
+
+    # Every typing call carried Bearer auth.
+    for call in typing_route.calls:
+        assert call.request.headers.get("authorization") == EXPECTED_AUTH
+
+    await adapter.disconnect()
+
+
+async def test_keep_typing_swallows_send_typing_errors(
+    adapter: ChatlyticsAdapter, mock_router: respx.MockRouter
+) -> None:
+    """Heartbeat must never propagate -- typing is a UX hint, not critical.
+
+    Companion to AC-7: confirms a failing typing endpoint does not
+    crash the wrapped body.  Not in the 8-test ROADMAP list but worth
+    asserting given the heartbeat runs as a background task whose
+    exceptions would otherwise be silently dropped.
+    """
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    mock_router.post("/api/v1/typing").mock(
+        return_value=httpx.Response(500, text="upstream broken")
+    )
+    await adapter.connect()
+    body_ran = False
+    async with adapter._keep_typing(CHAT_ID, interval=0.05):
+        await asyncio.sleep(0.06)
+        body_ran = True
+    assert body_ran, "_keep_typing must not abort the wrapped body on typing errors"
+    await adapter.disconnect()
