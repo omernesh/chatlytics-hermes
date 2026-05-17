@@ -152,6 +152,18 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
     def name(self) -> str:
         return "Chatlytics"
 
+    @property
+    def client(self) -> Optional[ChatlyticsClient]:
+        """Public access to the shared httpx wrapper.
+
+        HERMES-05 tool handlers (in :mod:`chatlytics_hermes.tools`) call
+        through this property to reuse the adapter's authenticated
+        ``ChatlyticsClient`` instead of opening a fresh httpx.AsyncClient
+        per call.  Returns ``None`` when the adapter has not yet been
+        connected.
+        """
+        return self._client
+
     # --- Lifecycle (HERMES-02) ---------------------------------------------
 
     async def connect(self) -> bool:
@@ -889,6 +901,76 @@ async def _standalone_send(text: str, **kwargs: Any) -> Dict[str, Any]:
     }
 
 
+def _make_tool_handler(ctx: Any, name: str, handler: Any) -> Any:
+    """Build a register-time wrapper that resolves the live adapter at call time.
+
+    ``ctx.register_tool`` runs at plugin-load time -- before the gateway
+    calls ``adapter_factory(config)``.  Tool handlers therefore cannot
+    capture an adapter instance at registration: they must look one up
+    via ``ctx.get_platform("chatlytics")`` (or its equivalent on the
+    runtime ``PluginContext``) on each invocation.
+
+    The wrapper:
+
+    - Resolves the adapter through any of the well-known accessor names
+      gateways have exposed historically (``get_platform``,
+      ``platform`` mapping, ``platforms`` dict).
+    - Returns a structured ``{"success": False, "error": ...}`` payload
+      when no live adapter / client is available, instead of raising --
+      tool callers expect every code path to honor the contract.
+    - Forwards the live ``ChatlyticsClient`` (plus, for media handlers,
+      the adapter instance) into the bare async handler.
+    """
+    # Imported lazily so registration order matches HERMES-01: importing
+    # ``tools`` triggers schema construction; we keep that out of import
+    # path until ``register()`` is actually called.
+    from .tools import handler_takes_adapter
+
+    needs_adapter = handler_takes_adapter(handler)
+
+    def _lookup_adapter() -> Optional["ChatlyticsAdapter"]:
+        # ``ctx.get_platform("chatlytics")`` is the v0.14 public accessor;
+        # some test harnesses (and older PluginContexts) expose the
+        # adapter via ``ctx.platforms[name].adapter`` instead.  Try both.
+        entry = None
+        get_platform = getattr(ctx, "get_platform", None)
+        if callable(get_platform):
+            try:
+                entry = get_platform("chatlytics")
+            except Exception:  # noqa: BLE001
+                entry = None
+        if entry is None:
+            platforms_attr = getattr(ctx, "platforms", None)
+            if isinstance(platforms_attr, dict):
+                entry = platforms_attr.get("chatlytics")
+        if entry is None:
+            return None
+        # Both attribute and dict accessors used by various harnesses.
+        adapter_inst = getattr(entry, "adapter", None)
+        if adapter_inst is None and isinstance(entry, dict):
+            adapter_inst = entry.get("adapter")
+        return adapter_inst
+
+    async def _bound(**kwargs: Any) -> Dict[str, Any]:
+        adapter_inst = _lookup_adapter()
+        client = getattr(adapter_inst, "client", None) if adapter_inst else None
+        if client is None:
+            return {
+                "success": False,
+                "error": (
+                    f"Chatlytics tool '{name}' invoked but the adapter is "
+                    "not connected; ensure 'hermes gateway start' has run."
+                ),
+            }
+        if needs_adapter:
+            return await handler(client, adapter=adapter_inst, **kwargs)
+        return await handler(client, **kwargs)
+
+    _bound.__name__ = f"_bound_{name}"
+    _bound.__qualname__ = f"_bound_{name}"
+    return _bound
+
+
 def register(ctx: Any) -> None:
     """Plugin entry point: discovered by Hermes via the ``hermes_agent.plugins``
     entry point group in ``pyproject.toml``.
@@ -933,3 +1015,23 @@ def register(ctx: Any) -> None:
         # can fire deliveries without an active adapter.
         standalone_sender_fn=_standalone_send,
     )
+
+    # --- HERMES-05: tool surface -------------------------------------
+    # Iterate the locked-21 TOOLS registry and register each as a Hermes
+    # tool under the ``chatlytics`` toolset.  ``ctx`` from the v0.14
+    # PluginContext exposes ``register_tool(name=, toolset=, schema=,
+    # handler=, ...)`` (see ``plugins/spotify/__init__.py`` for the
+    # canonical signature).  We feature-detect via ``hasattr`` so the
+    # HERMES-01 MockCtx (platform-only) still works for the existing
+    # ``test_register_*`` suite.
+    register_tool = getattr(ctx, "register_tool", None)
+    if callable(register_tool):
+        from .tools import TOOLS
+
+        for tool_name, tool_schema, tool_handler in TOOLS:
+            register_tool(
+                name=tool_name,
+                toolset="chatlytics",
+                schema=tool_schema,
+                handler=_make_tool_handler(ctx, tool_name, tool_handler),
+            )
