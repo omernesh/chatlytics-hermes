@@ -33,8 +33,10 @@ import os
 from typing import Any, Dict, Optional
 
 import httpx
+from aiohttp import web
 
 from .client import ChatlyticsClient
+from .inbound import make_health_handler, make_webhook_handler
 
 try:
     from gateway.platforms.base import BasePlatformAdapter, SendResult
@@ -86,13 +88,19 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             os.getenv("CHATLYTICS_ACCOUNT_ID") or extra.get("account_id")
         )
 
-        # Webhook server settings (used by HERMES-03).
+        # Webhook server settings (HERMES-03).
+        self.webhook_host: str = (
+            os.getenv("CHATLYTICS_WEBHOOK_HOST") or extra.get("webhook_host", "0.0.0.0")
+        )
         try:
             self.webhook_port: int = int(
                 os.getenv("CHATLYTICS_WEBHOOK_PORT") or extra.get("webhook_port", 8765)
             )
         except (TypeError, ValueError):
             self.webhook_port = 8765
+        self.webhook_path: str = (
+            os.getenv("CHATLYTICS_WEBHOOK_PATH") or extra.get("webhook_path", "/webhook")
+        )
         self.webhook_secret: Optional[str] = (
             os.getenv("CHATLYTICS_WEBHOOK_SECRET") or extra.get("webhook_secret")
         )
@@ -107,6 +115,11 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # connect time, never at registration time.
         self._client: Optional[ChatlyticsClient] = None
 
+        # Embedded aiohttp webhook server -- started in ``connect()``,
+        # shut down in ``disconnect()`` via ``runner.cleanup()``.
+        self._runner: Optional[web.AppRunner] = None
+        self._site: Optional[web.TCPSite] = None
+
     @property
     def name(self) -> str:
         return "Chatlytics"
@@ -116,13 +129,15 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
     async def connect(self) -> bool:
         """Connect to the Chatlytics gateway.
 
-        Constructs ``self._client``, then issues ``GET {base_url}/health``.
-        Returns True on 200; raises :class:`ChatlyticsConnectError` on any
-        other status code or transport error.
-
-        HERMES-03 will extend this to also start the embedded aiohttp
-        webhook server -- that addition does not change the health-check
-        preflight.
+        1. Construct ``self._client`` (httpx).
+        2. Issue ``GET {base_url}/health`` against the Chatlytics gateway
+           -- non-200 raises :class:`ChatlyticsConnectError`.
+        3. Start the embedded aiohttp webhook server bound to
+           ``(self.webhook_host, self.webhook_port)`` with routes
+           ``POST {webhook_path}`` (default ``/webhook``) and
+           ``GET /health`` -- a bind failure raises
+           :class:`ChatlyticsConnectError` and tears down the httpx
+           client so the next connect() retries from a clean slate.
         """
         if self._client is None:
             self._client = ChatlyticsClient(
@@ -153,15 +168,65 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 f"{response.status_code}: {response.text[:200]}"
             )
 
+        # --- Inbound webhook server (HERMES-03) -----------------------
+        try:
+            app = web.Application()
+            app.router.add_post(self.webhook_path, make_webhook_handler(self))
+            app.router.add_get("/health", make_health_handler())
+
+            self._runner = web.AppRunner(app)
+            await self._runner.setup()
+            self._site = web.TCPSite(
+                self._runner, self.webhook_host, self.webhook_port
+            )
+            await self._site.start()
+            logger.info(
+                "Chatlytics webhook server listening on %s:%d%s",
+                self.webhook_host,
+                self.webhook_port,
+                self.webhook_path,
+            )
+        except OSError as exc:
+            # Bind error -- tear down everything cleanly so the next
+            # connect() can retry from a known-good state.
+            if self._runner is not None:
+                try:
+                    await self._runner.cleanup()
+                except Exception:  # noqa: BLE001 -- never let teardown raise
+                    logger.exception("aiohttp runner cleanup raised; continuing")
+                self._runner = None
+                self._site = None
+            await self._client.aclose()
+            self._client = None
+            raise ChatlyticsConnectError(
+                f"Chatlytics webhook server failed to bind "
+                f"{self.webhook_host}:{self.webhook_port}: {exc}"
+            ) from exc
+
         self._running = True
         return True
 
     async def disconnect(self) -> None:
-        """Close the httpx client.  Idempotent."""
+        """Stop the aiohttp webhook server and close the httpx client.  Idempotent.
+
+        Order matters: shut down the aiohttp server first (so no
+        in-flight request handlers can issue further outbound calls
+        through ``self._client``), then close the shared httpx client.
+        """
+        if self._runner is not None:
+            logger.info("Stopping Chatlytics webhook server")
+            try:
+                await self._runner.cleanup()
+            except Exception:  # noqa: BLE001 -- never let teardown raise
+                logger.exception("aiohttp runner cleanup raised; continuing")
+            self._runner = None
+            self._site = None
+
         if self._client is not None:
             logger.info("Disconnecting from Chatlytics gateway")
             await self._client.aclose()
             self._client = None
+
         self._running = False
 
     # --- Outbound (HERMES-02) ---------------------------------------------
