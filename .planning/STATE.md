@@ -1,17 +1,17 @@
 ---
 gsd_state_version: 1.0
-milestone: v2.0
-milestone_name: — Hermes plugin v2.0 (upstream-contract rebuild)
-status: complete
-stopped_at: v2.0 milestone shipped 2026-05-17 — 6/6 phases, 45/45 tests, 21 tools, v2.0.0 tagged local
+milestone: v2.1
+milestone_name: — Tech debt resolution + live-loader integration
+status: planning
+stopped_at: v2.1 ROADMAP scaffolded 2026-05-17 — 6 phases (HERMES-07..HERMES-12) scoped from v2.0 audit
 last_updated: "2026-05-17T00:00:00.000Z"
-last_activity: 2026-05-17 -- v2.0 milestone shipped (6/6 phases, 45/45 tests, v2.0.0 tagged local)
+last_activity: 2026-05-17 -- v2.1 milestone scaffolded; tech debt phases derived from .planning/v2.0-MILESTONE-AUDIT.md
 progress:
   total_phases: 6
-  completed_phases: 6
-  total_plans: 6
-  completed_plans: 6
-  percent: 100
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
@@ -22,49 +22,51 @@ See: `.planning/PROJECT.md`
 
 **Core value:** A first-class Hermes Agent platform plugin that exposes the full Chatlytics REST API surface (text, media, reactions, groups, contacts, channels, search, polls, presence, profile, etc.) as Hermes tools, plus inbound WhatsApp event ingestion via the canonical `BasePlatformAdapter` contract.
 
-**Current focus:** v2.0 — full upstream-contract rebuild against `hermes-agent>=0.14,<0.15`. The v1.x standalone-shim API is being discarded (never published, no compatibility shims).
+**Current focus:** v2.1 — close every MED/LOW finding carried forward from the v2.0 audit and prove the plugin works against a real `PluginContext` end-to-end (live-loader integration smoke). Additive, non-breaking; ships as `v2.1.0`. NO PyPI publish (operator lock preserved).
 
 ## Current Position
 
-Phase: -- (v2.0 milestone complete)
-Plan: --
-Status: complete
-Last activity: 2026-05-17 -- v2.0 SHIPPED (6/6 phases, 45/45 tests, v2.0.0 tagged local). Audit: `.planning/v2.0-MILESTONE-AUDIT.md`. Archive: `.planning/milestones/v2.0-ROADMAP.md`.
+Phase: HERMES-07 (not started)
+Plan: —
+Status: planning
+Last activity: 2026-05-17 — v2.1 milestone scaffolded; 6 phases derived from v2.0 audit findings.
 
-## v2.0 Phase Plan (6 phases, HERMES-01 → HERMES-06)
+## v2.1 Phase Plan (6 phases, HERMES-07 → HERMES-12)
 
-| Phase | Status | Depends on | Notes |
-|-------|--------|------------|-------|
-| HERMES-01 — Upstream contract scaffolding | Ready | Nothing | Bare `BasePlatformAdapter` subclass + `plugin.yaml` + `register(ctx)` + pinned `hermes-agent>=0.14,<0.15`. Acceptance: `register(MockCtx())` registers platform `chatlytics`. |
-| HERMES-02 — Outbound text + control parity | Ready | HERMES-01 | Implement `connect/disconnect/send/send_typing/get_chat_info` via httpx → Chatlytics REST. `SendResult.ok=True` against mocked Chatlytics. |
-| HERMES-03 — Inbound transport migration | Ready | HERMES-02 | aiohttp inbound server inside `connect()` (NOT separate Flask thread). Normalize webhook JSON → `MessageEvent` via `MessageType.{TEXT,IMAGE,AUDIO,...}` → `self.handle_message(event)`. |
-| HERMES-04 — Media + UX polish + cron | Ready | HERMES-03 | All 6 media-send variants: `send_image / send_voice / send_video / send_document / send_animation / send_image_file` wired to Chatlytics media endpoints. `_keep_typing()` 30s heartbeat. `cron_deliver_env_var="CHATLYTICS_HOME_CHANNEL"` + `standalone_sender_fn`. |
-| HERMES-05 — Full Chatlytics tool surface | Ready | HERMES-04 | EVERY Chatlytics action exposed as a Hermes tool via `ctx.register_tool()`. Source the tool list from the Claude Code plugin's MCP server bundle (`chatlytics-mcp.bundle.js`) and Chatlytics `/api/v1/actions` enumeration. |
-| HERMES-06 — Release + smoke test | Ready | HERMES-05 | README rewrite (drop v1.1.0 standalone-shim language), CHANGELOG `2.0.0 (BREAKING)`, smoke: `pip install -e .[dev] hermes-agent==0.14.0 && hermes plugins ls \| grep chatlytics`. Tag `v2.0.0`. **NO PyPI publish in this milestone.** |
+| Phase | Status | Depends on | Closes (v2.0 carry-forward) | Notes |
+|-------|--------|------------|------------------------------|-------|
+| HERMES-07 — Live-loader integration smoke | Ready | v2.0 shipped | 06-MED-01 | Wire `gateway.bootstrap.load_plugins()` against respx-mocked Chatlytics; assert 21 tools land on `PluginContext` registry. Strongest v2.0 test gap. |
+| HERMES-08 — Async lifecycle hardening | Ready | HERMES-07 | 04-MED-01, 04-LOW-03, 06-LOW-02 | Resolve `_keep_typing` shape divergence (rename + compat wrapper OR upstream PR). Fire-and-forget initial heartbeat. Concurrency regression test for `_resolve_media_url`. |
+| HERMES-09 — Observability + log hygiene | Ready | HERMES-08 | 02-LOW-01, 02-LOW-02, 05-LOW-01 | Consolidate `send_typing` log levels. Add diagnostic logs to silent error paths. Warn on dropped reserved-name metadata. |
+| HERMES-10 — Input validation + UX alignment | Ready | HERMES-09 | 03-LOW-01, 05-LOW-02, 05-LOW-03, 02-LOW-03 | Validate `webhook_path` at `__init__`. Optional `looksLikeJid` for media-tool schemas. Align `chatlytics_login` semantics with MCP. Document `get_chat_info` `{}` shape. |
+| HERMES-11 — Test infra cleanup | Ready | HERMES-10 | 02-MED-02, 06-LOW-01 | Teardown for conftest platform_registry seed. Smoke build cache layer or pre-built docker. Optional `--fast` flag. |
+| HERMES-12 — Release v2.1.0 | Ready | HERMES-07..11 | 05-MED-01 docs, 04-LOW-02 docs | CHANGELOG 2.1.0 (additive, NOT BREAKING). README updates. pyproject bump to 2.1.0. Tag `v2.1.0`. NO PyPI publish (operator lock). |
 
-## v2.0 Architectural Invariants (every phase preserves)
+## v2.1 Architectural Invariants (every phase preserves)
 
-- Pinned upstream dep: `hermes-agent>=0.14,<0.15`. Bump only when the entire plugin re-verified against the new minor.
-- Inbound transport lives **inside** `connect()` via aiohttp — no separate threads, no Flask. The plugin owns its own event loop integration.
-- Outbound goes through Chatlytics REST (`/api/v1/send`, `/api/v1/send-media`, `/api/v1/actions`, `/api/v1/typing`, `/api/v1/chat`). No direct WAHA calls.
-- All tool handlers return `{"success": bool, ...}` shape compatible with Hermes tool result conventions.
-- `chatlytics-hermes` package name is preserved (per pyproject.toml `name = "chatlytics-hermes"`). v2.0 only changes API surface, not distribution name.
-- License: MIT (preserved from v1.x).
+- Hermes pin stays `>=0.14,<0.15` (0.15 readiness is a v3.0 decision)
+- Inbound transport stays inside `connect()` via aiohttp (no Flask, no threads)
+- Tool surface stays at 21 tools (new tools would be a v2.2 minor)
+- All HTTP outbound through `httpx` async; aiohttp ONLY for embedded inbound server
+- All tool handlers return `{"success": bool, ...}` shape
+- `chatlytics-hermes` package name preserved
+- MIT license preserved
+- NO PyPI publish (operator lock from v2.0 carries forward)
+- v2.0 deliverables (`src/chatlytics_hermes/{__init__,adapter,client,inbound,tools}.py`, `plugin.yaml`, 21 tools, 45 tests, `scripts/smoke.sh`, README v2.0 rewrite, CHANGELOG 2.0.0) — DO NOT REGRESS. Every v2.1 phase must show 45/45 v2.0 tests still passing.
 
 ## Verification Ceiling
 
-Autonomous-only: pytest + mocked aiohttp/respx + smoke install in a clean venv against real `hermes-agent==0.14.0`. No live Chatlytics gateway calls in unit tests. No PyPI publish in this milestone.
+Autonomous-only (unchanged from v2.0): pytest + mocked aiohttp/respx + clean-venv docker smoke against real `hermes-agent @ v2026.5.16`. v2.1 ADDS: live-loader integration smoke via respx-mocked `PluginContext`. Still no live Chatlytics gateway calls. Still no PyPI publish.
 
 ## Session Continuity
 
-Last session: 2026-05-17 -- v2.0 milestone shipped end-to-end (autonomous orchestration). All 6 HERMES phases executed, reviewed, and verified. v2.0.0 annotated tag created locally; NOT pushed.
-Stopped at: milestone lifecycle complete; awaiting operator push.
-Resume file: next milestone -- not yet scoped.
-Next action: operator push (`git push origin main && git push origin v2.0.0`), then scope v2.1.
+Last session: 2026-05-17 — v2.0 shipped autonomously; v2.1 milestone immediately scaffolded from the v2.0 audit's carry-forward MED/LOW items. Two parallel reviews (gsd-code-review + pr-review-toolkit) running in background.
+Stopped at: v2.1 milestone scaffolded, awaiting operator decision on whether to run `/gsd-autonomous --from 7 --to 12` now or after reviewing the cross-AI review outputs.
+Resume file: `.planning/ROADMAP.md` v2.1 section + this STATE.md.
+Next action: `/gsd-autonomous --from 7 --to 12` (after reviewing `.planning/v2.0-MILESTONE-CODE-REVIEW.md` + `.planning/v2.0-MILESTONE-PR-REVIEW.md` once both background reviews land).
 
 ## Operator Next Steps
 
-- `git push origin main` -- push milestone-complete commits
-- `git push origin v2.0.0` -- push the v2.0.0 annotated tag (autonomously created, NOT pushed)
-- (optional, later) PyPI publish via `python -m build && twine upload dist/*` -- explicitly deferred per ROADMAP lock
-- Scope v2.1 milestone: live-loader integration smoke (06-MED-01), `_keep_typing` async-cm shape decision (04-MED-01), `send_typing` log flood fix (02-LOW-02), see `.planning/v2.0-MILESTONE-AUDIT.md`
+- (v2.0 close-out) `git push origin main && git push origin v2.0.0` — operator action, still pending
+- (v2.1 kick-off) After background reviews land: integrate their findings into v2.1 phases if any cross HIGH/BLOCKER thresholds, then run `/gsd-autonomous --from 7 --to 12`
+- (v2.1 ship) When v2.1 completes: same operator-push pattern, then optionally bundle v2.0+v2.1 for the future PyPI publish (still operator-locked)
