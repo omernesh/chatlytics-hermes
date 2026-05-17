@@ -258,6 +258,34 @@ async def test_disconnect_stops_aiohttp_server(
     assert adapter._client is None
 
 
+# --- 03-REVIEW MED-01 regression: connect() is idempotent -------------
+
+async def test_connect_is_idempotent(
+    mock_health: respx.MockRouter,
+) -> None:
+    """Two consecutive connect() calls without an intervening disconnect()
+    must not leak the runner or rebind the port."""
+    adapter = _make_adapter()
+    await adapter.connect()
+    first_runner = adapter._runner
+    first_site = adapter._site
+    try:
+        # Second connect() should be a no-op for the aiohttp side.
+        await adapter.connect()
+        assert adapter._runner is first_runner, "second connect() rebuilt the runner"
+        assert adapter._site is first_site, "second connect() rebuilt the site"
+
+        # Port is still listening -- no rebind happened.
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(2.0)
+        try:
+            sock.connect((adapter.webhook_host, adapter.webhook_port))
+        finally:
+            sock.close()
+    finally:
+        await adapter.disconnect()
+
+
 # --- AC-7: HMAC verification rejects bad signature --------------------
 
 async def test_hmac_verification_rejects_bad_signature(

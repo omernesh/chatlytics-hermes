@@ -169,6 +169,20 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             )
 
         # --- Inbound webhook server (HERMES-03) -----------------------
+        # Idempotency guard: if a previous connect() already started the
+        # aiohttp runner and a caller invokes connect() again without
+        # disconnect() in between (e.g. plugin reload, retry shim), skip
+        # the rebind to avoid leaking the existing runner under a fresh
+        # ``self._runner`` reference (MED-01 from 03-REVIEW).
+        if self._runner is not None:
+            logger.debug(
+                "connect(): webhook server already running on %s:%d; skipping startup",
+                self.webhook_host,
+                self.webhook_port,
+            )
+            self._running = True
+            return True
+
         try:
             app = web.Application()
             app.router.add_post(self.webhook_path, make_webhook_handler(self))
