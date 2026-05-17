@@ -144,6 +144,23 @@ def test_init_accepts_default_webhook_path(monkeypatch: pytest.MonkeyPatch) -> N
     assert adapter.webhook_path == "/webhook"
 
 
+def test_init_rejects_webhook_path_with_whitespace_padding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WARNING-01 (10-REVIEW): whitespace-padded paths must be rejected.
+
+    Previously the validator stripped before checking, which let inputs
+    like "  /webhook  " pass while the unstripped value broke aiohttp
+    route registration silently. The fix rejects leading/trailing
+    whitespace explicitly.
+    """
+    monkeypatch.delenv("CHATLYTICS_WEBHOOK_PATH", raising=False)
+    for padded in ("  /webhook", "/webhook  ", "  /webhook  ", "\t/webhook", "/webhook\n"):
+        cfg = _make_config(webhook_path=padded)
+        with pytest.raises(ValueError):
+            ChatlyticsAdapter(cfg)
+
+
 # ---------------------------------------------------------------------------
 # Section 2: tool schema validation (6 tests)
 # ---------------------------------------------------------------------------
@@ -291,6 +308,30 @@ async def test_chatlytics_login_session_count_unknown_when_missing(
             return_value=httpx.Response(
                 200,
                 json={"webhook_registered": True},
+            )
+        )
+        result = await chatlytics_login(login_client)
+    assert result["success"] is True
+    assert result["sessions"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_chatlytics_login_session_count_unknown_when_bool(
+    login_client: ChatlyticsClient,
+) -> None:
+    """LOW-01 fix (10-REVIEW): bool ``sessions`` -> 'unknown', NOT coerced to 0/1.
+
+    Python's ``bool`` is a subclass of ``int``; without the explicit
+    bool exclusion the session-count branch would assign True/False to
+    ``session_count`` directly. The MCP bundle's
+    ``typeof === "number"`` excludes booleans, so this Python
+    implementation must too.
+    """
+    with respx.mock(base_url=BASE_URL, assert_all_called=False) as router:
+        router.get("/health").mock(
+            return_value=httpx.Response(
+                200,
+                json={"webhook_registered": True, "sessions": True},
             )
         )
         result = await chatlytics_login(login_client)

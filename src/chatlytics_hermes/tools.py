@@ -903,9 +903,15 @@ async def chatlytics_login(client: ChatlyticsClient) -> Dict[str, Any]:
     webhook_ok = webhook_value is True
 
     sessions = result.get("sessions")
+    # LOW-01 fix (10-REVIEW): ``bool`` is a subclass of ``int`` in
+    # Python, so a bare ``isinstance(sessions, int)`` matches True/False
+    # too. The MCP bundle's ``typeof === "number"`` does NOT match JS
+    # booleans, so without the explicit bool exclusion this branch
+    # would diverge from the reference implementation under a
+    # degenerate ``{"sessions": true}`` response.
     if isinstance(sessions, list):
         session_count: Any = len(sessions)
-    elif isinstance(sessions, int):
+    elif isinstance(sessions, int) and not isinstance(sessions, bool):
         session_count = sessions
     else:
         session_count = "unknown"

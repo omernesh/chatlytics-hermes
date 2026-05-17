@@ -116,7 +116,13 @@ def _validate_webhook_path(path: Any) -> None:
 
     Rules (any violation raises):
 
-    1. Path is a non-empty string (after ``.strip()``).
+    1. Path is a non-empty string AND has no leading/trailing
+       whitespace (operators copy-paste paths with stray newlines or
+       spaces often enough that silently accepting them defeats the
+       validator's fail-fast contract — aiohttp's ``UrlDispatcher``
+       does NOT strip route paths, so ``"  /webhook  "`` would either
+       404 silently or raise during route compilation depending on
+       aiohttp version).
     2. Starts with ``/``.
     3. No C0 or DEL control characters.
     4. No ``..`` segments (path-traversal smell).
@@ -133,32 +139,46 @@ def _validate_webhook_path(path: Any) -> None:
             "CHATLYTICS_WEBHOOK_PATH must be a string; got "
             f"{type(path).__name__}"
         )
-    stripped = path.strip()
-    if not stripped:
+    if not path:
         raise ValueError(
             "CHATLYTICS_WEBHOOK_PATH must be a non-empty string"
         )
-    if not stripped.startswith("/"):
+    # WARNING-01 fix (10-REVIEW): reject whitespace-padded inputs
+    # explicitly. Previously the validator stripped before checking and
+    # passed inputs like "  /webhook  " through with whitespace intact,
+    # which then broke aiohttp route registration silently.
+    if path != path.strip():
+        raise ValueError(
+            "CHATLYTICS_WEBHOOK_PATH must not have leading or trailing "
+            f"whitespace; got {path[:80]!r}"
+        )
+    if not path.strip():
+        # Defensive (path was all-whitespace) -- caught by the previous
+        # equality check, but kept for symmetry with the original.
+        raise ValueError(
+            "CHATLYTICS_WEBHOOK_PATH must be a non-empty string"
+        )
+    if not path.startswith("/"):
         raise ValueError(
             "CHATLYTICS_WEBHOOK_PATH must start with '/'; got "
-            f"{stripped[:80]!r}"
+            f"{path[:80]!r}"
         )
-    if any(c in _CONTROL_CHARS for c in stripped):
+    if any(c in _CONTROL_CHARS for c in path):
         raise ValueError(
             "CHATLYTICS_WEBHOOK_PATH must not contain control characters; "
-            f"got {stripped[:80]!r}"
+            f"got {path[:80]!r}"
         )
-    if ".." in stripped:
+    if ".." in path:
         raise ValueError(
             "CHATLYTICS_WEBHOOK_PATH must not contain '..' segments; "
-            f"got {stripped[:80]!r}"
+            f"got {path[:80]!r}"
         )
-    if "?" in stripped or "#" in stripped:
+    if "?" in path or "#" in path:
         raise ValueError(
             "CHATLYTICS_WEBHOOK_PATH must not contain '?' or '#'; "
-            f"got {stripped[:80]!r}"
+            f"got {path[:80]!r}"
         )
-    if stripped == "/health":
+    if path == "/health":
         raise ValueError(
             "CHATLYTICS_WEBHOOK_PATH cannot be '/health' (reserved for the "
             "health endpoint route registered by the embedded webhook server)"
