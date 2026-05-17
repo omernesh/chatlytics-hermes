@@ -89,6 +89,82 @@ def _guess_content_type(filename: Optional[str]) -> str:
     return guess or "application/octet-stream"
 
 
+# HERMES-10 (03-LOW-01 + PR-MED-01): webhook_path validation at __init__.
+# C0 + DEL control range; rejected so adapters fail fast on copy-paste glitches
+# and possible injection attempts. Module-level constant so the validator and
+# its tests share one source of truth.
+_CONTROL_CHARS: str = "".join(chr(i) for i in range(32)) + "\x7f"
+
+
+def _validate_webhook_path(path: Any) -> None:
+    """Validate ``webhook_path`` at adapter ``__init__``.
+
+    Raises :class:`ValueError` with a clear message identifying the
+    offending value and the rule violated. Closes:
+
+    - **03-LOW-01** — v2.0 audit: ``webhook_path`` was not validated; a
+      missing leading slash silently sent the aiohttp router into a
+      route shape it does not honor (``add_post("webhook", ...)``
+      registers ``/webhook`` on some aiohttp versions and raises on
+      others — non-portable).
+    - **PR-review MED-01** — route collision when
+      ``CHATLYTICS_WEBHOOK_PATH=/health``. The embedded webhook server
+      registers ``GET /health`` for liveness; allowing
+      ``POST /health`` to be the inbound webhook path means a curl
+      probe and a real inbound delivery share a URL, which silently
+      mixes traffic and confuses operators.
+
+    Rules (any violation raises):
+
+    1. Path is a non-empty string (after ``.strip()``).
+    2. Starts with ``/``.
+    3. No C0 or DEL control characters.
+    4. No ``..`` segments (path-traversal smell).
+    5. No ``?`` or ``#`` (URL queries/fragments belong to the client
+       request, not the route registration).
+    6. Not equal to ``/health`` (reserved for the health endpoint).
+
+    Fail-fast at ``__init__`` matches Hermes conventions; the adapter
+    deliberately does NOT silently rewrite the path. Operators see the
+    error immediately at gateway start and can correct config.
+    """
+    if not isinstance(path, str):
+        raise ValueError(
+            "CHATLYTICS_WEBHOOK_PATH must be a string; got "
+            f"{type(path).__name__}"
+        )
+    stripped = path.strip()
+    if not stripped:
+        raise ValueError(
+            "CHATLYTICS_WEBHOOK_PATH must be a non-empty string"
+        )
+    if not stripped.startswith("/"):
+        raise ValueError(
+            "CHATLYTICS_WEBHOOK_PATH must start with '/'; got "
+            f"{stripped[:80]!r}"
+        )
+    if any(c in _CONTROL_CHARS for c in stripped):
+        raise ValueError(
+            "CHATLYTICS_WEBHOOK_PATH must not contain control characters; "
+            f"got {stripped[:80]!r}"
+        )
+    if ".." in stripped:
+        raise ValueError(
+            "CHATLYTICS_WEBHOOK_PATH must not contain '..' segments; "
+            f"got {stripped[:80]!r}"
+        )
+    if "?" in stripped or "#" in stripped:
+        raise ValueError(
+            "CHATLYTICS_WEBHOOK_PATH must not contain '?' or '#'; "
+            f"got {stripped[:80]!r}"
+        )
+    if stripped == "/health":
+        raise ValueError(
+            "CHATLYTICS_WEBHOOK_PATH cannot be '/health' (reserved for the "
+            "health endpoint route registered by the embedded webhook server)"
+        )
+
+
 def _coerce_success_payload(
     status_code: int,
     payload: Any,
@@ -185,6 +261,10 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         self.webhook_path: str = (
             os.getenv("CHATLYTICS_WEBHOOK_PATH") or extra.get("webhook_path", "/webhook")
         )
+        # HERMES-10 (03-LOW-01 + PR-MED-01): validate the resolved value so
+        # invalid configs raise at gateway startup instead of failing silently
+        # at the aiohttp route registration in connect().
+        _validate_webhook_path(self.webhook_path)
         self.webhook_secret: Optional[str] = (
             os.getenv("CHATLYTICS_WEBHOOK_SECRET") or extra.get("webhook_secret")
         )
@@ -520,14 +600,34 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         return True
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
-        """GET /api/v1/chat?chatId={id} and return the JSON body as dict.
+        """GET /api/v1/chat?chatId={id} and return the JSON body as a dict.
 
-        Returns ``{}`` if the adapter is not connected or the gateway
-        responds with a non-200 / non-JSON body.  Callers may rely on
-        the dict having the keys documented in the Chatlytics gateway
-        contract (``name``, ``phone``, ``isGroup``, ...) when status
-        was 200 -- the adapter does not validate the schema beyond
+        HERMES-10 (02-LOW-03): empty-vs-error semantics.
+
+        Returns ``{}`` in four distinct paths -- callers cannot
+        distinguish from the return value alone; consult logs for the
+        cause:
+
+        1. Adapter not connected (``self._client is None``) -- no
+           log; this indicates a programmer error (called before
+           ``connect()``).
+        2. Transport error (``httpx.RequestError``) -- WARNING log
+           ``"get_chat_info transport error: ..."``.
+        3. Non-200 response from the gateway -- WARNING log
+           ``"get_chat_info returned <status> for chat <id>"``.
+        4. Malformed JSON body or non-dict payload -- DEBUG log
+           ``"get_chat_info JSON decode failed; returning {}"``.
+
+        When the gateway returns 200 with a valid JSON object, the
+        dict is returned as-is and is expected to contain ``name``,
+        ``phone``, ``isGroup``, ... per the Chatlytics gateway
+        contract. The adapter does NOT validate the schema beyond
         ``isinstance(payload, dict)``.
+
+        Future v2.2+ may introduce a richer return shape
+        (``{"success": bool, "chat": dict | None, "error": str |
+        None}``) to distinguish these paths without log inspection;
+        that is a breaking change and is out of scope for v2.1.
         """
         if self._client is None:
             return {}
@@ -798,6 +898,16 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         signature evolution (HI-03 fix from HERMES-08): future Hermes
         versions may add new kwargs (``priority``, ``force_native``,
         etc.) that this override should not trip on.
+
+        HERMES-10 (PR-review LOW-06) -- API-shape cross-reference:
+        companion method :meth:`send_image_file` exists for backwards
+        compat with the v1.x API surface that exposed a path-only
+        variant; v2.0 preserved both. Both methods accept
+        ``Union[str, bytes, bytearray]`` internally and route through
+        the same :meth:`_send_media_payload` so behavior is identical
+        given equivalent inputs. New code should prefer
+        :meth:`send_image` (URL-or-bytes-or-path Union shape) and
+        treat :meth:`send_image_file` as a legacy alias.
         """
         return await self._send_media_payload(
             chat_id, "image", image_url, caption=caption
@@ -908,6 +1018,14 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         Reads ``image_path`` from disk, uploads the bytes via
         ``/api/v1/upload``, then sends the returned URL via
         ``/api/v1/send-media`` with ``mediaType=image``.
+
+        HERMES-10 (PR-review LOW-06) -- API-shape cross-reference:
+        companion to :meth:`send_image`. v2.0 retained both methods
+        for v1.x API-shape backwards-compat; new code may prefer
+        :meth:`send_image` since it accepts the same
+        ``Union[str, bytes, bytearray]`` shape. Both methods share
+        the same :meth:`_send_media_payload` body, so they return
+        identical ``SendResult`` shapes given equivalent inputs.
         """
         # Even if the caller hands us a URL by mistake, treat it as a
         # path-or-bytes case -- send_image is the URL-first handler.

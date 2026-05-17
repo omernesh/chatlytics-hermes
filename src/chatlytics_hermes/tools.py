@@ -193,18 +193,73 @@ def _media_result_dict(result: Any) -> Dict[str, Any]:
 _DRAFT = "https://json-schema.org/draft/2020-12/schema"
 
 
+# HERMES-10 (05-LOW-02 + PR-MED-01): permissive chatId / messageId validation.
+#
+# Reject only obvious garbage at the schema boundary: empty strings and any C0
+# control character (``\x00``-``\x1f``) or DEL (``\x7f``). These almost
+# certainly indicate a copy-paste glitch, a stray newline, or an injection
+# attempt -- they NEVER represent a real Chatlytics chatId.
+#
+# We deliberately do NOT enforce strict JID format (``\d+@(c|g|newsletter)\.us``)
+# because Chatlytics accepts ALL of the following shapes interchangeably:
+#
+#   - WhatsApp JIDs (``1234567890@c.us``, ``1234...@g.us``, ``...@newsletter``)
+#   - Phone numbers (``+1234567890``, ``1234567890``)
+#   - Group display names (some Chatlytics gateway versions resolve these
+#     server-side, e.g. ``"My Group Name"``)
+#
+# Tightening past the permissive pattern would break legitimate user inputs
+# typed at ``/chatlytics_send``. Schema-layer validation here is cosmetic --
+# better error messages early, NOT a stricter accept-set.
+_CHAT_ID_PATTERN: str = r"^[^\x00-\x1f\x7f]+$"
+
+
+def _chat_id_field(
+    description: str = "Chat JID, phone, or group identifier.",
+) -> Dict[str, Any]:
+    """Reusable schema fragment for ``chatId`` properties.
+
+    Returns a Draft 2020-12 string schema with ``minLength: 1`` and a
+    ``pattern`` that rejects empty strings + control characters. Used
+    by every chatId-bearing tool schema so the wording stays consistent
+    and any future tightening lands in exactly one place.
+    """
+    return {
+        "type": "string",
+        "minLength": 1,
+        "pattern": _CHAT_ID_PATTERN,
+        "description": description,
+    }
+
+
+def _message_id_field(
+    description: str = "Target message identifier.",
+) -> Dict[str, Any]:
+    """Reusable schema fragment for ``messageId`` properties.
+
+    Same permissive validation as :func:`_chat_id_field`. Empty strings
+    and control characters are obvious garbage; everything else is
+    accepted (Chatlytics gateway versions vary on the exact format).
+    """
+    return {
+        "type": "string",
+        "minLength": 1,
+        "pattern": _CHAT_ID_PATTERN,
+        "description": description,
+    }
+
+
 SEND_SCHEMA: Dict[str, Any] = {
     "$schema": _DRAFT,
     "title": "chatlytics_send",
     "description": "Send a WhatsApp text message via the Chatlytics gateway.",
     "type": "object",
     "properties": {
-        "chatId": {
-            "type": "string",
-            "description": "Chat JID (e.g. 12036...@g.us, 9725...@c.us) or phone.",
-        },
+        "chatId": _chat_id_field(
+            "Chat JID (e.g. 12036...@g.us, 9725...@c.us) or phone."
+        ),
         "text": {"type": "string", "minLength": 1, "description": "Message text."},
-        "replyTo": {"type": "string", "description": "Optional message ID to reply to."},
+        "replyTo": _message_id_field("Optional message ID to reply to."),
         "accountId": {"type": "string", "description": "Optional Chatlytics account override."},
     },
     "required": ["chatId", "text"],
@@ -218,9 +273,9 @@ REPLY_SCHEMA: Dict[str, Any] = {
     "description": "Reply to a specific WhatsApp message (sets replyTo).",
     "type": "object",
     "properties": {
-        "chatId": {"type": "string"},
+        "chatId": _chat_id_field(),
         "text": {"type": "string", "minLength": 1},
-        "replyTo": {"type": "string", "description": "Message ID being replied to."},
+        "replyTo": _message_id_field("Message ID being replied to."),
         "accountId": {"type": "string"},
     },
     "required": ["chatId", "text", "replyTo"],
@@ -234,9 +289,9 @@ REACT_SCHEMA: Dict[str, Any] = {
     "description": "Send an emoji reaction to a message.",
     "type": "object",
     "properties": {
-        "messageId": {"type": "string"},
+        "messageId": _message_id_field(),
         "emoji": {"type": "string", "minLength": 1, "description": "Single emoji."},
-        "chatId": {"type": "string", "description": "Optional chat context."},
+        "chatId": _chat_id_field("Optional chat context."),
     },
     "required": ["messageId", "emoji"],
     "additionalProperties": False,
@@ -249,9 +304,9 @@ EDIT_SCHEMA: Dict[str, Any] = {
     "description": "Edit an already-sent WhatsApp message.",
     "type": "object",
     "properties": {
-        "messageId": {"type": "string"},
+        "messageId": _message_id_field(),
         "text": {"type": "string", "minLength": 1},
-        "chatId": {"type": "string"},
+        "chatId": _chat_id_field(),
     },
     "required": ["messageId", "text"],
     "additionalProperties": False,
@@ -264,8 +319,8 @@ UNSEND_SCHEMA: Dict[str, Any] = {
     "description": "Recall (unsend) a previously sent message.",
     "type": "object",
     "properties": {
-        "messageId": {"type": "string"},
-        "chatId": {"type": "string"},
+        "messageId": _message_id_field(),
+        "chatId": _chat_id_field(),
     },
     "required": ["messageId"],
     "additionalProperties": False,
@@ -278,8 +333,8 @@ PIN_SCHEMA: Dict[str, Any] = {
     "description": "Pin a message in a chat.",
     "type": "object",
     "properties": {
-        "messageId": {"type": "string"},
-        "chatId": {"type": "string"},
+        "messageId": _message_id_field(),
+        "chatId": _chat_id_field(),
         "duration": {"type": "integer", "minimum": 1, "description": "Pin duration in seconds (optional)."},
     },
     "required": ["messageId"],
@@ -293,8 +348,8 @@ UNPIN_SCHEMA: Dict[str, Any] = {
     "description": "Unpin a message in a chat.",
     "type": "object",
     "properties": {
-        "messageId": {"type": "string"},
-        "chatId": {"type": "string"},
+        "messageId": _message_id_field(),
+        "chatId": _chat_id_field(),
     },
     "required": ["messageId"],
     "additionalProperties": False,
@@ -307,7 +362,7 @@ READ_SCHEMA: Dict[str, Any] = {
     "description": "Read recent messages from a chat (paged).",
     "type": "object",
     "properties": {
-        "chatId": {"type": "string"},
+        "chatId": _chat_id_field(),
         "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 10},
     },
     "required": ["chatId"],
@@ -321,8 +376,8 @@ DELETE_SCHEMA: Dict[str, Any] = {
     "description": "Delete a message (local-only or for everyone, gateway-dependent).",
     "type": "object",
     "properties": {
-        "messageId": {"type": "string"},
-        "chatId": {"type": "string"},
+        "messageId": _message_id_field(),
+        "chatId": _chat_id_field(),
         "forEveryone": {"type": "boolean", "default": False},
     },
     "required": ["messageId"],
@@ -336,7 +391,7 @@ POLL_SCHEMA: Dict[str, Any] = {
     "description": "Create a WhatsApp poll in a chat.",
     "type": "object",
     "properties": {
-        "chatId": {"type": "string"},
+        "chatId": _chat_id_field(),
         "question": {"type": "string", "minLength": 1},
         "options": {
             "type": "array",
@@ -359,7 +414,8 @@ def _media_schema(title: str, description: str, extra_props: Optional[Dict[str, 
         "description": description,
         "type": "object",
         "properties": {
-            "chatId": {"type": "string"},
+            # HERMES-10 (05-LOW-02 + PR-MED-01): permissive chatId validation.
+            "chatId": _chat_id_field(),
             "mediaUrl": {"type": "string", "format": "uri", "description": "https:// URL of the media."},
             "filePath": {"type": "string", "description": "Local file path; uploaded to /api/v1/upload."},
             "caption": {"type": "string"},
@@ -453,8 +509,11 @@ LOGIN_SCHEMA: Dict[str, Any] = {
     "$schema": _DRAFT,
     "title": "chatlytics_login",
     "description": (
-        "Validate the configured API key and webhook registration. "
-        "Returns webhook_registered + session count on success."
+        "Validate the configured API key and webhook registration via /health. "
+        "Returns success=True only when webhook_registered is True (matches the "
+        "Claude Code MCP bundle semantics in chatlytics-mcp.js). On "
+        "webhook_registered=False the tool returns success=False with the "
+        "webhook_registered + sessions fields populated for diagnostic visibility."
     ),
     "type": "object",
     "properties": {},
@@ -659,6 +718,24 @@ async def chatlytics_send_image(
     filePath: Optional[str] = None,
     caption: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Send an image via the Chatlytics gateway.
+
+    HERMES-10 (PR-review LOW-06): dispatches to the appropriate
+    adapter method based on which input is set:
+
+    - ``mediaUrl`` -> ``adapter.send_image(chatId, mediaUrl, ...)``
+      (URL-first variant)
+    - ``filePath`` -> ``adapter.send_image_file(chatId, filePath, ...)``
+      (local-path variant)
+
+    The adapter retains the URL-vs-path split for v2.0 surface
+    backwards-compat; this tool offers a single unified entry point so
+    MCP / Claude Code users see one consistent ``chatlytics_send_image``
+    call shape regardless of source. The other four media tools
+    (``send_voice/video/file/animation``) use a single adapter method
+    that internally dispatches on input shape -- only the image surface
+    is split historically.
+    """
     if adapter is None:
         return {"success": False, "error": "Media tools require a live adapter; ensure register() ran."}
     resource = _resolve_resource(mediaUrl=mediaUrl, filePath=filePath)
@@ -792,11 +869,39 @@ async def chatlytics_health(client: ChatlyticsClient) -> Dict[str, Any]:
 
 
 async def chatlytics_login(client: ChatlyticsClient) -> Dict[str, Any]:
-    """Validate API key + webhook registration via /health."""
+    """Validate API key + webhook registration via /health.
+
+    HERMES-10 (05-LOW-03 + PR-LOW-03): aligns with the Claude Code MCP
+    bundle's semantics (``chatlytics-mcp.js`` :240-303).
+
+    Behavior:
+
+    - When ``/health`` itself fails (transport error or non-200): pass
+      through the failure dict returned by :func:`_get` (already
+      populated with ``success=False`` + ``error``).
+    - When ``/health`` returns 200 but ``webhook_registered`` is not
+      literally ``True``: return ``success=False`` with an error message
+      indicating the webhook is unregistered. WhatsApp inbound is
+      effectively down even though the gateway responds, so a "login
+      OK" return would mislead the operator.
+    - When ``/health`` returns 200 AND ``webhook_registered`` is
+      ``True``: return ``success=True`` with ``webhook_registered`` and
+      ``sessions`` (derived count) populated.
+
+    ``sessions`` derivation matches the MCP bundle:
+
+    - ``list`` payload -> ``len(list)``
+    - ``int`` payload -> ``int``
+    - anything else (missing, ``None``, string) -> ``"unknown"``
+    """
     result = await _get(client, "/health")
     if not result.get("success"):
+        # Transport error or non-200 -- _get already populated success=False.
         return result
-    webhook_ok = result.get("webhook_registered") is True
+
+    webhook_value = result.get("webhook_registered")
+    webhook_ok = webhook_value is True
+
     sessions = result.get("sessions")
     if isinstance(sessions, list):
         session_count: Any = len(sessions)
@@ -804,11 +909,29 @@ async def chatlytics_login(client: ChatlyticsClient) -> Dict[str, Any]:
         session_count = sessions
     else:
         session_count = "unknown"
+
+    raw_response = {k: v for k, v in result.items() if k != "success"}
+
+    if not webhook_ok:
+        # MCP-aligned: gateway reachable but webhook unregistered ->
+        # surface as a clear failure so operators do not think the
+        # plugin is healthy when inbound is silently dropped.
+        return {
+            "success": False,
+            "error": (
+                f"webhook_registered is not true (got {webhook_value!r}); "
+                "WhatsApp inbound may be down"
+            ),
+            "webhook_registered": webhook_value,
+            "sessions": session_count,
+            "raw_response": raw_response,
+        }
+
     return {
         "success": True,
-        "webhook_registered": webhook_ok,
+        "webhook_registered": True,
         "sessions": session_count,
-        "raw_response": {k: v for k, v in result.items() if k != "success"},
+        "raw_response": raw_response,
     }
 
 
