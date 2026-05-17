@@ -24,6 +24,27 @@ that ``from chatlytics_hermes import register`` works in environments
 without ``hermes-agent`` installed (HERMES-01 acceptance criterion 1).
 The ``ChatlyticsAdapter`` class only raises when instantiated without
 the runtime dependency present.
+
+Log level convention (HERMES-09)
+--------------------------------
+
+This module (and the rest of the plugin) follows a consistent log-level
+convention so operators can tune verbosity without re-reading source:
+
+- **DEBUG**: steady-state telemetry; expected transient hiccups; swallowed-by-design
+  exceptions on non-critical paths (typing heartbeats, JSON-decode fallbacks,
+  ``ctx`` accessor probes).  Off by default in production logging configs.
+- **INFO**: lifecycle events (connect, disconnect, webhook server start/stop).
+- **WARNING**: operator-actionable degraded states (``_keep_typing`` initial-fire
+  failure, dropped reserved-metadata keys, bind errors, HMAC reject, webhook reject,
+  ``get_chat_info`` non-200 lookup).
+- **ERROR / EXCEPTION**: dispatch failures and teardown failures.
+
+UX-hint paths (notably ``send_typing``) intentionally log at DEBUG even on
+transport / non-200 failures: typing is a cosmetic affordance and a flapping
+gateway should not flood operator logs with hundreds of WARNING lines.  The
+``_keep_typing`` initial-fire WARNING (in ``_keep_typing``) is the canonical
+operator-actionable surface for sustained typing-pipeline failure.
 """
 
 from __future__ import annotations
@@ -379,9 +400,20 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             # quoted-message context, link previews) without the adapter
             # owning a schema for them.  Reserved keys cannot be
             # overridden by the caller.
+            #
+            # HERMES-09 (closes 02-LOW-01): dropped reserved keys now emit
+            # a WARNING so the caller learns their intent was unrealized
+            # instead of silently mismatching the body shape.
+            _reserved = {"chatId", "text", "accountId", "replyTo"}
             for key, value in metadata.items():
-                if key not in {"chatId", "text", "accountId", "replyTo"}:
-                    body[key] = value
+                if key in _reserved:
+                    logger.warning(
+                        "send() ignoring reserved metadata key %r "
+                        "(would shadow body field)",
+                        key,
+                    )
+                    continue
+                body[key] = value
 
         logger.debug("send -> /api/v1/send chatId=%s len=%d", chat_id, len(content))
 
@@ -398,6 +430,12 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         try:
             payload: Any = response.json()
         except Exception:  # noqa: BLE001 -- json.JSONDecodeError + httpx variants
+            # HERMES-09 (closes 02-LOW-01): operators tracing a
+            # malformed gateway response can now see why raw_text was
+            # used instead of the parsed payload.
+            logger.debug(
+                "send() response was not JSON; using raw_text fallback"
+            )
             payload = {"raw_text": response.text}
 
         if (
@@ -432,25 +470,53 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         Compatible with the base class signature (which uses ``metadata``)
         and the Chatlytics-specific ``duration`` knob (default 3.0 s).
         ``metadata`` is accepted for API compatibility; the adapter
-        currently uses only ``duration``.  Errors are logged and
-        swallowed -- typing is a UX hint, not a critical path.
+        currently uses only ``duration``.  Errors are logged at DEBUG
+        and swallowed -- typing is a UX hint, not a critical path.
+
+        Operator-actionable surface area for sustained failures is in
+        :meth:`_keep_typing`'s first-fire WARNING (HERMES-08 06-LOW-02),
+        which uses :meth:`_send_typing_once` internally so it can detect
+        degraded sends without forcing :meth:`send_typing` to raise.
+        """
+        await self._send_typing_once(chat_id, duration)
+
+    async def _send_typing_once(
+        self,
+        chat_id: str,
+        duration: float = 3.0,
+    ) -> bool:
+        """POST one typing request; return True on success, False on degraded.
+
+        Internal helper introduced in HERMES-09 (closes 02-LOW-02 +
+        LO-11): :meth:`send_typing` must stay quiet (DEBUG) on transport
+        and non-200 failures so a flapping gateway does not flood logs,
+        but :meth:`_keep_typing` still needs to know whether the FIRST
+        fire failed so it can emit a WARNING (06-LOW-02 fix).  Returning
+        a status bool lets both call sites share one request path.
         """
         if self._client is None:
-            return
+            return False
 
         try:
             response = await self._client.post(
                 "/api/v1/typing",
                 json={"chatId": chat_id, "duration": float(duration)},
             )
-            if response.status_code != 200:
-                logger.warning(
-                    "send_typing returned %s for chat %s",
-                    response.status_code,
-                    chat_id,
-                )
         except httpx.RequestError as exc:
-            logger.warning("send_typing transport error: %s", exc)
+            # HERMES-09 (closes 02-LOW-02 + LO-11): UX-hint endpoint;
+            # DEBUG prevents log flood on a flapping gateway.
+            logger.debug("send_typing transport error: %s", exc)
+            return False
+
+        if response.status_code != 200:
+            logger.debug(
+                "send_typing returned %s for chat %s",
+                response.status_code,
+                chat_id,
+            )
+            return False
+
+        return True
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """GET /api/v1/chat?chatId={id} and return the JSON body as dict.
@@ -485,6 +551,10 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         try:
             payload = response.json()
         except Exception:  # noqa: BLE001
+            # HERMES-09 (closes 02-LOW-01): distinguish "malformed body"
+            # from "empty success" in the operator log -- the bare {}
+            # return is otherwise ambiguous to callers debugging.
+            logger.debug("get_chat_info JSON decode failed; returning {}")
             return {}
 
         return payload if isinstance(payload, dict) else {}
@@ -899,17 +969,30 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # fix: the initial fire now happens INSIDE the coroutine, so
         # any wrapper (e.g. _typing_scope) returns control to the body
         # immediately and does not block on the first round-trip.
+        #
+        # HERMES-09 (06-LOW-02 + LO-11): use the internal
+        # ``_send_typing_once`` helper so degraded sends (non-200 or
+        # transport error) surface as WARNING here even though
+        # :meth:`send_typing` itself stays quiet (DEBUG).
         try:
-            await self.send_typing(chat_id, duration=30.0)
+            initial_ok = await self._send_typing_once(chat_id, duration=30.0)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
-            # 06-LOW-02: first-fire failure is operator-actionable --
-            # WARNING level so it surfaces in default logging configs.
+            initial_ok = False
             logger.warning(
                 "send_typing initial fire raised for chat %s; continuing heartbeat",
                 chat_id,
                 exc_info=True,
+            )
+        if not initial_ok:
+            # 06-LOW-02: first-fire failure is operator-actionable --
+            # WARNING level so it surfaces in default logging configs.
+            # The DEBUG record from _send_typing_once carries the "why";
+            # this WARNING carries the "who".
+            logger.warning(
+                "send_typing initial fire failed for chat %s; continuing heartbeat",
+                chat_id,
             )
 
         while True:
@@ -1050,6 +1133,12 @@ async def _standalone_send(text: str, **kwargs: Any) -> Dict[str, Any]:
     try:
         payload = response.json()
     except Exception:  # noqa: BLE001
+        # HERMES-09 (closes 02-LOW-01): cron deliveries blind-spot --
+        # operators tracing a failed scheduled send can now see why
+        # raw_text was used.
+        logger.debug(
+            "_standalone_send response was not JSON; using raw_text fallback"
+        )
         payload = {"raw_text": response.text}
 
     # MD-01 fix (HERMES-08): use the canonical success-shape helper so
@@ -1110,7 +1199,16 @@ def _make_tool_handler(ctx: Any, name: str, handler: Any) -> Any:
         if callable(get_platform):
             try:
                 entry = get_platform("chatlytics")
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                # HERMES-09 (closes 05-LOW-01): the fallback chain is
+                # by design (older PluginContexts expose ``platforms``
+                # dict instead), but operators deep-debugging a missing
+                # adapter should see why we did not use get_platform.
+                logger.debug(
+                    "_make_tool_handler ctx.get_platform raised: %s; "
+                    "falling back to ctx.platforms",
+                    exc,
+                )
                 entry = None
         if entry is None:
             platforms_attr = getattr(ctx, "platforms", None)

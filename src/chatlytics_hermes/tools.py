@@ -77,6 +77,11 @@ def _err_from_response(response: httpx.Response) -> Dict[str, Any]:
     try:
         payload: Any = response.json()
     except Exception:  # noqa: BLE001
+        # HERMES-09 (closes 02-LOW-01): operators tracing a malformed
+        # gateway error response can see why raw_text was used.
+        logger.debug(
+            "_err_from_response JSON decode failed; using raw_text fallback"
+        )
         payload = {"raw_text": response.text}
     msg = (
         payload.get("error") if isinstance(payload, dict) else None
@@ -117,6 +122,10 @@ async def _post(
     try:
         payload = response.json()
     except Exception:  # noqa: BLE001
+        # HERMES-09 (closes 02-LOW-01): same rationale as
+        # _err_from_response -- operators see the decode-failure
+        # fallback instead of a mysterious raw_text payload.
+        logger.debug("_post JSON decode failed; using raw_text fallback")
         return _ok({"raw_text": response.text})
     success, error_msg = _coerce_success_payload(response.status_code, payload)
     if not success:
@@ -147,6 +156,8 @@ async def _get(
     try:
         payload = response.json()
     except Exception:  # noqa: BLE001
+        # HERMES-09 (closes 02-LOW-01).
+        logger.debug("_get JSON decode failed; using raw_text fallback")
         return _ok({"raw_text": response.text})
     success, error_msg = _coerce_success_payload(response.status_code, payload)
     if not success:
