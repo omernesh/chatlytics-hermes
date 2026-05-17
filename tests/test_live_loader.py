@@ -245,10 +245,6 @@ async def test_loader_isolated_from_real_chatlytics() -> None:
 # ---------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BL-01: _keep_typing is @asynccontextmanager, not a coroutine -- fixed in Phase 8",
-)
 async def test_keep_typing_is_a_coroutine() -> None:
     """``adapter._keep_typing(...)`` must return a coroutine usable by
     ``asyncio.create_task`` per the base contract.
@@ -284,10 +280,6 @@ async def test_keep_typing_is_a_coroutine() -> None:
         raise
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BL-01: _keep_typing rejects 'metadata' kwarg -- fixed in Phase 8",
-)
 async def test_bl01_keep_typing_accepts_metadata_kwarg() -> None:
     """The base class call site at ``gateway/platforms/base.py:1780``
     ALWAYS passes ``metadata=_thread_metadata`` to ``_keep_typing`` (no
@@ -307,10 +299,6 @@ async def test_bl01_keep_typing_accepts_metadata_kwarg() -> None:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BL-01: base _process_message_background crashes on _keep_typing -- fixed in Phase 8",
-)
 async def test_base_process_message_invokes_keep_typing() -> None:
     """Drive the REAL base ``_process_message_background`` pipeline.
 
@@ -395,10 +383,6 @@ async def test_base_process_message_invokes_keep_typing() -> None:
 # ---------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="HI-01: filePath has no allowlist -- Phase 8 adds CHATLYTICS_UPLOAD_ALLOWED_ROOTS",
-)
 async def test_hi01_send_file_rejects_path_outside_allowed_roots() -> None:
     """A path-traversal-style filePath must be rejected with success: False.
 
@@ -471,10 +455,6 @@ async def test_hi01_send_file_rejects_path_outside_allowed_roots() -> None:
 # ---------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="HI-03: send_image lacks **kwargs -- fixed in Phase 8",
-)
 async def test_hi03_send_image_accepts_unknown_kwargs() -> None:
     """The override must accept ``**kwargs`` for forward-compat with
     upstream base signature evolution.
@@ -497,10 +477,6 @@ async def test_hi03_send_image_accepts_unknown_kwargs() -> None:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="HI-03: send_animation lacks **kwargs -- fixed in Phase 8",
-)
 async def test_hi03_send_animation_accepts_unknown_kwargs() -> None:
     """Same as test_hi03_send_image_accepts_unknown_kwargs but for
     ``send_animation`` (adapter.py:626-642)."""

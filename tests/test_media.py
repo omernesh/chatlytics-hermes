@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
+import tempfile
 from pathlib import Path
 from typing import Any, Dict
 
@@ -41,12 +42,17 @@ class _FakePlatformConfig:
 
 @pytest.fixture
 def adapter() -> ChatlyticsAdapter:
+    # HERMES-08 HI-01 fix: ``upload_allowed_roots`` MUST be configured
+    # for local-file media tests to pass under the new default-deny
+    # allowlist.  ``tempfile.gettempdir()`` covers ``tmp_path`` (pytest's
+    # per-test temp dir lives under it).
     return ChatlyticsAdapter(
         _FakePlatformConfig(
             extra={
                 "base_url": BASE_URL,
                 "api_key": API_KEY,
                 "account_id": "acct-1",
+                "upload_allowed_roots": tempfile.gettempdir(),
             }
         )
     )
@@ -316,7 +322,11 @@ async def test_keep_typing_heartbeats_every_30s(
     )
     await adapter.connect()
 
-    async with adapter._keep_typing(CHAT_ID, interval=0.05):
+    # HERMES-08 BL-01 fix: the async-cm flavor is now ``_typing_scope``.
+    # ``_keep_typing`` is the plain coroutine that honors the upstream
+    # base contract (called by ``asyncio.create_task`` in
+    # gateway.platforms.base._process_message_background).
+    async with adapter._typing_scope(CHAT_ID, interval=0.05):
         await asyncio.sleep(0.12)
         in_block = typing_route.call_count
 
@@ -356,8 +366,8 @@ async def test_keep_typing_swallows_send_typing_errors(
     )
     await adapter.connect()
     body_ran = False
-    async with adapter._keep_typing(CHAT_ID, interval=0.05):
+    async with adapter._typing_scope(CHAT_ID, interval=0.05):
         await asyncio.sleep(0.06)
         body_ran = True
-    assert body_ran, "_keep_typing must not abort the wrapped body on typing errors"
+    assert body_ran, "_typing_scope must not abort the wrapped body on typing errors"
     await adapter.disconnect()
