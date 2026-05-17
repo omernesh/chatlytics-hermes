@@ -19,8 +19,13 @@ summary:
   low: 1
   info: 4
   total: 6
-status: findings_present
-overall_verdict: APPROVE_WITH_NITS
+status: findings_fixed
+overall_verdict: APPROVE
+fix_pass:
+  commit: 717f73e
+  fixed_findings: [WARNING-01, INFO-01]
+  deferred_findings: [LOW-01, INFO-02, INFO-03, INFO-04]
+  final_tests: "65/65"
 ---
 
 # Phase 9 Code Review — Observability + Log Hygiene
