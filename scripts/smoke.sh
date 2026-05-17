@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# chatlytics-hermes -- dockerized release smoke test (HERMES-06).
+# chatlytics-hermes -- dockerized release smoke test (HERMES-06 + HERMES-07).
 #
 # Spins up a fresh python:3.13-slim container, installs hermes-agent
 # from the v2026.5.16 tag and this package editable, then asserts:
 #
 #   1. ``from chatlytics_hermes import register`` succeeds.
 #   2. The ``chatlytics`` entry point is discoverable under the
-#      ``hermes_agent.plugins`` group (via pkg_resources). This is the
-#      check Hermes uses internally -- ``hermes plugins list`` on the
-#      CLI only enumerates plugins installed via ``hermes plugins
+#      ``hermes_agent.plugins`` group (via importlib.metadata). This is
+#      the check Hermes uses internally -- ``hermes plugins list`` on
+#      the CLI only enumerates plugins installed via ``hermes plugins
 #      install <repo>``, NOT pip entry-point plugins like this one.
 #   3. ``pytest tests/`` reports zero failures.
+#   4. (HERMES-07) Live-loader integration: tests/test_live_loader.py
+#      drives the real PluginContext contract -- ``register(ctx)``
+#      registers the chatlytics platform and all 21 tools.
 #
 # Exits 0 on full success, non-zero otherwise.
 #
@@ -49,8 +52,12 @@ assert \"chatlytics\" in names, f\"chatlytics not found in entry-points group; g
 print(f\"entry-points OK: chatlytics in {names}\")
 "
 
-    echo "--- smoke step 3/3: pytest tests/ ---"
+    echo "--- smoke step 3/4: pytest tests/ ---"
     pytest tests/ -q
+
+    echo "--- smoke step 4/4: live-loader integration ---"
+    pytest tests/test_live_loader.py -q --no-header --tb=short
+    echo "live-loader: chatlytics platform + 21 tools registered"
 
     echo "--- smoke PASS ---"
   '
