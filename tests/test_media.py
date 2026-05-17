@@ -228,6 +228,69 @@ async def test_send_image_file_uploads_local_bytes(
     await adapter.disconnect()
 
 
+# --- 04-MED-02 regression: file read off the event loop ---------------
+
+async def test_send_image_file_reads_off_event_loop(
+    adapter: ChatlyticsAdapter,
+    mock_router: respx.MockRouter,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_resolve_media_url`` must read local files via ``asyncio.to_thread``.
+
+    Regression for 04-REVIEW MED-02 (surfaced through 05-REVIEW MED-02):
+    the local-file branch of ``_resolve_media_url`` previously called
+    ``open()`` + ``fh.read()`` directly on the event loop thread, which
+    blocks all other coroutines for the duration of the read on
+    multi-MB files. HERMES-06 wraps the read in ``asyncio.to_thread``.
+
+    We assert the wrap is in effect by capturing the thread on which
+    ``open()`` runs: it must NOT be the main thread (the loop thread).
+    """
+    import builtins
+    import threading
+
+    img_path = tmp_path / "x.png"
+    fake_png = b"\x89PNG\r\n\x1a\n" + b"check-thread"
+    img_path.write_bytes(fake_png)
+
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    mock_router.post("/api/v1/upload").mock(
+        return_value=httpx.Response(200, json={"url": "https://cdn.test/x.png"})
+    )
+    mock_router.post("/api/v1/send-media").mock(
+        return_value=httpx.Response(200, json={"success": True, "messageId": "m-thr"})
+    )
+
+    main_thread = threading.main_thread()
+    threads_seen: list[threading.Thread] = []
+    real_open = builtins.open
+
+    def spy_open(*args, **kwargs):  # noqa: ANN001 -- builtin shim
+        # Record the thread that performed the open. ``_resolve_media_url``
+        # is the only path under test that opens ``img_path`` -- other
+        # opens (e.g. inside respx, pytest plumbing) MAY hit the main
+        # thread legitimately, so only record opens against our fixture
+        # file.
+        if args and str(args[0]) == str(img_path):
+            threads_seen.append(threading.current_thread())
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", spy_open)
+
+    await adapter.connect()
+    result = await adapter.send_image_file(CHAT_ID, str(img_path), caption="thr")
+    assert result.success is True
+
+    assert threads_seen, "open() was never called against the test file"
+    for thr in threads_seen:
+        assert thr is not main_thread, (
+            f"open() on local media path ran on the main/event-loop thread "
+            f"({thr!r}); _resolve_media_url must use asyncio.to_thread"
+        )
+    await adapter.disconnect()
+
+
 # --- AC-7: _keep_typing heartbeats every interval --------------------
 
 async def test_keep_typing_heartbeats_every_30s(

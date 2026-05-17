@@ -463,11 +463,19 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         elif isinstance(resource, str) and resource.startswith(("http://", "https://")):
             return resource
         else:
-            # Local file path.
+            # Local file path. The blocking ``open()+read()`` runs in a
+            # worker thread via ``asyncio.to_thread`` so concurrent media
+            # tool invocations do not stall the event loop while a
+            # multi-MB file is read off disk (fix for 04-MED-02 / surfaced
+            # by HERMES-05 tool layer in 05-MED-02).
             path = str(resource)
-            with open(path, "rb") as fh:
-                content = fh.read()
-            name = upload_filename or os.path.basename(path) or "upload.bin"
+
+            def _read_file() -> tuple[bytes, str]:
+                with open(path, "rb") as fh:
+                    return fh.read(), os.path.basename(path) or "upload.bin"
+
+            content, basename = await asyncio.to_thread(_read_file)
+            name = upload_filename or basename
             ctype = content_type or _guess_content_type(name)
             upload_response = await self._client.upload_file(
                 filename=name, content=content, content_type=ctype
