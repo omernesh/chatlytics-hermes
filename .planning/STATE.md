@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v2.1
 milestone_name: — Tech debt resolution + live-loader integration
-status: planning
-stopped_at: v2.1 ROADMAP re-prioritized 2026-05-17 — HERMES-08 elevated to BLOCKER+HIGH fixes after GSD milestone review (v2.0.0 DO NOT PUSH publicly until v2.1 lands)
+status: shipped_local
+stopped_at: v2.1.0 LOCAL TAG created 2026-05-17 -- all 6 phases done, 88/88 tests, operator push pending
 last_updated: "2026-05-17T00:00:00.000Z"
-last_activity: 2026-05-17 -- GSD milestone-wide review verdict FIX_FIRST (1 BLOCKER, 3 HIGH); BL-01/HI-01/HI-03 folded into HERMES-08; HERMES-07 expanded to surface BL-01 under test
+last_activity: 2026-05-17 -- v2.1.0 tagged locally (no push, no PyPI per operator lock); Phase 12 APPROVE; milestone v2.1 ready for operator review
 progress:
   total_phases: 6
-  completed_phases: 5
+  completed_phases: 6
   total_plans: 0
   completed_plans: 0
-  percent: 0
+  percent: 100
 ---
 
 # Project State
@@ -26,10 +26,10 @@ See: `.planning/PROJECT.md`
 
 ## Current Position
 
-Phase: HERMES-07 (not started)
-Plan: —
-Status: planning
-Last activity: 2026-05-17 — v2.1 milestone scaffolded; 6 phases derived from v2.0 audit findings.
+Phase: HERMES-12 (done)
+Plan: 12-PLAN-1 (done)
+Status: shipped_local (v2.1.0 tagged locally; awaiting operator push)
+Last activity: 2026-05-17 — Phase 12 complete; `v2.1.0` LOCAL tag created; milestone v2.1 done.
 
 ## v2.1 Phase Plan (6 phases, HERMES-07 → HERMES-12)
 
@@ -40,7 +40,7 @@ Last activity: 2026-05-17 — v2.1 milestone scaffolded; 6 phases derived from v
 | HERMES-09 — Observability + log hygiene | Done | HERMES-08 | 02-LOW-01, 02-LOW-02, 05-LOW-01, LO-11 | DONE 2026-05-17. Consolidated `send_typing` log levels (WARN→DEBUG via internal `_send_typing_once`); added diagnostic logs to 6 silent paths; reserved-metadata WARN per dropped key; new `tests/test_observability.py` (7 tests). 65/65 tests pass. REVIEW APPROVE_WITH_NITS, WARNING-01 + INFO-01 fixed in fix-pass; LOW-01 + INFO-02..04 deferred to Phase 10/12. |
 | HERMES-10 — Input validation + UX alignment | Ready | HERMES-09 | 03-LOW-01, 05-LOW-02, 05-LOW-03, 02-LOW-03 | Validate `webhook_path` at `__init__`. Optional `looksLikeJid` for media-tool schemas. Align `chatlytics_login` semantics with MCP. Document `get_chat_info` `{}` shape. |
 | HERMES-11 — Test infra cleanup | Done | HERMES-10 | 02-MED-02, 06-LOW-01, PR-MED-03, PR-INFO-02 | DONE 2026-05-17. Conftest yield teardown + idempotency guard; tests/_fixtures.FakePlatformConfig consolidates 7 dup shims; scripts/smoke.sh --fast (opt-in) + pip --retries 3. 88/88 tests pass. REVIEW APPROVE (0 BLOCKER, 0 HIGH, 0 MED, 1 LOW, 2 INFO; no fix-pass needed). |
-| HERMES-12 — Release v2.1.0 | Ready | HERMES-07..11 | 05-MED-01 docs, 04-LOW-02 docs | CHANGELOG 2.1.0 (additive, NOT BREAKING). README updates. pyproject bump to 2.1.0. Tag `v2.1.0`. NO PyPI publish (operator lock). |
+| HERMES-12 — Release v2.1.0 | Done | HERMES-07..11 | 05-MED-01 docs, 04-LOW-02 docs, PR-MED-04 | DONE 2026-05-17. CHANGELOG 2.1.0 prepended (security-led, additive). README + What's new + Known issues. pyproject + plugin.yaml bumped to 2.1.0. plugin.yaml phase-IDs stripped. `v2.1.0` LOCAL tag created (no push, no PyPI per operator lock). 88/88 tests pass. REVIEW APPROVE (0 BLOCKER/HIGH/MED/LOW, 2 INFO). |
 
 ## v2.1 Architectural Invariants (every phase preserves)
 
@@ -60,10 +60,10 @@ Autonomous-only (unchanged from v2.0): pytest + mocked aiohttp/respx + clean-ven
 
 ## Session Continuity
 
-Last session: 2026-05-17 — v2.0 shipped autonomously; v2.1 milestone immediately scaffolded from the v2.0 audit's carry-forward MED/LOW items. Two parallel reviews (gsd-code-review + pr-review-toolkit) running in background.
-Stopped at: v2.1 milestone scaffolded, awaiting operator decision on whether to run `/gsd-autonomous --from 7 --to 12` now or after reviewing the cross-AI review outputs.
-Resume file: `.planning/ROADMAP.md` v2.1 section + this STATE.md.
-Next action: `/gsd-autonomous --from 7 --to 12` (after reviewing `.planning/v2.0-MILESTONE-CODE-REVIEW.md` + `.planning/v2.0-MILESTONE-PR-REVIEW.md` once both background reviews land).
+Last session: 2026-05-17 — v2.1 milestone shipped autonomously (all 6 phases: HERMES-07 through HERMES-12). BL-01 / HI-01 / HI-03 fixed and locked under test. CHANGELOG / README / pyproject.toml / plugin.yaml updated. `v2.1.0` annotated tag created LOCAL ONLY (no push, no PyPI per operator lock).
+Stopped at: v2.1.0 LOCAL TAG created; awaiting operator review and manual push.
+Resume file: `.planning/ROADMAP.md` v2.1 section + this STATE.md + `.planning/phases/HERMES-12-release-v2-1-0/`.
+Next action: Operator review of v2.1.0 release artifact, then `git push origin main && git push origin v2.1.0` when ready. Optionally delete the local `v2.0.0` tag (points at known-broken artifact superseded by v2.1.0).
 
 ## Operator Next Steps
 
