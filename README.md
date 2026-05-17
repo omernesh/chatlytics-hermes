@@ -44,6 +44,41 @@ block (`hermes config edit`).
 | `CHATLYTICS_WEBHOOK_PORT`     | no       | Local port for the aiohttp inbound webhook listener (default: `8765`)             |
 | `CHATLYTICS_WEBHOOK_SECRET`   | no       | HMAC-SHA256 shared secret for `X-Chatlytics-Signature` verification               |
 | `CHATLYTICS_HOME_CHANNEL`     | no       | Default chat_id for cron / notification delivery                                  |
+| `CHATLYTICS_UPLOAD_ALLOWED_ROOTS` | no   | OS-pathsep-separated absolute paths that media tools may read from disk (default-deny when unset; see Security below) |
+
+### Security: filePath upload allowlist (`CHATLYTICS_UPLOAD_ALLOWED_ROOTS`)
+
+The 5 media tools (`chatlytics_send_image`, `chatlytics_send_voice`,
+`chatlytics_send_video`, `chatlytics_send_file`,
+`chatlytics_send_animation`) accept an optional `filePath` parameter
+that uploads a local file to the Chatlytics gateway. To prevent
+prompt-injection or LLM-manipulation attacks from reading arbitrary
+host files (e.g. `/etc/passwd`, `C:\Windows\System32\config\SAM`),
+local-file uploads are **default-deny**: every `filePath` value is
+rejected unless it resolves under a configured allowed root.
+
+Configure the allowlist via `CHATLYTICS_UPLOAD_ALLOWED_ROOTS`, using
+the OS path separator (`:` on POSIX, `;` on Windows):
+
+```bash
+# POSIX
+export CHATLYTICS_UPLOAD_ALLOWED_ROOTS="/var/lib/chatlytics/uploads:/tmp/chatlytics"
+```
+
+```powershell
+# Windows PowerShell
+$env:CHATLYTICS_UPLOAD_ALLOWED_ROOTS = "C:\Users\Public\Documents\chatlytics;C:\Temp\chatlytics"
+```
+
+When `CHATLYTICS_UPLOAD_ALLOWED_ROOTS` is **unset**, every `filePath`
+upload returns
+`{"success": false, "error": "Permission denied: Local file uploads are disabled; ..."}`.
+URL-based uploads via `mediaUrl` are unaffected — only the local-file
+path is gated.
+
+Recommended practice: point the allowlist at a dedicated upload
+directory that is OS-owned (mode `0700`), and pipe agent-produced
+files through that directory before invoking a media tool.
 
 ### YAML config (optional)
 
