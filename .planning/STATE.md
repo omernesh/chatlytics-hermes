@@ -3,9 +3,9 @@ gsd_state_version: 1.0
 milestone: v2.1
 milestone_name: — Tech debt resolution + live-loader integration
 status: planning
-stopped_at: v2.1 ROADMAP scaffolded 2026-05-17 — 6 phases (HERMES-07..HERMES-12) scoped from v2.0 audit
+stopped_at: v2.1 ROADMAP re-prioritized 2026-05-17 — HERMES-08 elevated to BLOCKER+HIGH fixes after GSD milestone review (v2.0.0 DO NOT PUSH publicly until v2.1 lands)
 last_updated: "2026-05-17T00:00:00.000Z"
-last_activity: 2026-05-17 -- v2.1 milestone scaffolded; tech debt phases derived from .planning/v2.0-MILESTONE-AUDIT.md
+last_activity: 2026-05-17 -- GSD milestone-wide review verdict FIX_FIRST (1 BLOCKER, 3 HIGH); BL-01/HI-01/HI-03 folded into HERMES-08; HERMES-07 expanded to surface BL-01 under test
 progress:
   total_phases: 6
   completed_phases: 0
@@ -33,10 +33,10 @@ Last activity: 2026-05-17 — v2.1 milestone scaffolded; 6 phases derived from v
 
 ## v2.1 Phase Plan (6 phases, HERMES-07 → HERMES-12)
 
-| Phase | Status | Depends on | Closes (v2.0 carry-forward) | Notes |
-|-------|--------|------------|------------------------------|-------|
-| HERMES-07 — Live-loader integration smoke | Ready | v2.0 shipped | 06-MED-01 | Wire `gateway.bootstrap.load_plugins()` against respx-mocked Chatlytics; assert 21 tools land on `PluginContext` registry. Strongest v2.0 test gap. |
-| HERMES-08 — Async lifecycle hardening | Ready | HERMES-07 | 04-MED-01, 04-LOW-03, 06-LOW-02 | Resolve `_keep_typing` shape divergence (rename + compat wrapper OR upstream PR). Fire-and-forget initial heartbeat. Concurrency regression test for `_resolve_media_url`. |
+| Phase | Status | Depends on | Closes | Notes |
+|-------|--------|------------|--------|-------|
+| HERMES-07 — Live-loader integration smoke | Ready | v2.0 shipped (local) | 06-MED-01, GSD-MD-04 | Wire `gateway.bootstrap.load_plugins()` against respx-mocked Chatlytics; assert 21 tools land. **Includes BL-01 + HI-01 + HI-03 regression tests (xfail-marked here, un-xfailed in HERMES-08).** Strongest v2.0 test gap + the harness gap that hid BL-01. |
+| HERMES-08 — Critical safety fixes + async lifecycle | Ready | HERMES-07 | **BL-01 (BLOCKER), HI-01 (HIGH), HI-03 (HIGH), MD-01**, 04-MED-01, 04-LOW-03, 06-LOW-02 | **Top of the milestone in importance.** `_keep_typing` rewrite as plain coroutine + `_typing_scope` async-cm wrapper for in-plugin sites. `filePath` allowlist via `CHATLYTICS_UPLOAD_ALLOWED_ROOTS` env var. `**kwargs` on `send_image`/`send_animation`. Success-shape coercion dedup. Plus original async lifecycle items. |
 | HERMES-09 — Observability + log hygiene | Ready | HERMES-08 | 02-LOW-01, 02-LOW-02, 05-LOW-01 | Consolidate `send_typing` log levels. Add diagnostic logs to silent error paths. Warn on dropped reserved-name metadata. |
 | HERMES-10 — Input validation + UX alignment | Ready | HERMES-09 | 03-LOW-01, 05-LOW-02, 05-LOW-03, 02-LOW-03 | Validate `webhook_path` at `__init__`. Optional `looksLikeJid` for media-tool schemas. Align `chatlytics_login` semantics with MCP. Document `get_chat_info` `{}` shape. |
 | HERMES-11 — Test infra cleanup | Ready | HERMES-10 | 02-MED-02, 06-LOW-01 | Teardown for conftest platform_registry seed. Smoke build cache layer or pre-built docker. Optional `--fast` flag. |
@@ -67,6 +67,7 @@ Next action: `/gsd-autonomous --from 7 --to 12` (after reviewing `.planning/v2.0
 
 ## Operator Next Steps
 
-- (v2.0 close-out) `git push origin main && git push origin v2.0.0` — operator action, still pending
-- (v2.1 kick-off) After background reviews land: integrate their findings into v2.1 phases if any cross HIGH/BLOCKER thresholds, then run `/gsd-autonomous --from 7 --to 12`
-- (v2.1 ship) When v2.1 completes: same operator-push pattern, then optionally bundle v2.0+v2.1 for the future PyPI publish (still operator-locked)
+- **DO NOT push v2.0.0 publicly.** The GSD milestone review (`.planning/v2.0-MILESTONE-CODE-REVIEW.md`, verdict FIX_FIRST) confirmed BL-01 (`_keep_typing` crashes on first inbound) + HI-01 (path traversal via `filePath` tool param) + HI-03 (brittle `**kwargs` gap). `git push origin main` is fine (advances the branch); `git push origin v2.0.0` would publish a tag pointing at a known-broken artifact.
+- (v2.1 kick-off) Run `/gsd-autonomous --from 7 --to 12`. HERMES-07 reproduces BL-01/HI-01 under test (xfail-marked); HERMES-08 fixes them and un-xfails.
+- (v2.1 ship) When v2.1 completes: push `main` + `v2.1.0` tag (v2.0.0 stays as a local checkpoint; v2.1.0 supersedes it). Optionally bundle v2.0+v2.1 for the future PyPI publish (still operator-locked).
+- (after v2.1) Decide whether to delete the local `v2.0.0` tag (since it points at a known-broken artifact) or keep it as a build checkpoint. Recommend delete after `v2.1.0` is tagged.

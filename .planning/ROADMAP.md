@@ -268,24 +268,34 @@ This runs discuss → plan → execute → review → commit for each phase in s
 
 ---
 
-## v2.1 — Tech debt resolution + live-loader integration
+## v2.1 — Critical safety fixes + tech debt resolution + live-loader integration
 
-Close every MED/LOW finding carried forward from the v2.0 audit (`.planning/v2.0-MILESTONE-AUDIT.md`) and prove the plugin works against a real `PluginContext` end-to-end (not just at the entry-point discovery layer). Six phases, additive/non-breaking, ships as `v2.1.0`. NO PyPI publish (operator lock preserved). Designed for `/gsd-autonomous --from 7 --to 12`.
+**RE-PRIORITIZED 2026-05-17** after the milestone-wide GSD code review (`.planning/v2.0-MILESTONE-CODE-REVIEW.md`) surfaced **1 BLOCKER (BL-01) + 2 HIGH (HI-01, HI-03)** that the per-phase reviews missed:
 
-### Phase 7: Live-loader integration smoke
-**Goal:** Wire `hermes.gateway.bootstrap.load_plugins()` (or whatever the v0.14 loader entry point is — confirm against `/tmp/hermes-ref-v0.14.0/hermes_cli/plugins.py`) against a respx-mocked Chatlytics backend and prove the chatlytics plugin loads, `register(ctx)` is called, and all 21 tools land on the in-memory `PluginContext` registry. Closes 06-MED-01 (the strongest v2.0 test gap).
+- **BL-01:** `_keep_typing` async-cm override will crash the inbound dispatch path on the FIRST production inbound message (`adapter.py:741-806` — upstream base calls `asyncio.create_task(self._keep_typing(chat_id, metadata=...))`; chatlytics doesn't accept `metadata` AND the asynccontextmanager returns a non-coroutine). Hidden because `tests/test_inbound.py` replaces `handle_message` with a recorder and the smoke script never starts a live gateway.
+- **HI-01:** Tool surface exposes an arbitrary local file read primitive (`tools.py:611-705` media tools accept `filePath` with zero validation → `chatlytics_send_file(filePath="/etc/passwd")` exfiltrates files to Chatlytics).
+- **HI-03:** Two of six media overrides drop `**kwargs` (`send_image`, `send_animation` in `adapter.py`) → brittle to upstream signature evolution.
 
-**Depends on:** v2.0 milestone (shipped)
+**→ DO NOT push `v2.0.0` publicly until v2.1 lands.** The local v2.0.0 tag is fine as a checkpoint; pushing it ships a known-broken-on-first-inbound plugin. Ship as `v2.1.0` instead.
+
+Close the BLOCKER + 2 HIGHs FIRST (HERMES-07 surfaces the BLOCKER via live-loader test; HERMES-08 fixes BL-01 + HI-01 + HI-03), then close every remaining MED/LOW from the v2.0 audit and the two milestone-wide reviews. Six phases total, additive/non-breaking from the public API perspective (BL-01 fix changes internal `_keep_typing` shape but the convenience `_typing_scope` async-cm preserves the in-plugin call sites). Ships as `v2.1.0`. NO PyPI publish (operator lock preserved). Designed for `/gsd-autonomous --from 7 --to 12`.
+
+### Phase 7: Live-loader integration smoke (surfaces BL-01)
+**Goal:** Wire `hermes.gateway.bootstrap.load_plugins()` (or whatever the v0.14 loader entry point is — confirm against `/tmp/hermes-ref-v0.14.0/hermes_cli/plugins.py`) against a respx-mocked Chatlytics backend and prove the chatlytics plugin loads, `register(ctx)` is called, and all 21 tools land on the in-memory `PluginContext` registry. CRITICALLY: include a test that exercises the BASE `handle_message` pipeline (NOT the recorder-replacement pattern from `test_inbound.py:98-106` that hid BL-01) so the BLOCKER is reproduced and locked under test. Closes 06-MED-01 + GSD-review **MD-04** (test harness bypass).
+
+**Depends on:** v2.0 milestone (shipped, local-only)
 
 **In scope:**
-- New test file `tests/test_live_loader.py` — spin up a real `PluginContext` (or the closest reachable substitute), invoke the gateway plugin loader, assert `chatlytics` platform is registered AND all 21 tools are registered on the same context
+- New test file `tests/test_live_loader.py` — spin up a real `PluginContext` (or the closest reachable substitute via `hermes_cli/plugins.py:613`), invoke the gateway plugin loader, assert `chatlytics` platform is registered AND all 21 tools are registered on the same context
 - respx-mocked Chatlytics backend for any in-loader HTTP probes (avoid live calls)
+- **Critical regression test:** `test_base_handle_message_invokes_keep_typing` — instantiate the adapter, install an `AsyncMock` `_message_handler` (so the base path runs but returns immediately), feed it a `MessageEvent`, assert NO `TypeError` from `_keep_typing(chat_id, metadata=...)`. This test MUST FAIL on the current v2.0 code (reproducing BL-01) and pass after HERMES-08 fixes it.
+- Direct `_keep_typing` test: `asyncio.create_task(adapter._keep_typing(chat_id, metadata={}, stop_event=asyncio.Event()))` — asserts the method IS a coroutine, accepts both kwargs, and respects `stop_event.set()`. Currently fails (asynccontextmanager doesn't return a coroutine).
 - Add a `--live-loader` step to `scripts/smoke.sh` (or a separate `scripts/smoke-live-loader.sh`) so CI/release verification includes it
 - Document the loader contract findings in `src/chatlytics_hermes/__init__.py` docstring
 
 **Out of scope:**
 - Live Chatlytics gateway calls (still operator-lock-blocked)
-- Changes to `register()` shape (tests adapt to existing code, not vice versa, unless a defect surfaces)
+- The actual BL-01 / HI-01 / HI-03 fixes (those land in HERMES-08 — this phase is about REPRODUCING them under test first)
 - New tools
 
 **Files (create/modify):**
@@ -295,41 +305,61 @@ Close every MED/LOW finding carried forward from the v2.0 audit (`.planning/v2.0
 
 **Acceptance criteria:**
 1. `pytest tests/test_live_loader.py::test_loader_registers_chatlytics_platform -q` passes — loader sees and calls `register(ctx)`
-2. `tests/test_live_loader.py::test_loader_registers_21_tools` — after load, `ctx.registered_tools` (or equivalent registry) contains exactly the 21 expected tool names
+2. `tests/test_live_loader.py::test_loader_registers_21_tools` — after load, the in-memory tool registry contains exactly the 21 expected tool names
 3. `tests/test_live_loader.py::test_loader_handles_missing_env_vars_gracefully` — when required env vars are unset, the loader produces a clear error (not a crash) and does NOT half-register
 4. `tests/test_live_loader.py::test_loader_isolated_from_real_chatlytics` — respx pass-through OFF for chatlytics endpoints; any live call attempt raises
-5. `bash scripts/smoke.sh` exit 0 with the new live-loader step included
-6. Smoke output explicitly mentions "live-loader: chatlytics platform + 21 tools registered"
+5. `tests/test_live_loader.py::test_base_handle_message_invokes_keep_typing` is checked-in (xfail-marked in HERMES-07; un-xfailed in HERMES-08 after BL-01 fix)
+6. `tests/test_live_loader.py::test_keep_typing_is_a_coroutine` is checked-in with same xfail pattern (matches the BL-01 acceptance test from the GSD review)
+7. `bash scripts/smoke.sh` exit 0 with the new live-loader step included; output mentions "live-loader: chatlytics platform + 21 tools registered"
 
 ---
 
-### Phase 8: Async lifecycle hardening
-**Goal:** Resolve the `_keep_typing` shape divergence (closes 04-MED-01), convert `_keep_typing` initial fire to fire-and-forget so wrapped bodies aren't delayed (closes 04-LOW-03), bump first-fire failure log to WARNING for visibility (closes 06-LOW-02), and add a concurrency regression test for `_resolve_media_url` after the v2.0 `asyncio.to_thread` fix.
+### Phase 8: Critical safety fixes (BL-01 BLOCKER + HI-01 HIGH + HI-03 HIGH) + async lifecycle hardening
+**Goal:** Fix every BLOCKER and HIGH finding from the GSD milestone-wide review (`.planning/v2.0-MILESTONE-CODE-REVIEW.md`) so the plugin is safe to push publicly. Also closes the original v2.0-audit MED items co-located in the same code (`_keep_typing` lifecycle / 04-MED-01, 04-LOW-03, 06-LOW-02) plus concurrency regression coverage for the v2.0 `_resolve_media_url` `asyncio.to_thread` fix.
 
-**Depends on:** Phase 7 (live-loader proves which shape upstream expects under real load)
+**Depends on:** Phase 7 (BL-01/HI-01 regression tests checked in xfail; this phase un-xfails them after fix)
 
-**In scope:**
-- Decide between (a) rename `_keep_typing` → `keep_typing_block()` + thin base-coroutine compat wrapper that calls the new method, or (b) upstream PR to `hermes-agent` to relax the base contract. Decision goes in PLAN.md based on real upstream behavior observed in Phase 7.
-- Convert `_keep_typing` initial-fire to fire-and-forget (`asyncio.create_task` instead of `await`)
-- Bump first-fire failure logging to WARNING (subsequent heartbeats stay at DEBUG to prevent log flood)
-- Add `tests/test_concurrency.py` with at least one regression test asserting `_resolve_media_url` doesn't block the event loop under concurrent calls (use `asyncio.gather` + timing assertion)
+**In scope — CRITICAL FIXES (lead these commits, before the lifecycle polish):**
+
+1. **BL-01 fix** (`src/chatlytics_hermes/adapter.py:741-806`): Rewrite `_keep_typing` as a plain coroutine matching the upstream base signature `(self, chat_id, interval=30.0, metadata=None, stop_event=None)`. Move the existing `@asynccontextmanager` flavor to `_typing_scope` (preserves the in-plugin tool-handler ergonomics). Reference implementation in `.planning/v2.0-MILESTONE-CODE-REVIEW.md` BL-01 Option A.
+
+2. **HI-01 fix** (`src/chatlytics_hermes/tools.py:611-705` + `adapter.py:434-501` `_resolve_media_url`): Add an env-configured path allowlist for `filePath` uploads. New env var `CHATLYTICS_UPLOAD_ALLOWED_ROOTS` (defaults to `/tmp` on POSIX, `C:\Users\Public\Documents` on Windows — or empty meaning local-file uploads disabled). `_resolve_media_url` rejects any local path not under an allowed root with `PermissionError`. The 5 media tools return `{"success": False, "error": "..."}` instead of raising.
+
+3. **HI-03 fix** (`src/chatlytics_hermes/adapter.py`): Add `**kwargs: Any` to `send_image` (lines 605-624) and `send_animation` (lines 626-642) signatures. Document them as "swallowed for forward-compat with upstream base evolution." Bring all 6 media overrides to a consistent shape.
+
+4. **MD-01 fix (cross-phase consistency)** (`adapter.py:_make_send_result`, `_standalone_send`, `tools.py:_ok`): Consolidate the three subtly-different success-shape coercions into one canonical helper. Pick the cleanest predicate from `tools._ok` and apply it everywhere. Tests verify identical behavior across all three call sites.
+
+**In scope — original async-lifecycle items (after the critical fixes):**
+
+5. Convert `_keep_typing` initial-fire to fire-and-forget so wrapped tool bodies aren't blocked up to 30s on a degraded gateway (closes 04-LOW-03)
+6. Bump first-fire failure logging to WARNING (subsequent heartbeats stay at DEBUG to prevent log flood) — closes 06-LOW-02
+7. Add `tests/test_concurrency.py` with regression tests asserting `_resolve_media_url` doesn't block the event loop under concurrent calls (closes the v2.0 fix at commit `5e00da9` with a real regression guard)
 
 **Out of scope:**
 - New media handlers
-- Tool surface changes
+- Tool surface changes (still 21 tools)
+- Live Chatlytics gateway calls
 
 **Files (create/modify):**
-- MODIFY `src/chatlytics_hermes/adapter.py` (`_keep_typing` rename/wrapper + fire-and-forget + log level)
+- MODIFY `src/chatlytics_hermes/adapter.py` (`_keep_typing` rewrite + `_typing_scope` extraction + `send_image`/`send_animation` `**kwargs` + `_resolve_media_url` allowlist + `_make_send_result` consolidation)
+- MODIFY `src/chatlytics_hermes/tools.py` (`_ok` canonical helper + 5 media-tool error returns)
 - CREATE `tests/test_concurrency.py`
-- MODIFY existing `tests/test_media.py` if rename breaks fixtures
+- MODIFY `tests/test_media.py` (update `test_keep_typing_heartbeats_every_30s` to use `_typing_scope`; add BL-01 fix regression test if HERMES-07 didn't already cover it)
+- MODIFY `tests/test_live_loader.py` (un-xfail the BL-01 / HI-01 / HI-03 regression tests added in HERMES-07)
+- MODIFY `tests/test_tools.py` (add HI-01 path-traversal negative tests for each of 5 media tools)
 
 **Acceptance criteria:**
-1. `pytest tests/test_media.py::test_keep_typing_heartbeats_every_30s` still passes (regression)
-2. `tests/test_concurrency.py::test_keep_typing_initial_fire_does_not_block` — wrapped body starts within 10ms even if first typing request hangs
-3. `tests/test_concurrency.py::test_resolve_media_url_off_event_loop` — concurrent media uploads don't serialize on file I/O
-4. `tests/test_concurrency.py::test_keep_typing_first_fire_failure_logs_warning` — caplog captures WARNING on first-fire failure
-5. If shape decision is (a) rename + wrapper: HERMES-04 `_keep_typing` callers still work; the base-coroutine entry point is reachable (test exercises both)
-6. If shape decision is (b) upstream PR: link the PR in PLAN.md and document the in-tree workaround used until the PR lands
+1. `tests/test_live_loader.py::test_base_handle_message_invokes_keep_typing` PASSES (was xfailed in HERMES-07; BL-01 fixed)
+2. `tests/test_live_loader.py::test_keep_typing_is_a_coroutine` PASSES (was xfailed in HERMES-07)
+3. `tests/test_media.py::test_keep_typing_heartbeats_every_30s` still passes (via `_typing_scope`, no regression)
+4. `tests/test_tools.py::test_chatlytics_send_file_rejects_path_outside_allowed_roots` — calling `chatlytics_send_file(chatId="...", filePath="/etc/passwd")` returns `{"success": False, "error": "..."}` and NO file is opened, NO upload is attempted (verify via mock assertions)
+5. Same path-traversal negative test for the other 4 media tools (`send_image`, `send_voice`, `send_video`, `send_animation`) — 5 tests total
+6. `tests/test_concurrency.py::test_keep_typing_initial_fire_does_not_block` — wrapped body starts within 10ms even if first typing request hangs
+7. `tests/test_concurrency.py::test_resolve_media_url_off_event_loop` — concurrent media uploads don't serialize on file I/O
+8. `tests/test_concurrency.py::test_keep_typing_first_fire_failure_logs_warning` — caplog captures WARNING on first-fire failure
+9. `inspect.signature(ChatlyticsAdapter.send_image)` AND `inspect.signature(ChatlyticsAdapter.send_animation)` both include `**kwargs` parameter (HI-03 regression)
+10. Single canonical success-shape helper used by `_make_send_result`, `_standalone_send`, and `tools._ok` — MD-01 dedup verified by code reading
+11. Full pre-existing 45 + new tests all pass in dockerized smoke
 
 ---
 
