@@ -6,7 +6,7 @@ Replace the v1.x standalone-shim API with a proper Hermes plugin against
 `hermes-agent>=0.14,<0.15`. Six phases, designed for end-to-end execution via
 `/gsd-autonomous --from HERMES-01 --to HERMES-06`.
 
-### Phase HERMES-01: Upstream contract scaffolding
+### Phase 1: Upstream contract scaffolding
 **Goal:** Bare `BasePlatformAdapter` subclass + `plugin.yaml` + `register(ctx)` entry point + pinned `hermes-agent>=0.14,<0.15` dependency. No outbound or inbound logic yet — purely the structural contract that lets Hermes load the plugin and call `register()`.
 
 **Depends on:** Nothing (entry phase)
@@ -43,7 +43,7 @@ Replace the v1.x standalone-shim API with a proper Hermes plugin against
 
 ---
 
-### Phase HERMES-02: Outbound text + control parity
+### Phase 2: Outbound text + control parity
 **Goal:** Implement `connect()`, `disconnect()`, `send()`, `send_typing()`, `get_chat_info()` against the Chatlytics REST API via `httpx.AsyncClient`. Establish `SendResult` return contract. No media yet (HERMES-04), no inbound yet (HERMES-03).
 
 **Depends on:** HERMES-01
@@ -81,7 +81,7 @@ Replace the v1.x standalone-shim API with a proper Hermes plugin against
 
 ---
 
-### Phase HERMES-03: Inbound transport migration
+### Phase 3: Inbound transport migration
 **Goal:** Replace v1.x Flask-in-a-thread inbound with an aiohttp server started **inside** `connect()` and stopped in `disconnect()`. Normalize webhook JSON → Hermes `MessageEvent` via `MessageType.{TEXT,IMAGE,AUDIO,VIDEO,DOCUMENT,STICKER}`, then dispatch via `await self.handle_message(event)`.
 
 **Depends on:** HERMES-02
@@ -120,7 +120,7 @@ Replace the v1.x standalone-shim API with a proper Hermes plugin against
 
 ---
 
-### Phase HERMES-04: Media + UX polish + cron
+### Phase 4: Media + UX polish + cron
 **Goal:** Implement all 6 `BasePlatformAdapter` media-send variants — `send_image`, `send_voice`, `send_video`, `send_document`, `send_animation`, `send_image_file` — wired to Chatlytics media endpoints. Add `_keep_typing()` 30s heartbeat (WhatsApp 24h window protection). Wire `cron_deliver_env_var="CHATLYTICS_HOME_CHANNEL"` + `standalone_sender_fn` for scheduled deliveries.
 
 **Depends on:** HERMES-03
@@ -158,7 +158,7 @@ Replace the v1.x standalone-shim API with a proper Hermes plugin against
 
 ---
 
-### Phase HERMES-05: Full Chatlytics tool surface
+### Phase 5: Full Chatlytics tool surface
 **Goal:** Expose EVERY Chatlytics action as a Hermes tool via `ctx.register_tool()`. Source the canonical tool list from the Claude Code plugin's MCP server bundle (`servers/chatlytics-mcp.bundle.js` in `omernesh/chatlytics-claude-code`) plus any additional actions enumerable via Chatlytics's `POST /api/v1/actions` schema. Tools must validate inputs via JSON schemas and return `{"success": true, ...}` shape.
 
 **Depends on:** HERMES-04
@@ -197,7 +197,7 @@ Replace the v1.x standalone-shim API with a proper Hermes plugin against
 
 ---
 
-### Phase HERMES-06: Release + smoke test
+### Phase 6: Release + smoke test
 **Goal:** Rewrite README.md from the v1.x standalone-shim perspective to the v2.0 first-class-plugin perspective. CHANGELOG entry `2.0.0 (BREAKING)`. Smoke test against real `hermes-agent==0.14.0` in a clean venv. Tag `v2.0.0`. **NO PyPI publish.**
 
 **Depends on:** HERMES-05
