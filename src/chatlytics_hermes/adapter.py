@@ -5,11 +5,13 @@ platform: a ``BasePlatformAdapter`` subclass plus the ``register(ctx)``
 entry point that Hermes discovers via the ``hermes_agent.plugins`` entry
 point group declared in ``pyproject.toml``.
 
-HERMES-01 (this phase) scaffolds the contract only.  The abstract
-methods raise ``NotImplementedError`` and will be filled in by:
+HERMES-01 scaffolded the contract.  HERMES-02 (this phase) fills in
+``connect``, ``disconnect``, ``send``, ``send_typing``, and
+``get_chat_info`` against the Chatlytics REST gateway using a shared
+``httpx.AsyncClient`` instance owned by the adapter.
 
-- HERMES-02 -- ``connect``, ``disconnect``, ``send``, ``send_typing``,
-  ``get_chat_info`` (outbound text + control parity)
+Future phases:
+
 - HERMES-03 -- embedded aiohttp inbound webhook server inside
   ``connect`` / ``disconnect`` (inbound transport migration)
 - HERMES-04 -- media handlers (``send_image``, ``send_voice``,
@@ -19,15 +21,20 @@ methods raise ``NotImplementedError`` and will be filled in by:
 
 The upstream import block is wrapped in ``try/except ImportError`` so
 that ``from chatlytics_hermes import register`` works in environments
-without ``hermes-agent`` installed (acceptance criterion 1).  The
-``ChatlyticsAdapter`` class only raises when instantiated without the
-runtime dependency present.
+without ``hermes-agent`` installed (HERMES-01 acceptance criterion 1).
+The ``ChatlyticsAdapter`` class only raises when instantiated without
+the runtime dependency present.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Dict, Optional
+
+import httpx
+
+from .client import ChatlyticsClient
 
 try:
     from gateway.platforms.base import BasePlatformAdapter, SendResult
@@ -43,16 +50,24 @@ except ImportError:  # hermes-agent not installed (e.g. acceptance criterion 1)
     _HERMES_AVAILABLE = False
 
 
+logger = logging.getLogger("chatlytics_hermes.adapter")
+
+
+class ChatlyticsConnectError(RuntimeError):
+    """Raised when the adapter cannot complete its health check on connect."""
+
+
 class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
     """Async Chatlytics adapter implementing the ``BasePlatformAdapter`` contract.
 
     Instantiated by the ``adapter_factory`` passed to
-    ``ctx.register_platform`` in :func:`register`.  All abstract methods
-    raise ``NotImplementedError`` in HERMES-01 and are filled in by
-    subsequent phases.
+    ``ctx.register_platform`` in :func:`register`.  HERMES-02 wires up
+    the outbound text + control surface (connect, disconnect, send,
+    send_typing, get_chat_info).  Inbound webhook + media handlers land
+    in HERMES-03 / HERMES-04.
     """
 
-    def __init__(self, config: Any, **kwargs: Any) -> None:
+    def __init__(self, config: "PlatformConfig", **kwargs: Any) -> None:
         if not _HERMES_AVAILABLE:
             raise RuntimeError(
                 "hermes-agent>=0.14,<0.15 must be installed to instantiate "
@@ -87,23 +102,69 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             os.getenv("CHATLYTICS_HOME_CHANNEL") or extra.get("home_channel")
         )
 
+        # HTTP client is constructed lazily on ``connect()`` so that
+        # misconfigured adapters (empty base_url/api_key) raise only at
+        # connect time, never at registration time.
+        self._client: Optional[ChatlyticsClient] = None
+
     @property
     def name(self) -> str:
         return "Chatlytics"
 
-    # --- Abstract methods (HERMES-02 implements) --------------------------
+    # --- Lifecycle (HERMES-02) ---------------------------------------------
 
     async def connect(self) -> bool:
-        raise NotImplementedError(
-            "ChatlyticsAdapter.connect is filled in by HERMES-02 "
-            "(httpx health check) and extended by HERMES-03 (aiohttp webhook server)."
+        """Connect to the Chatlytics gateway.
+
+        Constructs ``self._client``, then issues ``GET {base_url}/health``.
+        Returns True on 200; raises :class:`ChatlyticsConnectError` on any
+        other status code or transport error.
+
+        HERMES-03 will extend this to also start the embedded aiohttp
+        webhook server -- that addition does not change the health-check
+        preflight.
+        """
+        if self._client is None:
+            self._client = ChatlyticsClient(
+                base_url=self.base_url,
+                api_key=self.api_key,
+            )
+
+        logger.info(
+            "Connecting to Chatlytics gateway at %s",
+            self._client.base_url,
         )
+        try:
+            response = await self._client.get("/health")
+        except httpx.RequestError as exc:
+            # Transport-level error -- close client so the next connect()
+            # can retry from a clean slate.
+            await self._client.aclose()
+            self._client = None
+            raise ChatlyticsConnectError(
+                f"Chatlytics health check failed: {exc}"
+            ) from exc
+
+        if response.status_code != 200:
+            await self._client.aclose()
+            self._client = None
+            raise ChatlyticsConnectError(
+                f"Chatlytics health check returned status "
+                f"{response.status_code}: {response.text[:200]}"
+            )
+
+        self._running = True
+        return True
 
     async def disconnect(self) -> None:
-        raise NotImplementedError(
-            "ChatlyticsAdapter.disconnect is filled in by HERMES-02 "
-            "(httpx client close) and extended by HERMES-03 (aiohttp server stop)."
-        )
+        """Close the httpx client.  Idempotent."""
+        if self._client is not None:
+            logger.info("Disconnecting from Chatlytics gateway")
+            await self._client.aclose()
+            self._client = None
+        self._running = False
+
+    # --- Outbound (HERMES-02) ---------------------------------------------
 
     async def send(
         self,
@@ -111,11 +172,143 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         content: str,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
-    ) -> "SendResult":  # type: ignore[name-defined]
-        raise NotImplementedError(
-            "ChatlyticsAdapter.send is filled in by HERMES-02 "
-            "(POST /api/v1/send via httpx.AsyncClient)."
+    ) -> SendResult:  # type: ignore[name-defined]
+        """POST /api/v1/send with ``{chatId, text, [accountId], [replyTo], ...}``.
+
+        Returns a ``SendResult`` with ``success=True`` and the gateway's
+        reported ``messageId`` on 200, otherwise ``success=False`` with
+        the error in ``error`` and the raw status + body in
+        ``raw_response``.
+        """
+        if self._client is None:
+            return SendResult(
+                success=False,
+                error="Adapter not connected: call connect() before send()",
+            )
+
+        body: Dict[str, Any] = {
+            "chatId": chat_id,
+            "text": content,
+        }
+        if self.account_id:
+            body["accountId"] = self.account_id
+        if reply_to:
+            body["replyTo"] = reply_to
+        if metadata:
+            # Merge non-conflicting metadata keys into the request body so
+            # the gateway can accept platform-specific extras (e.g.
+            # quoted-message context, link previews) without the adapter
+            # owning a schema for them.  Reserved keys cannot be
+            # overridden by the caller.
+            for key, value in metadata.items():
+                if key not in {"chatId", "text", "accountId", "replyTo"}:
+                    body[key] = value
+
+        logger.debug("send -> /api/v1/send chatId=%s len=%d", chat_id, len(content))
+
+        try:
+            response = await self._client.post("/api/v1/send", json=body)
+        except httpx.RequestError as exc:
+            return SendResult(
+                success=False,
+                error=f"Transport error: {exc}",
+                retryable=True,
+            )
+
+        # Tolerate non-JSON bodies for diagnostic surface area.
+        try:
+            payload: Any = response.json()
+        except Exception:  # noqa: BLE001 -- json.JSONDecodeError + httpx variants
+            payload = {"raw_text": response.text}
+
+        if (
+            response.status_code == 200
+            and isinstance(payload, dict)
+            and payload.get("success", True)
+        ):
+            return SendResult(
+                success=True,
+                message_id=payload.get("messageId"),
+                raw_response=payload,
+            )
+
+        error_msg = (
+            payload.get("error") if isinstance(payload, dict) else None
+        ) or f"HTTP {response.status_code}"
+        return SendResult(
+            success=False,
+            error=error_msg,
+            raw_response=payload,
+            retryable=response.status_code >= 500,
         )
+
+    async def send_typing(
+        self,
+        chat_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        duration: float = 3.0,
+    ) -> None:
+        """POST /api/v1/typing with ``{chatId, duration}``.
+
+        Compatible with the base class signature (which uses ``metadata``)
+        and the Chatlytics-specific ``duration`` knob (default 3.0 s).
+        ``metadata`` is accepted for API compatibility; the adapter
+        currently uses only ``duration``.  Errors are logged and
+        swallowed -- typing is a UX hint, not a critical path.
+        """
+        if self._client is None:
+            return
+
+        try:
+            response = await self._client.post(
+                "/api/v1/typing",
+                json={"chatId": chat_id, "duration": float(duration)},
+            )
+            if response.status_code != 200:
+                logger.warning(
+                    "send_typing returned %s for chat %s",
+                    response.status_code,
+                    chat_id,
+                )
+        except httpx.RequestError as exc:
+            logger.warning("send_typing transport error: %s", exc)
+
+    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+        """GET /api/v1/chat?chatId={id} and return the JSON body as dict.
+
+        Returns ``{}`` if the adapter is not connected or the gateway
+        responds with a non-200 / non-JSON body.  Callers may rely on
+        the dict having the keys documented in the Chatlytics gateway
+        contract (``name``, ``phone``, ``isGroup``, ...) when status
+        was 200 -- the adapter does not validate the schema beyond
+        ``isinstance(payload, dict)``.
+        """
+        if self._client is None:
+            return {}
+
+        try:
+            response = await self._client.get(
+                "/api/v1/chat",
+                params={"chatId": chat_id},
+            )
+        except httpx.RequestError as exc:
+            logger.warning("get_chat_info transport error: %s", exc)
+            return {}
+
+        if response.status_code != 200:
+            logger.warning(
+                "get_chat_info returned %s for chat %s",
+                response.status_code,
+                chat_id,
+            )
+            return {}
+
+        try:
+            payload = response.json()
+        except Exception:  # noqa: BLE001
+            return {}
+
+        return payload if isinstance(payload, dict) else {}
 
 
 def register(ctx: Any) -> None:
