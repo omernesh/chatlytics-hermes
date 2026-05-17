@@ -68,12 +68,17 @@ def test_register_adds_chatlytics_platform() -> None:
     assert "Chatlytics" in hint or "WhatsApp" in hint
 
 
-def test_register_does_not_declare_deferred_hooks() -> None:
-    """Scope discipline: HERMES-01 must NOT register hooks owned by later phases.
+def test_register_declares_hermes_04_hooks() -> None:
+    """HERMES-04 register() must declare the cron + env-enablement hooks.
 
-    HERMES-03 will add ``env_enablement_fn`` + the webhook config bridge,
-    HERMES-04 will add ``cron_deliver_env_var`` + ``standalone_sender_fn``.
-    Catching them here ensures the executor stuck to the locked scope.
+    Originally written for HERMES-01 as a scope-discipline guard ("no
+    deferred hooks present yet").  HERMES-04 now legitimately registers
+    ``cron_deliver_env_var``, ``standalone_sender_fn``,
+    ``env_enablement_fn``, and ``check_fn`` -- so this test flips
+    polarity and asserts they ARE present.
+
+    Hooks still owned by later phases (HERMES-05 tool surface) must
+    remain absent.
     """
     from chatlytics_hermes import register
 
@@ -81,12 +86,17 @@ def test_register_does_not_declare_deferred_hooks() -> None:
     register(ctx)
     entry = ctx.platforms[0]
 
+    # HERMES-04 hooks MUST be present.
+    assert entry.get("cron_deliver_env_var") == "CHATLYTICS_HOME_CHANNEL"
+    assert callable(entry.get("standalone_sender_fn"))
+    assert callable(entry.get("env_enablement_fn"))
+    assert callable(entry.get("check_fn"))
+    # check_fn should be safe to call and return True (deps are pre-imported).
+    assert entry["check_fn"]() is True
+
+    # Hooks owned by later phases (HERMES-05 / HERMES-06) MUST stay absent.
     deferred_hooks = {
-        "env_enablement_fn",
         "apply_yaml_config_fn",
-        "cron_deliver_env_var",
-        "standalone_sender_fn",
-        "check_fn",
         "validate_config",
         "is_connected",
         "setup_fn",
@@ -94,7 +104,7 @@ def test_register_does_not_declare_deferred_hooks() -> None:
         "allow_all_env",
     }
     leaked = deferred_hooks & set(entry)
-    assert not leaked, f"HERMES-01 leaked hooks owned by later phases: {leaked}"
+    assert not leaked, f"HERMES-04 leaked hooks owned by later phases: {leaked}"
 
 
 def test_plugin_yaml_is_valid() -> None:

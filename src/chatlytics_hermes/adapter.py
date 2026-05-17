@@ -905,6 +905,11 @@ def register(ctx: Any) -> None:
         name="chatlytics",
         label="Chatlytics WhatsApp",
         adapter_factory=lambda cfg: ChatlyticsAdapter(cfg),
+        # HERMES-04 forward-fix for 02-REVIEW MED-01: real PluginContext
+        # requires check_fn. Adapter deps (httpx, aiohttp, PyYAML) are
+        # all declared in pyproject; by the time register() runs, the
+        # import path has succeeded so returning True is honest.
+        check_fn=lambda: True,
         required_env=["CHATLYTICS_BASE_URL", "CHATLYTICS_API_KEY"],
         install_hint=(
             "pip install -e git+https://github.com/omernesh/chatlytics-hermes.git"
@@ -916,4 +921,15 @@ def register(ctx: Any) -> None:
             "strikethrough ~text~, monospace ```text```). Keep responses "
             "conversational and concise; long messages are split by the gateway."
         ),
+        # HERMES-04: env-driven enablement so `hermes gateway status`
+        # surfaces a Chatlytics entry when CHATLYTICS_HOME_CHANNEL is
+        # set, without instantiating the adapter.
+        env_enablement_fn=_env_enablement,
+        # HERMES-04: cron home-channel routing. ``deliver=chatlytics``
+        # cron jobs use this env var to find the target chat.
+        cron_deliver_env_var="CHATLYTICS_HOME_CHANNEL",
+        # HERMES-04: out-of-process cron delivery hook so ``hermes
+        # cron`` running in a separate process from ``hermes gateway``
+        # can fire deliveries without an active adapter.
+        standalone_sender_fn=_standalone_send,
     )
