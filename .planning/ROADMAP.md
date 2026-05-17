@@ -1,6 +1,9 @@
 # ROADMAP — chatlytics-hermes
 
-## v2.0 — Hermes plugin v2.0 (upstream-contract rebuild)
+## v2.0 — Hermes plugin v2.0 (upstream-contract rebuild) (COMPLETE)
+
+**Shipped:** 2026-05-17. All 6 HERMES phases delivered. 45/45 tests green in dockerized `python:3.13-slim` + `hermes-agent@v2026.5.16`. 21 tools registered. `v2.0.0` annotated tag created locally (operator push pending). NO PyPI publish (operator lock). Archive: `.planning/milestones/v2.0-ROADMAP.md`. Audit: `.planning/v2.0-MILESTONE-AUDIT.md`.
+
 
 Replace the v1.x standalone-shim API with a proper Hermes plugin against
 `hermes-agent>=0.14,<0.15`. Six phases, designed for end-to-end execution via

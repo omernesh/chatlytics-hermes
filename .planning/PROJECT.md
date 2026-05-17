@@ -26,14 +26,14 @@ Hermes agents get production-grade WhatsApp messaging — text, media (image/voi
 
 ## Requirements
 
-### Active (v2.0)
+### Active (v2.0) -- COMPLETE 2026-05-17
 
-- [ ] **HERMES-01** — Upstream contract scaffolding (`BasePlatformAdapter` subclass, `plugin.yaml`, `register(ctx)`, pinned dep)
-- [ ] **HERMES-02** — Outbound text + control parity (`connect/disconnect/send/send_typing/get_chat_info` via httpx)
-- [ ] **HERMES-03** — Inbound transport migration (aiohttp inside `connect()`, `MessageEvent` via `MessageType`)
-- [ ] **HERMES-04** — Media + UX polish + cron (6 media variants, `_keep_typing()`, `cron_deliver_env_var`)
-- [ ] **HERMES-05** — Full Chatlytics tool surface (every action as a Hermes tool via `ctx.register_tool()`)
-- [ ] **HERMES-06** — Release + smoke test (README/CHANGELOG, smoke install, tag `v2.0.0`, no PyPI publish)
+- [x] **HERMES-01** -- Upstream contract scaffolding (`BasePlatformAdapter` subclass, `plugin.yaml`, `register(ctx)`, pinned dep)
+- [x] **HERMES-02** -- Outbound text + control parity (`connect/disconnect/send/send_typing/get_chat_info` via httpx)
+- [x] **HERMES-03** -- Inbound transport migration (aiohttp inside `connect()`, `MessageEvent` via `MessageType`)
+- [x] **HERMES-04** -- Media + UX polish + cron (6 media variants, `_keep_typing()`, `cron_deliver_env_var`)
+- [x] **HERMES-05** -- Full Chatlytics tool surface (every action as a Hermes tool via `ctx.register_tool()`)
+- [x] **HERMES-06** -- Release + smoke test (README/CHANGELOG, smoke install, tag `v2.0.0`, no PyPI publish)
 
 ### Out of Scope (v2.0)
 
@@ -86,4 +86,4 @@ This document evolves at phase transitions and milestone boundaries.
 3. Update Context with current state
 
 ---
-*Last updated: 2026-05-17 — repo initialized, v2.0 milestone scaffolded for `/gsd-autonomous --from HERMES-01 --to HERMES-06`.*
+*Last updated: 2026-05-17 -- v2.0 SHIPPED. All 6 HERMES phases complete (45/45 tests, 21 tools, v2.0.0 tagged local). Audit: `.planning/v2.0-MILESTONE-AUDIT.md`. Archive: `.planning/milestones/v2.0-ROADMAP.md`. Operator push of `main` + `v2.0.0` tag pending; PyPI publish deferred per lock.*

@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: — Hermes plugin v2.0 (upstream-contract rebuild)
-status: planning
-stopped_at: STATE.md / ROADMAP.md / PROJECT.md initialized 2026-05-17
+status: complete
+stopped_at: v2.0 milestone shipped 2026-05-17 — 6/6 phases, 45/45 tests, 21 tools, v2.0.0 tagged local
 last_updated: "2026-05-17T00:00:00.000Z"
-last_activity: 2026-05-17 — repo extracted from waha-oc-plugin via git-filter-repo + .planning/ scaffolded
+last_activity: 2026-05-17 -- v2.0 milestone shipped (6/6 phases, 45/45 tests, v2.0.0 tagged local)
 progress:
   total_phases: 6
-  completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
-  percent: 0
+  completed_phases: 6
+  total_plans: 6
+  completed_plans: 6
+  percent: 100
 ---
 
 # Project State
@@ -26,10 +26,10 @@ See: `.planning/PROJECT.md`
 
 ## Current Position
 
-Phase: HERMES-01 (not started)
-Plan: —
-Status: planning
-Last activity: 2026-05-17 — repo extracted from waha-oc-plugin
+Phase: -- (v2.0 milestone complete)
+Plan: --
+Status: complete
+Last activity: 2026-05-17 -- v2.0 SHIPPED (6/6 phases, 45/45 tests, v2.0.0 tagged local). Audit: `.planning/v2.0-MILESTONE-AUDIT.md`. Archive: `.planning/milestones/v2.0-ROADMAP.md`.
 
 ## v2.0 Phase Plan (6 phases, HERMES-01 → HERMES-06)
 
@@ -57,11 +57,14 @@ Autonomous-only: pytest + mocked aiohttp/respx + smoke install in a clean venv a
 
 ## Session Continuity
 
-Last session: 2026-05-17 — repo extracted from `omernesh/openclaw-waha-plugin` monorepo via git-filter-repo (7 commits + `hermes-1.1.0` tag preserved).
-Stopped at: STATE.md / ROADMAP.md / PROJECT.md initialized.
-Resume file: `.planning/ROADMAP.md` + `.planning/PROJECT.md`.
-Next action: `/gsd-autonomous --from HERMES-01 --to HERMES-06` to run the milestone end-to-end.
+Last session: 2026-05-17 -- v2.0 milestone shipped end-to-end (autonomous orchestration). All 6 HERMES phases executed, reviewed, and verified. v2.0.0 annotated tag created locally; NOT pushed.
+Stopped at: milestone lifecycle complete; awaiting operator push.
+Resume file: next milestone -- not yet scoped.
+Next action: operator push (`git push origin main && git push origin v2.0.0`), then scope v2.1.
 
 ## Operator Next Steps
 
-- From `D:\docker\chatlytics-hermes-split\`, run: `/gsd-autonomous --from HERMES-01 --to HERMES-06`
+- `git push origin main` -- push milestone-complete commits
+- `git push origin v2.0.0` -- push the v2.0.0 annotated tag (autonomously created, NOT pushed)
+- (optional, later) PyPI publish via `python -m build && twine upload dist/*` -- explicitly deferred per ROADMAP lock
+- Scope v2.1 milestone: live-loader integration smoke (06-MED-01), `_keep_typing` async-cm shape decision (04-MED-01), `send_typing` log flood fix (02-LOW-02), see `.planning/v2.0-MILESTONE-AUDIT.md`
