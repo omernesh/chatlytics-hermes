@@ -64,8 +64,18 @@ def _make_adapter(
 
 @pytest.fixture
 def mock_health():
-    with respx.mock(base_url=BASE_URL, assert_all_called=False) as router:
-        router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    # Mock the outbound /health call to the fake Chatlytics gateway.
+    # Any other httpx traffic in this test module is made against a
+    # real local aiohttp server bound to 127.0.0.1 -- register an
+    # explicit ``pass_through`` catch-all so respx does not intercept
+    # those localhost requests with a stub response.
+    with respx.mock(assert_all_called=False) as router:
+        router.get(f"{BASE_URL}/health").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        # Pass through any other URL (the real aiohttp server on
+        # 127.0.0.1:{ephemeral} that the tests are exercising).
+        router.route().pass_through()
         yield router
 
 
