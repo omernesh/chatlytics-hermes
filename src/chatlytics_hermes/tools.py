@@ -43,6 +43,7 @@ from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 import httpx
 
+from .adapter import _coerce_success_payload
 from .client import ChatlyticsClient
 
 logger = logging.getLogger("chatlytics_hermes.tools")
@@ -97,7 +98,16 @@ async def _post(
     path: str,
     body: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """POST helper -- enforces the canonical return shape."""
+    """POST helper -- enforces the canonical return shape.
+
+    MD-01 fix (HERMES-08): delegates success derivation to
+    :func:`chatlytics_hermes.adapter._coerce_success_payload` so this
+    helper, ``_make_send_result``, and ``_standalone_send`` all agree
+    on the contract.  In particular, a gateway response of
+    ``200 {"success": false, "error": "..."}`` now correctly returns
+    ``{"success": false, ...}`` instead of being coerced to truthy by
+    :func:`_ok`.
+    """
     try:
         response = await client.post(path, json=body)
     except httpx.RequestError as exc:
@@ -105,9 +115,18 @@ async def _post(
     if response.status_code >= 400:
         return _err_from_response(response)
     try:
-        return _ok(response.json())
+        payload = response.json()
     except Exception:  # noqa: BLE001
         return _ok({"raw_text": response.text})
+    success, error_msg = _coerce_success_payload(response.status_code, payload)
+    if not success:
+        return {
+            "success": False,
+            "error": error_msg,
+            "status_code": response.status_code,
+            "raw_response": payload,
+        }
+    return _ok(payload)
 
 
 async def _get(
@@ -115,7 +134,10 @@ async def _get(
     path: str,
     params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """GET helper -- enforces the canonical return shape."""
+    """GET helper -- enforces the canonical return shape.
+
+    MD-01 fix (HERMES-08): see :func:`_post` docstring.
+    """
     try:
         response = await client.get(path, params=params)
     except httpx.RequestError as exc:
@@ -123,9 +145,18 @@ async def _get(
     if response.status_code >= 400:
         return _err_from_response(response)
     try:
-        return _ok(response.json())
+        payload = response.json()
     except Exception:  # noqa: BLE001
         return _ok({"raw_text": response.text})
+    success, error_msg = _coerce_success_payload(response.status_code, payload)
+    if not success:
+        return {
+            "success": False,
+            "error": error_msg,
+            "status_code": response.status_code,
+            "raw_response": payload,
+        }
+    return _ok(payload)
 
 
 def _media_result_dict(result: Any) -> Dict[str, Any]:

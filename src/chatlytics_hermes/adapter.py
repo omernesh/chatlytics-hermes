@@ -33,7 +33,8 @@ import contextlib
 import logging
 import mimetypes
 import os
-from typing import Any, Dict, Optional, Union
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import httpx
 from aiohttp import web
@@ -65,6 +66,40 @@ def _guess_content_type(filename: Optional[str]) -> str:
         return "application/octet-stream"
     guess, _ = mimetypes.guess_type(filename)
     return guess or "application/octet-stream"
+
+
+def _coerce_success_payload(
+    status_code: int,
+    payload: Any,
+) -> Tuple[bool, Optional[str]]:
+    """Single source of truth for Chatlytics gateway response success derivation.
+
+    Returns ``(success, error_msg)`` where ``error_msg`` is non-None
+    only when ``success`` is False.
+
+    Coercion rules (resolves MD-01 from the v2.0 milestone code review):
+
+    - HTTP 4xx/5xx -> ``(False, payload.error or "HTTP {status}")``
+    - HTTP 2xx + ``payload.get("success") is False`` ->
+      ``(False, payload.error or "gateway reported success=false")``
+    - HTTP 2xx + ``payload.success`` truthy/absent / non-dict payload ->
+      ``(True, None)``
+
+    Used by :meth:`ChatlyticsAdapter._make_send_result`,
+    :func:`_standalone_send`, and the tool-layer ``_post``/``_get``
+    helpers (via :mod:`chatlytics_hermes.tools`) so all three sites
+    agree on the contract.  Eliminates the 200+``success:false``
+    divergence flagged in the milestone code review (MD-01).
+    """
+    if status_code >= 400:
+        err = (
+            payload.get("error") if isinstance(payload, dict) else None
+        ) or f"HTTP {status_code}"
+        return False, err
+    if isinstance(payload, dict) and payload.get("success") is False:
+        err = payload.get("error") or "gateway reported success=false"
+        return False, err
+    return True, None
 
 try:
     from gateway.platforms.base import BasePlatformAdapter, SendResult
@@ -137,6 +172,31 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         self.home_channel: Optional[str] = (
             os.getenv("CHATLYTICS_HOME_CHANNEL") or extra.get("home_channel")
         )
+
+        # HI-01 fix (HERMES-08): path allowlist for ``filePath`` uploads.
+        # Default-deny — when unset, ALL local-file uploads are rejected.
+        # Use OS pathsep separator (``:`` on POSIX, ``;`` on Windows).
+        _roots_raw: str = (
+            os.getenv("CHATLYTICS_UPLOAD_ALLOWED_ROOTS")
+            or str(extra.get("upload_allowed_roots") or "")
+        )
+        self.upload_allowed_roots: List[Path] = []
+        if _roots_raw:
+            for entry in _roots_raw.split(os.pathsep):
+                entry = entry.strip()
+                if not entry:
+                    continue
+                try:
+                    self.upload_allowed_roots.append(
+                        Path(entry).expanduser().resolve()
+                    )
+                except (OSError, RuntimeError) as exc:
+                    logger.warning(
+                        "CHATLYTICS_UPLOAD_ALLOWED_ROOTS entry %r could not be "
+                        "resolved (%s); skipping",
+                        entry,
+                        exc,
+                    )
 
         # HTTP client is constructed lazily on ``connect()`` so that
         # misconfigured adapters (empty base_url/api_key) raise only at
@@ -470,9 +530,51 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             # by HERMES-05 tool layer in 05-MED-02).
             path = str(resource)
 
+            # HI-01 fix (HERMES-08): reject paths outside the configured
+            # allowlist BEFORE opening the file. Default-deny — when the
+            # env var ``CHATLYTICS_UPLOAD_ALLOWED_ROOTS`` is unset, the
+            # allowlist is empty and EVERY local upload is refused. This
+            # closes the prompt-injection / LLM-manipulation path to
+            # ``open("/etc/passwd")``.
+            try:
+                resolved = Path(path).expanduser().resolve()
+            except (OSError, RuntimeError) as exc:
+                raise PermissionError(
+                    f"Cannot resolve upload path {path!r}: {exc}"
+                ) from exc
+            if not self.upload_allowed_roots:
+                raise PermissionError(
+                    "Local file uploads are disabled: set "
+                    "CHATLYTICS_UPLOAD_ALLOWED_ROOTS to an allowlist of "
+                    "absolute paths (OS-pathsep separated) to enable "
+                    "filePath uploads."
+                )
+            allowed = False
+            for root in self.upload_allowed_roots:
+                # Path.is_relative_to landed in 3.9; we pin >=3.10 in
+                # pyproject so this is safe. Equality also matches
+                # uploading the root itself when it's a regular file.
+                try:
+                    if resolved == root or resolved.is_relative_to(root):
+                        allowed = True
+                        break
+                except AttributeError:
+                    # Defensive fallback for 3.8 hosts if a downstream
+                    # consumer ever loosens the pin.
+                    rs = str(resolved)
+                    rr = str(root)
+                    if rs == rr or rs.startswith(rr + os.sep):
+                        allowed = True
+                        break
+            if not allowed:
+                raise PermissionError(
+                    f"Refusing upload outside CHATLYTICS_UPLOAD_ALLOWED_ROOTS: "
+                    f"{resolved}"
+                )
+
             def _read_file() -> tuple[bytes, str]:
-                with open(path, "rb") as fh:
-                    return fh.read(), os.path.basename(path) or "upload.bin"
+                with open(str(resolved), "rb") as fh:
+                    return fh.read(), os.path.basename(str(resolved)) or "upload.bin"
 
             content, basename = await asyncio.to_thread(_read_file)
             name = upload_filename or basename
@@ -504,29 +606,25 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         """Convert a Chatlytics send-media response into a SendResult.
 
         Shared by all 6 media handlers so the success/error mapping
-        matches :meth:`send` exactly -- 200 + ``success: True`` (or
-        absent) -> success; 4xx / 5xx / ``success: False`` -> failure,
-        with ``retryable=True`` on 5xx for the base-class retry shim.
+        matches :meth:`send` exactly.  Delegates success derivation to
+        :func:`_coerce_success_payload` (MD-01 dedup — adapter,
+        standalone-send, and tool layer all use the same predicate).
         """
         try:
             payload: Any = response.json()
         except Exception:  # noqa: BLE001
             payload = {"raw_text": response.text}
 
-        if (
-            response.status_code == 200
-            and isinstance(payload, dict)
-            and payload.get("success", True)
-        ):
+        success, error_msg = _coerce_success_payload(response.status_code, payload)
+        if success:
             return SendResult(
                 success=True,
-                message_id=payload.get("messageId"),
+                message_id=(
+                    payload.get("messageId") if isinstance(payload, dict) else None
+                ),
                 raw_response=payload,
             )
 
-        error_msg = (
-            payload.get("error") if isinstance(payload, dict) else None
-        ) or f"HTTP {response.status_code}"
         return SendResult(
             success=False,
             error=error_msg,
@@ -564,6 +662,11 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             )
         except FileNotFoundError as exc:
             return SendResult(success=False, error=f"File not found: {exc}")
+        except PermissionError as exc:
+            # HI-01 surface: path is outside CHATLYTICS_UPLOAD_ALLOWED_ROOTS
+            # OR the allowlist is empty (default-deny). Distinct from a
+            # generic OSError so the tool layer / operator can tell why.
+            return SendResult(success=False, error=f"Permission denied: {exc}")
         except OSError as exc:
             return SendResult(success=False, error=f"File read error: {exc}")
         except RuntimeError as exc:
@@ -609,6 +712,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
     ) -> "SendResult":
         """Send an image as a native WhatsApp photo attachment.
 
@@ -618,6 +722,11 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         are accepted for base-class signature parity but currently
         ignored -- Chatlytics's send-media endpoint does not expose
         per-message reply context (HERMES-05 may revisit).
+
+        ``**kwargs`` is swallowed for forward-compat with upstream base
+        signature evolution (HI-03 fix from HERMES-08): future Hermes
+        versions may add new kwargs (``priority``, ``force_native``,
+        etc.) that this override should not trip on.
         """
         return await self._send_media_payload(
             chat_id, "image", image_url, caption=caption
@@ -630,12 +739,16 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
     ) -> "SendResult":
         """Send an animated GIF / short MP4 as inline video.
 
         Chatlytics's gateway delivers gif/mp4 animations under
         ``mediaType=video`` (the WhatsApp protocol has no native GIF
         primitive; clients render short MP4s in a loop instead).
+
+        ``**kwargs`` is swallowed for forward-compat with upstream base
+        signature evolution (HI-03 fix from HERMES-08).
         """
         return await self._send_media_payload(
             chat_id, "animation", animation_url, caption=caption
@@ -736,64 +849,116 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             filename=filename,
         )
 
-    # --- UX polish (HERMES-04) --------------------------------------------
+    # --- UX polish (HERMES-04 + HERMES-08 BL-01 fix) -----------------------
 
-    @contextlib.asynccontextmanager
-    async def _keep_typing(self, chat_id: str, interval: float = 30.0):
-        """30 s typing-bubble heartbeat for long-running tool handlers.
+    async def _keep_typing(
+        self,
+        chat_id: str,
+        interval: float = 30.0,
+        metadata: Optional[Dict[str, Any]] = None,
+        stop_event: Optional[asyncio.Event] = None,
+    ) -> None:
+        """Continuously refresh the typing bubble until cancelled.
 
-        Usage::
+        BL-01 fix (HERMES-08): this method is now a plain coroutine that
+        matches the upstream ``BasePlatformAdapter._keep_typing`` call
+        site signature.  The base class invokes::
 
-            async with adapter._keep_typing(chat_id):
-                result = await long_running_tool()
+            asyncio.create_task(
+                self._keep_typing(chat_id, metadata=..., stop_event=...)
+            )
 
-        Fires ``send_typing(chat_id, duration=30.0)`` immediately so the
-        bubble appears without waiting ``interval`` seconds, then keeps
-        a background task alive that re-issues the typing request every
-        ``interval`` seconds.  The background task is cancelled cleanly
-        on context-manager exit (even if the body raises).
+        on every inbound message (see
+        ``gateway/platforms/base.py:1787-1792``).  In v2.0 this method
+        was decorated ``@asynccontextmanager`` and crashed with
+        ``TypeError: a coroutine was expected, got
+        _AsyncGeneratorContextManager`` AND ``unexpected keyword
+        argument 'metadata'``.  The async-cm flavor has been moved to
+        :meth:`_typing_scope` (preserved for in-plugin tool handlers).
 
-        ``interval`` defaults to 30 s to match the WhatsApp ``typing``
-        TTL; long-running handlers (multi-minute LLM calls, image
-        generation pipelines) keep the bubble alive without flooding
-        the gateway.  Tests override ``interval`` to a small value to
-        observe heartbeats without 30 s real-time sleeps.
+        Behavior:
 
-        Errors from ``send_typing`` are swallowed at debug level --
-        typing is a UX hint, not a critical path.  A failed heartbeat
-        never aborts the wrapped body.
+        - Fires ``send_typing(chat_id, duration=30.0)`` immediately so
+          the bubble appears without waiting ``interval`` seconds.
+        - Initial-fire failure logs at WARNING (operator-actionable;
+          06-LOW-02 fix).  Subsequent heartbeat failures stay at DEBUG
+          to prevent log flood on a flapping gateway.
+        - Reissues the typing request every ``interval`` seconds.
+        - Respects ``stop_event.is_set()`` between sleeps.
+        - Respects ``asyncio.CancelledError`` at any point.
+        - ``metadata`` is accepted for base-class signature parity;
+          Chatlytics's typing endpoint does not consume it currently.
+
+        ``interval`` defaults to 30 s to match the WhatsApp typing TTL;
+        long-running handlers (multi-minute LLM calls, image generation
+        pipelines) keep the bubble alive without flooding the gateway.
+        Tests override ``interval`` to a small value to observe
+        heartbeats without 30 s real-time sleeps.
         """
-        async def _beat() -> None:
-            try:
-                while True:
-                    await asyncio.sleep(interval)
-                    try:
-                        await self.send_typing(chat_id, duration=30.0)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:  # noqa: BLE001
-                        logger.debug(
-                            "send_typing heartbeat raised; continuing",
-                            exc_info=True,
-                        )
-            except asyncio.CancelledError:
-                # Normal cancellation on context-manager exit.
-                pass
-
-        # Initial fire so the bubble appears immediately -- otherwise
-        # the user sees nothing until ``interval`` elapses.
+        # Initial fire so the bubble appears immediately.  04-LOW-03
+        # fix: the initial fire now happens INSIDE the coroutine, so
+        # any wrapper (e.g. _typing_scope) returns control to the body
+        # immediately and does not block on the first round-trip.
         try:
             await self.send_typing(chat_id, duration=30.0)
+        except asyncio.CancelledError:
+            raise
         except Exception:  # noqa: BLE001
-            logger.debug(
-                "send_typing initial fire raised; continuing",
+            # 06-LOW-02: first-fire failure is operator-actionable --
+            # WARNING level so it surfaces in default logging configs.
+            logger.warning(
+                "send_typing initial fire raised for chat %s; continuing heartbeat",
+                chat_id,
                 exc_info=True,
             )
 
-        task = asyncio.create_task(_beat())
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                return
+            if stop_event is not None and stop_event.is_set():
+                return
+            try:
+                await self.send_typing(chat_id, duration=30.0)
+            except asyncio.CancelledError:
+                return
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "send_typing heartbeat raised; continuing",
+                    exc_info=True,
+                )
+
+    @contextlib.asynccontextmanager
+    async def _typing_scope(self, chat_id: str, interval: float = 30.0):
+        """In-plugin convenience wrapper around :meth:`_keep_typing`.
+
+        Usage::
+
+            async with adapter._typing_scope(chat_id):
+                result = await long_running_tool()
+
+        Spawns a background task running :meth:`_keep_typing` with an
+        internal ``stop_event``.  On context-manager exit, sets the
+        stop event, cancels the task, and awaits cancellation.  Errors
+        from the typing path never abort the wrapped body.
+
+        Renamed from ``_keep_typing`` in HERMES-08 (BL-01 fix) so the
+        public :meth:`_keep_typing` can honor the upstream coroutine
+        contract.  Existing tool-handler call sites that used
+        ``async with adapter._keep_typing(...)`` should switch to
+        ``async with adapter._typing_scope(...)``.
+        """
+        stop = asyncio.Event()
+        task = asyncio.create_task(
+            self._keep_typing(chat_id, interval=interval, stop_event=stop)
+        )
         try:
             yield
         finally:
+            stop.set()
             task.cancel()
             try:
                 await task
@@ -801,7 +966,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 pass
             except Exception:  # noqa: BLE001 -- never leak teardown errors
                 logger.debug(
-                    "_keep_typing teardown raised; continuing",
+                    "_typing_scope teardown raised; continuing",
                     exc_info=True,
                 )
 
@@ -887,11 +1052,13 @@ async def _standalone_send(text: str, **kwargs: Any) -> Dict[str, Any]:
     except Exception:  # noqa: BLE001
         payload = {"raw_text": response.text}
 
-    if (
-        response.status_code == 200
-        and isinstance(payload, dict)
-        and payload.get("success", True)
-    ):
+    # MD-01 fix (HERMES-08): use the canonical success-shape helper so
+    # _standalone_send, _make_send_result, and tools._post/_get agree on
+    # the predicate.  Eliminates the v2.0 divergence where a gateway
+    # response of ``200 {"success": false}`` would be coerced to truthy
+    # at one site and falsy at another.
+    success, error_msg = _coerce_success_payload(response.status_code, payload)
+    if success:
         # Spread payload AFTER success=True so a payload-side ``success``
         # value (some endpoints echo) does not override our derived flag.
         result: Dict[str, Any] = {"success": True}
@@ -902,9 +1069,7 @@ async def _standalone_send(text: str, **kwargs: Any) -> Dict[str, Any]:
 
     return {
         "success": False,
-        "error": (
-            payload.get("error") if isinstance(payload, dict) else None
-        ) or f"HTTP {response.status_code}",
+        "error": error_msg,
         "raw_response": payload,
     }
 
