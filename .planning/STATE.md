@@ -8,7 +8,7 @@ last_updated: "2026-05-17T00:00:00.000Z"
 last_activity: 2026-05-17 -- GSD milestone-wide review verdict FIX_FIRST (1 BLOCKER, 3 HIGH); BL-01/HI-01/HI-03 folded into HERMES-08; HERMES-07 expanded to surface BL-01 under test
 progress:
   total_phases: 6
-  completed_phases: 0
+  completed_phases: 5
   total_plans: 0
   completed_plans: 0
   percent: 0
@@ -39,7 +39,7 @@ Last activity: 2026-05-17 — v2.1 milestone scaffolded; 6 phases derived from v
 | HERMES-08 — Critical safety fixes + async lifecycle | Ready | HERMES-07 | **BL-01 (BLOCKER), HI-01 (HIGH), HI-03 (HIGH), MD-01**, 04-MED-01, 04-LOW-03, 06-LOW-02 | **Top of the milestone in importance.** `_keep_typing` rewrite as plain coroutine + `_typing_scope` async-cm wrapper for in-plugin sites. `filePath` allowlist via `CHATLYTICS_UPLOAD_ALLOWED_ROOTS` env var. `**kwargs` on `send_image`/`send_animation`. Success-shape coercion dedup. Plus original async lifecycle items. |
 | HERMES-09 — Observability + log hygiene | Done | HERMES-08 | 02-LOW-01, 02-LOW-02, 05-LOW-01, LO-11 | DONE 2026-05-17. Consolidated `send_typing` log levels (WARN→DEBUG via internal `_send_typing_once`); added diagnostic logs to 6 silent paths; reserved-metadata WARN per dropped key; new `tests/test_observability.py` (7 tests). 65/65 tests pass. REVIEW APPROVE_WITH_NITS, WARNING-01 + INFO-01 fixed in fix-pass; LOW-01 + INFO-02..04 deferred to Phase 10/12. |
 | HERMES-10 — Input validation + UX alignment | Ready | HERMES-09 | 03-LOW-01, 05-LOW-02, 05-LOW-03, 02-LOW-03 | Validate `webhook_path` at `__init__`. Optional `looksLikeJid` for media-tool schemas. Align `chatlytics_login` semantics with MCP. Document `get_chat_info` `{}` shape. |
-| HERMES-11 — Test infra cleanup | Ready | HERMES-10 | 02-MED-02, 06-LOW-01 | Teardown for conftest platform_registry seed. Smoke build cache layer or pre-built docker. Optional `--fast` flag. |
+| HERMES-11 — Test infra cleanup | Done | HERMES-10 | 02-MED-02, 06-LOW-01, PR-MED-03, PR-INFO-02 | DONE 2026-05-17. Conftest yield teardown + idempotency guard; tests/_fixtures.FakePlatformConfig consolidates 7 dup shims; scripts/smoke.sh --fast (opt-in) + pip --retries 3. 88/88 tests pass. REVIEW APPROVE (0 BLOCKER, 0 HIGH, 0 MED, 1 LOW, 2 INFO; no fix-pass needed). |
 | HERMES-12 — Release v2.1.0 | Ready | HERMES-07..11 | 05-MED-01 docs, 04-LOW-02 docs | CHANGELOG 2.1.0 (additive, NOT BREAKING). README updates. pyproject bump to 2.1.0. Tag `v2.1.0`. NO PyPI publish (operator lock). |
 
 ## v2.1 Architectural Invariants (every phase preserves)
