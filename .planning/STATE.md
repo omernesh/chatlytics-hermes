@@ -1,16 +1,16 @@
 ---
 gsd_state_version: 1.0
 milestone: v2.1
-milestone_name: — Tech debt resolution + live-loader integration
-status: shipped_local
-stopped_at: v2.1.0 LOCAL TAG created 2026-05-17 -- all 6 phases done, 88/88 tests, operator push pending
-last_updated: "2026-05-17T00:00:00.000Z"
-last_activity: 2026-05-17 -- v2.1.0 tagged locally (no push, no PyPI per operator lock); Phase 12 APPROVE; milestone v2.1 ready for operator review
+milestone_name: — Critical safety fixes + tech debt resolution + live-loader integration
+status: Awaiting next milestone
+stopped_at: v2.1.0 LOCAL TAG created; awaiting operator review and manual push.
+last_updated: "2026-05-17T14:36:06.536Z"
+last_activity: 2026-05-17 — Milestone v2.1 completed and archived
 progress:
   total_phases: 6
   completed_phases: 6
-  total_plans: 0
-  completed_plans: 0
+  total_plans: 6
+  completed_plans: 6
   percent: 100
 ---
 
@@ -26,10 +26,10 @@ See: `.planning/PROJECT.md`
 
 ## Current Position
 
-Phase: HERMES-12 (done)
-Plan: 12-PLAN-1 (done)
-Status: shipped_local (v2.1.0 tagged locally; awaiting operator push)
-Last activity: 2026-05-17 — Phase 12 complete; `v2.1.0` LOCAL tag created; milestone v2.1 done.
+Phase: Milestone v2.1 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-05-17 — Milestone v2.1 completed and archived
 
 ## v2.1 Phase Plan (6 phases, HERMES-07 → HERMES-12)
 
@@ -67,7 +67,4 @@ Next action: Operator review of v2.1.0 release artifact, then `git push origin m
 
 ## Operator Next Steps
 
-- **DO NOT push v2.0.0 publicly.** The GSD milestone review (`.planning/v2.0-MILESTONE-CODE-REVIEW.md`, verdict FIX_FIRST) confirmed BL-01 (`_keep_typing` crashes on first inbound) + HI-01 (path traversal via `filePath` tool param) + HI-03 (brittle `**kwargs` gap). `git push origin main` is fine (advances the branch); `git push origin v2.0.0` would publish a tag pointing at a known-broken artifact.
-- (v2.1 kick-off) Run `/gsd-autonomous --from 7 --to 12`. HERMES-07 reproduces BL-01/HI-01 under test (xfail-marked); HERMES-08 fixes them and un-xfails.
-- (v2.1 ship) When v2.1 completes: push `main` + `v2.1.0` tag (v2.0.0 stays as a local checkpoint; v2.1.0 supersedes it). Optionally bundle v2.0+v2.1 for the future PyPI publish (still operator-locked).
-- (after v2.1) Decide whether to delete the local `v2.0.0` tag (since it points at a known-broken artifact) or keep it as a build checkpoint. Recommend delete after `v2.1.0` is tagged.
+- Start the next milestone with /gsd:new-milestone

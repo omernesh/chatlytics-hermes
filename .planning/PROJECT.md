@@ -8,22 +8,27 @@ A first-class platform plugin for [Hermes Agent](https://github.com/NousResearch
 
 Hermes agents get production-grade WhatsApp messaging — text, media (image/voice/video/document/animation/image-file), reactions, groups, contacts, channels, polls, presence, profile management — via a single `pip install` and a config block. Inbound webhooks arrive as Hermes-native `MessageEvent` objects with proper `MessageType` discrimination; outbound goes through Chatlytics REST with auth, retry, and gate enforcement handled upstream.
 
-## Current Milestone: v2.1 — Critical safety fixes + tech debt resolution + live-loader integration
+## Current State: v2.1 SHIPPED 2026-05-17 (local tag, operator push pending)
 
-**⚠ DO NOT push the `v2.0.0` tag publicly until v2.1 lands.** The local v2.0.0 checkpoint is fine; pushing it ships a known-broken-on-first-inbound plugin per the milestone-wide GSD review (`.planning/v2.0-MILESTONE-CODE-REVIEW.md`, verdict FIX_FIRST: 1 BLOCKER, 3 HIGH). Ship as `v2.1.0` instead.
+All 6 v2.1 phases (HERMES-07 through HERMES-12) shipped. 88/88 tests passing (45 v2.0 baseline + 43 v2.1 additions; zero regressions). The BL-01 BLOCKER and 2 HIGHs from the v2.0 milestone code review are fixed and locked under regression tests. `v2.1.0` annotated tag created LOCAL ONLY (operator push pending; operator lock preserved). Archive: `.planning/milestones/v2.1-ROADMAP.md`. Audit: `.planning/milestones/v2.1-MILESTONE-AUDIT.md` (verdict: passed).
 
-**Goal:** First close the 1 BLOCKER + 3 HIGHs the GSD milestone review surfaced (the per-phase reviews missed them — they only surface end-to-end). Then close every remaining MED/LOW carried forward from the v2.0 audit + PR-style review. Prove the plugin works against a real `PluginContext` end-to-end, not just at the entry-point discovery layer. Additive from the public API perspective (BL-01 fix changes internal `_keep_typing` shape but the convenience `_typing_scope` async-cm preserves in-plugin call sites). Ships as `v2.1.0`. NO PyPI publish (operator lock remains).
+**Operator next:** Review v2.1.0 artifact, then `git push origin main && git push origin v2.1.0` when ready. Optionally delete local `v2.0.0` tag (points at BL-01 pre-fix artifact superseded by v2.1.0).
 
-**Target features:**
-- Live-loader integration smoke: wire `hermes.gateway.bootstrap.load_plugins()` (or equivalent) with a respx-mocked Chatlytics backend; assert all 21 tools land on the in-memory registry (closes 06-MED-01 — biggest v2.0 test gap)
-- `_keep_typing` shape alignment with upstream base coroutine contract — rename + thin compat wrapper, OR upstream PR (closes 04-MED-01)
-- Concurrency regression test for `_resolve_media_url` after the v2.0 `asyncio.to_thread` fix
-- Log hygiene: consolidate `send_typing` log volume; add diagnostic logs to silent error paths; bump `_keep_typing` first-fire failure to WARNING (closes 02-LOW-02, 05-LOW-01, 06-LOW-02)
-- Input validation: validate `webhook_path` at `__init__`; align `chatlytics_login` with MCP-bundle semantics; document `get_chat_info` `{}` semantics (closes 03-LOW-01, 05-LOW-03, 02-LOW-03)
-- Test infra cleanup: teardown for conftest platform_registry seed; smoke build cache layer (closes 02-MED-02, 06-LOW-01)
-- Tool catalog docs: clarify `chatlytics_actions` vs `chatlytics_dispatch` semantic split; document v2.0 known issues (closes 05-MED-01, 04-LOW-02)
+## Next Milestone Goals: v2.2 (planning)
 
-**Verification ceiling (autonomous-only):** pytest + mocked aiohttp/respx + clean-venv smoke in docker python:3.13-slim + live-loader smoke via respx-mocked PluginContext. No live Chatlytics gateway calls. **No PyPI publish in this milestone** (operator lock preserved).
+Deferred from v2.1 close (none are blockers — v2.1.0 ships clean):
+
+- Sentinel `_error` key on `get_chat_info` return shape (would be breaking — v2.2 minor)
+- Strict JID regex enforcement on `chatId` schemas (would break phone numbers / display names)
+- Collapse `send_image` / `send_image_file` into one method (breaking change — v2.2 minor)
+- Long-term wheel caching in `scripts/smoke.sh` beyond `--retries 3` (build-perf nice-to-have)
+- Hermes `0.15` readiness review (deferred to v3.0 — not a v2.2 item)
+
+Start next milestone via `/gsd:new-milestone` to refine scope.
+
+## Previous Milestone: v2.1 — Critical safety fixes + tech debt resolution + live-loader integration — SHIPPED 2026-05-17
+
+All 6 phases delivered. BL-01 + HI-01 + HI-03 from v2.0 milestone review CLOSED. Every carry-forward MED/LOW from v2.0 audit + PR-style review CLOSED. Live-loader integration smoke locks BL-01 under regression test. 88/88 tests green. Archive: `.planning/milestones/v2.1-ROADMAP.md`.
 
 ## Previous Milestone: v2.0 — Hermes plugin v2.0 (upstream-contract rebuild) — SHIPPED 2026-05-17
 
@@ -43,14 +48,18 @@ Full upstream-contract rebuild against `hermes-agent>=0.14,<0.15`. 6 phases, 45/
 
 ## Requirements
 
-### Active (v2.1)
+### Validated (v2.1) — 2026-05-17
 
-- [ ] **HERMES-07** — Live-loader integration smoke (surfaces BL-01 via base-path test; closes 06-MED-01 + GSD-review MD-04 test-harness bypass)
-- [ ] **HERMES-08** — Critical safety fixes (BL-01 BLOCKER `_keep_typing` rewrite; HI-01 HIGH `filePath` allowlist; HI-03 HIGH `**kwargs` on 2 media overrides) + async lifecycle hardening (closes 04-MED-01, 04-LOW-03, 06-LOW-02, MD-01)
-- [ ] **HERMES-09** — Observability + log hygiene (closes 02-LOW-01, 02-LOW-02, 05-LOW-01; consolidate `send_typing` log levels; add diagnostic logs to silent error paths; warn on dropped reserved-name metadata)
-- [ ] **HERMES-10** — Input validation + UX alignment (closes 03-LOW-01, 05-LOW-02, 05-LOW-03, 02-LOW-03; validate `webhook_path` at `__init__`; optional `looksLikeJid` for media-tool schemas; align `chatlytics_login` semantics with MCP; document `get_chat_info` `{}` shape)
-- [ ] **HERMES-11** — Test infra cleanup (closes 02-MED-02, 06-LOW-01; teardown for conftest platform_registry seed; smoke build cache layer or pre-built docker)
-- [ ] **HERMES-12** — Release v2.1.0 (closes 05-MED-01, 04-LOW-02 docs; CHANGELOG 2.1.0 additive entry; README updates for new behavior + tool semantic clarity; pyproject bump to 2.1.0; tag `v2.1.0`; NO PyPI publish)
+- [x] **HERMES-07** — Live-loader integration smoke; surfaces BL-01 + HI-01 + HI-03 via xfail-strict regression tests
+- [x] **HERMES-08** — Critical safety fixes (BL-01 + HI-01 + HI-03 + MD-01) + async lifecycle hardening; xfails un-xfailed
+- [x] **HERMES-09** — Observability + log hygiene; `send_typing` WARN→DEBUG, 6 silent paths logged, reserved-metadata WARNING
+- [x] **HERMES-10** — Input validation + UX alignment; `webhook_path` validated; `chatlytics_login` semantics aligned with MCP bundle
+- [x] **HERMES-11** — Test infra cleanup; conftest teardown + idempotency guard + shared `FakePlatformConfig` + `smoke.sh --fast`
+- [x] **HERMES-12** — Release v2.1.0 (LOCAL tag only); CHANGELOG/README/pyproject/plugin.yaml bumped; operator lock preserved
+
+### Active (v2.2 — planning)
+
+(See "Next Milestone Goals" above. Run `/gsd:new-milestone` to refine.)
 
 ### Shipped (v2.0) — 2026-05-17
 
@@ -120,4 +129,4 @@ This document evolves at phase transitions and milestone boundaries.
 3. Update Context with current state
 
 ---
-*Last updated: 2026-05-17 -- v2.0 SHIPPED. All 6 HERMES phases complete (45/45 tests, 21 tools, v2.0.0 tagged local). Audit: `.planning/v2.0-MILESTONE-AUDIT.md`. Archive: `.planning/milestones/v2.0-ROADMAP.md`. Operator push of `main` + `v2.0.0` tag pending; PyPI publish deferred per lock.*
+*Last updated: 2026-05-17 -- v2.1 SHIPPED (local). All 6 HERMES-07..12 phases complete (88/88 tests, BL-01/HI-01/HI-03 fixed, v2.1.0 tagged local). Audit: `.planning/milestones/v2.1-MILESTONE-AUDIT.md`. Archive: `.planning/milestones/v2.1-ROADMAP.md`. Operator push of `main` + `v2.1.0` tag pending; PyPI publish deferred per lock; local v2.0.0 tag may be deleted after v2.1.0 push.*
