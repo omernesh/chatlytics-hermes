@@ -88,3 +88,49 @@ class ChatlyticsClient:
     ) -> httpx.Response:
         """POST ``{base_url}{path}`` with a JSON body."""
         return await self._client.post(path, json=json)
+
+    async def post_multipart(
+        self,
+        path: str,
+        *,
+        files: Dict[str, Any],
+        data: Optional[Dict[str, Any]] = None,
+    ) -> httpx.Response:
+        """POST ``{base_url}{path}`` as ``multipart/form-data``.
+
+        ``files`` is forwarded to ``httpx.AsyncClient.post`` -- callers
+        pass ``{"file": (filename, content_bytes, content_type)}`` for the
+        Chatlytics upload endpoint contract.  ``data`` is optional
+        non-file form fields.
+        """
+        return await self._client.post(path, files=files, data=data or {})
+
+    # --- HERMES-04 helpers ------------------------------------------------
+
+    async def send_media(self, payload: Dict[str, Any]) -> httpx.Response:
+        """POST ``/api/v1/send-media`` with a JSON ``payload``.
+
+        Thin wrapper kept separate from :meth:`post` so future media
+        helpers (signed-upload buckets, retry shims) can subclass-override
+        without re-implementing the JSON post path.
+        """
+        return await self._client.post("/api/v1/send-media", json=payload)
+
+    async def upload_file(
+        self,
+        filename: str,
+        content: bytes,
+        content_type: str = "application/octet-stream",
+    ) -> httpx.Response:
+        """POST ``/api/v1/upload`` as multipart/form-data; returns the raw response.
+
+        The Chatlytics upload endpoint responds with JSON ``{"url": "..."}``;
+        callers reference that URL in subsequent ``send_media`` payloads as
+        the ``mediaUrl`` field.  This wrapper does not parse the response --
+        the adapter does, so the unit-test surface can stay close to the
+        wire-level shape.
+        """
+        return await self.post_multipart(
+            "/api/v1/upload",
+            files={"file": (filename, content, content_type)},
+        )
