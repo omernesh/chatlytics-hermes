@@ -10,11 +10,37 @@ through the `hermes_agent.plugins` entry-point group.
 
 ## Status
 
-**v2.0 BETA.** Requires `hermes-agent>=0.14,<0.15`.
+**v2.1.0 BETA.** Requires `hermes-agent>=0.14,<0.15`.
 
 `hermes-agent` v0.14 is not yet on PyPI; install it from the GitHub tag
 `v2026.5.16` (see [Install](#install) below). When v0.14 ships to PyPI the
 install line simplifies to a plain `pip install hermes-agent>=0.14`.
+
+## What's new in v2.1
+
+**Security.** v2.1.0 closes one BLOCKER and two HIGH issues carried
+forward from the v2.0 milestone-wide review. BL-01 was a `_keep_typing`
+async-cm vs base-coroutine shape mismatch that would have crashed the
+plugin on the first production inbound message. HI-01 was an arbitrary
+local-file read primitive on the 5 media tools (prompt-injectable
+`filePath="/etc/passwd"`); v2.1 introduces a default-deny
+`CHATLYTICS_UPLOAD_ALLOWED_ROOTS` env-configured path allowlist. HI-03
+fixed `**kwargs` gaps on two media overrides for upstream-signature
+forward-compat. **All v2.0.0 callers should upgrade.**
+
+**Quality.** Live-loader integration smoke (`tests/test_live_loader.py`)
+now exercises the real `register(ctx)` path against a respx-mocked
+gateway and asserts all 21 tools land -- the test harness gap that hid
+BL-01 is closed. Observability hardening: `send_typing` transport errors
+log at DEBUG (not WARNING); dropped reserved metadata keys emit a WARN
+per drop; silent `ctx.get_platform` failures now leave a DEBUG breadcrumb.
+Test infra cleanup: conftest now teardown-clean, `_FakePlatformConfig`
+consolidated into one shared fixture, `scripts/smoke.sh --fast` skips
+docker for local iteration. **The 21-tool surface is unchanged** -- v2.1
+is a drop-in upgrade from v2.0.
+
+See [CHANGELOG.md](CHANGELOG.md) for the full Security / Added / Changed
+/ Fixed / Docs breakdown.
 
 ## Install
 
@@ -141,13 +167,20 @@ gateway's `/api/v1/upload` endpoint first.
 
 ### Directory / search (3)
 
-`chatlytics_directory`, `chatlytics_search`, `chatlytics_actions` (lists the
-gateway's action catalog).
+`chatlytics_directory`, `chatlytics_search`, `chatlytics_actions`.
+`chatlytics_actions` is read-only -- it issues a **GET** against the
+gateway's action catalog and returns the list of dispatchable actions
+with their schemas. Use it when an agent needs to discover what actions
+are available before invoking one.
 
 ### Sessions / health (3)
 
-`chatlytics_health`, `chatlytics_login`, `chatlytics_dispatch` (generic
-action POST).
+`chatlytics_health`, `chatlytics_login`, `chatlytics_dispatch`.
+`chatlytics_dispatch` is the **POST** counterpart to `chatlytics_actions`
+-- it invokes a generic gateway action by name with arbitrary payload.
+Use the actions tool to discover, the dispatch tool to invoke. The split
+is intentional and mirrors the Chatlytics Claude Code MCP bundle's
+GET-vs-POST separation.
 
 Every tool returns `{"success": bool, ...}`. On non-2xx responses or
 transport errors the result is `{"success": False, "error": "...", ...}`
@@ -194,6 +227,34 @@ contributors:
   of `_resolve_media_url` wraps `open()+read()` in `asyncio.to_thread` so
   concurrent media-tool calls don't stall the loop while a multi-MB file
   is read from disk.
+- **`_keep_typing` shape (v2.1).** v2.1 rewrote `_keep_typing` as a plain
+  coroutine matching the upstream `BasePlatformAdapter` signature
+  `(self, chat_id, interval=30.0, metadata=None, stop_event=None)`. The
+  in-plugin async-cm ergonomics callers used in v2.0 are preserved via
+  a new `_typing_scope(chat_id)` helper -- callers should
+  `async with self._typing_scope(chat_id):` instead of
+  `async with self._keep_typing(chat_id):`. Public tool surface
+  unchanged.
+
+## Known issues
+
+- **`filename` for URL-path documents may not be honored by the gateway.**
+  `chatlytics_send_file` accepts a `filename` parameter that the
+  Chatlytics gateway is expected to surface as the saved filename on the
+  recipient end. For local-path uploads, the filename is set when the
+  bytes are POSTed to the gateway's upload endpoint, so it always takes
+  effect. For URL-path documents (where the plugin only forwards a
+  `mediaUrl`), it is not yet confirmed that the gateway re-sets the
+  filename downstream. Tracking upstream; if you rely on filename
+  control, prefer the local-path mode and the
+  `CHATLYTICS_UPLOAD_ALLOWED_ROOTS` allowlist.
+- **`get_chat_info` returns `{}` on error.** When the underlying
+  `GET /api/v1/chat?chatId=...` returns a non-2xx response or the
+  payload cannot be parsed, the tool returns an empty dict rather than
+  raising. Callers should treat `{}` as "info unavailable" (typically
+  unknown chat or transient gateway issue), distinct from a populated
+  dict with empty fields (which means the gateway returned info but
+  some keys were null upstream).
 
 ## License
 
