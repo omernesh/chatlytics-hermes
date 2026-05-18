@@ -1,11 +1,11 @@
 ---
 gsd_state_version: 1.0
 milestone: v3.0
-milestone_name: — Breaking-change harmonization + first public release (PyPI + npm)
+milestone_name: — Breaking-change harmonization + first public release
 status: planning
-stopped_at: v3.0 milestone scaffolded 2026-05-18 — 9 phases (HERMES-13..21) derived from v2.1 deferred backlog + cross-repo coordinated release. Awaiting `/gsd-autonomous --from 13 --to 21`.
-last_updated: "2026-05-18T00:00:00.000Z"
-last_activity: 2026-05-18 — v3.0 scaffolding (BREAKING release) — operator lock LIFTED — first public PyPI + npm publish
+stopped_at: v3.0 scaffolding complete; awaiting operator launch of `/gsd-autonomous --from 13 --to 21`.
+last_updated: "2026-05-18T07:13:45.220Z"
+last_activity: 2026-05-18 — v3.0 milestone scaffolded; 9 phases derived from v2.1 deferred backlog + cosmetics + cross-repo publish coordination.
 progress:
   total_phases: 9
   completed_phases: 0
@@ -61,11 +61,13 @@ Last activity: 2026-05-18 — v3.0 milestone scaffolded; 9 phases derived from v
 ## Verification Ceiling (v3.0)
 
 Autonomous-only base (unchanged from v2.1):
+
 - pytest + mocked aiohttp/respx + clean-venv docker smoke against real `hermes-agent @ v2026.5.16`
 - Live-loader integration smoke via respx-mocked `PluginContext`
 - Still no live Chatlytics gateway calls
 
 **v3.0 additions:**
+
 - TestPyPI dress rehearsal: `python -m build && twine upload --repository testpypi` → `pip install --index-url https://test.pypi.org/simple/ chatlytics-hermes` in a clean venv → run full pytest suite against the installed wheel
 - Real PyPI publish + post-publish install verification (same flow against real PyPI)
 - `npm publish --dry-run` validates manifest + tarball without going live
