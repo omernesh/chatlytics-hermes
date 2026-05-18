@@ -251,6 +251,12 @@ def _chat_id_field(
     """
     return {
         "type": "string",
+        # HERMES-18 (closes Phase 10 LOW-02): ``minLength: 1`` is
+        # deliberately redundant with the pattern's ``+`` quantifier
+        # (``+`` already rejects empty strings). The two-layer guard
+        # is intentional defense-in-depth: a future maintainer who
+        # changes the pattern to ``*`` (zero-or-more) will not
+        # accidentally allow empty chatIds through validation.
         "minLength": 1,
         "pattern": _JID_PATTERN,
         "description": description,
@@ -270,6 +276,11 @@ def _message_id_field(
     """
     return {
         "type": "string",
+        # HERMES-18 (closes Phase 10 LOW-02): ``minLength: 1`` is
+        # deliberately redundant with the pattern's ``+`` quantifier
+        # (``+`` already rejects empty strings). The two-layer guard
+        # is intentional defense-in-depth -- see the same rationale
+        # on :func:`_chat_id_field`.
         "minLength": 1,
         "pattern": _PERMISSIVE_ID_PATTERN,
         "description": description,
