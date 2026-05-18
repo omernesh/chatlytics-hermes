@@ -104,6 +104,98 @@ if [ "$FAST" = "1" ]; then
   exec python -m pytest tests/ -q --no-header
 fi
 
+# --- Cached docker path: populate .smoke-cache/, install with --no-index ------
+#
+# HERMES-16 opt-in caching. Active only when --cached is set AND --fast is not
+# (the fast path uses the host venv and never installs hermes-agent fresh).
+# On first --cached run the cache is populated via ``pip download`` against
+# the same git+ pin used by the default path; subsequent --cached runs install
+# with ``--no-index --find-links=.smoke-cache/`` for zero-network installs.
+# Pin-hash invalidation auto-wipes the cache when HERMES_AGENT_PIN_TAG changes.
+# Cache-miss fallback: drops to a normal network install AND refreshes the
+# cache so the next --cached run is fast again.
+
+if [ "$CACHED" = "1" ] && [ "$FAST" = "0" ]; then
+  CACHE_DIR="${REPO_DIR}/.smoke-cache"
+  PIN_HASH_FILE="${CACHE_DIR}/.pin-hash"
+
+  # Compute current pin sha256 (portable; sha256sum is in busybox + GNU).
+  CURRENT_PIN_HASH=$(printf '%s' "$HERMES_AGENT_PIN_TAG" | sha256sum | cut -d' ' -f1)
+
+  # Invalidate cache if pin changed since last populated run.
+  if [ -d "$CACHE_DIR" ] && [ -f "$PIN_HASH_FILE" ]; then
+    STORED_PIN_HASH=$(cat "$PIN_HASH_FILE")
+    if [ "$STORED_PIN_HASH" != "$CURRENT_PIN_HASH" ]; then
+      echo "smoke.sh: hermes-agent pin changed (was ${STORED_PIN_HASH:0:12}, now ${CURRENT_PIN_HASH:0:12}); wiping cache" >&2
+      rm -rf "$CACHE_DIR"
+    fi
+  fi
+
+  mkdir -p "$CACHE_DIR"
+
+  echo "--- smoke --cached: docker + .smoke-cache/ (pin hash ${CURRENT_PIN_HASH:0:12}) ---"
+
+  MSYS_NO_PATHCONV=1 docker run --rm \
+    -v "${REPO_DIR}:/work" \
+    -w /work \
+    -e HERMES_AGENT_PIN_SPEC="${HERMES_AGENT_PIN_SPEC}" \
+    -e CURRENT_PIN_HASH="${CURRENT_PIN_HASH}" \
+    python:3.13-slim sh -c '
+      set -euo pipefail
+
+      apt-get update -qq >/dev/null 2>&1
+      apt-get install -y -qq --no-install-recommends git ca-certificates >/dev/null 2>&1
+
+      CACHE_DIR=/work/.smoke-cache
+      PIN_HASH_FILE="$CACHE_DIR/.pin-hash"
+
+      # Populate cache if empty (first run or post-invalidation).
+      # Filter out .pin-hash so a stale-hash-only dir still counts as empty.
+      if [ -z "$(ls -A "$CACHE_DIR" 2>/dev/null | grep -v "^\\.pin-hash$" || true)" ]; then
+        echo "--- smoke --cached: cache empty, pip download hermes-agent ---"
+        pip download --quiet --no-cache-dir --retries 3 \
+          -d "$CACHE_DIR" "${HERMES_AGENT_PIN_SPEC}"
+        printf "%s" "$CURRENT_PIN_HASH" > "$PIN_HASH_FILE"
+      fi
+
+      echo "--- smoke --cached: pip install --no-index from cache ---"
+      if ! pip install --quiet --no-cache-dir --no-index \
+          --find-links="$CACHE_DIR" hermes-agent ; then
+        echo "smoke.sh: cache install failed; falling back to network install + refreshing cache" >&2
+        pip install --quiet --no-cache-dir --retries 3 "${HERMES_AGENT_PIN_SPEC}"
+        # Refresh cache so the next --cached run is fast again.
+        rm -rf "$CACHE_DIR"/*.whl "$CACHE_DIR"/*.tar.gz 2>/dev/null || true
+        pip download --quiet --no-cache-dir --retries 3 \
+          -d "$CACHE_DIR" "${HERMES_AGENT_PIN_SPEC}"
+        printf "%s" "$CURRENT_PIN_HASH" > "$PIN_HASH_FILE"
+      fi
+
+      pip install --quiet --no-cache-dir --retries 3 -e ".[dev]"
+
+      echo "--- smoke step 1/3: import chatlytics_hermes.register ---"
+      python -c "from chatlytics_hermes import register; print(f\"register OK: {register.__name__}\")"
+
+      echo "--- smoke step 2/3: hermes_agent.plugins entry-point discovery ---"
+      python -c "
+from importlib.metadata import entry_points
+eps = entry_points(group=\"hermes_agent.plugins\")
+names = sorted({ep.name for ep in eps})
+assert \"chatlytics\" in names, f\"chatlytics not found in entry-points group; got: {names}\"
+print(f\"entry-points OK: chatlytics in {names}\")
+"
+
+      echo "--- smoke step 3/4: pytest tests/ ---"
+      pytest tests/ -q
+
+      echo "--- smoke step 4/4: live-loader integration ---"
+      pytest tests/test_live_loader.py -q --no-header --tb=short
+      echo "live-loader: chatlytics platform + 21 tools registered"
+
+      echo "--- smoke PASS (cached) ---"
+    '
+  exit $?
+fi
+
 # --- Default path: full dockerized smoke --------------------------------------
 
 # MSYS_NO_PATHCONV stops Git Bash on Windows from mangling the
