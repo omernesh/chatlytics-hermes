@@ -15,6 +15,19 @@
   gateway for an unknown chatId is `validation_error`** (NOT a legitimate
   empty). Closes v2.1 deferred item 1.
 
+- **Strict JID regex on `chatId` schemas** (HERMES-14): all 15
+  chatId-bearing tool schemas in `chatlytics_hermes.tools` now enforce
+  the WhatsApp JID format `<id>@<suffix>` where suffix is one of
+  `c.us` (1:1), `g.us` (groups), `lid` (NOWEB linked-id), or
+  `newsletter` (channels). The v2.1 permissive accept-set (which let
+  bare phones and display names pass through) is gone. The regex
+  matches the sibling JS bundle's canonical `looksLikeJid`:
+  `/@(c\.us|g\.us|lid|newsletter)$/i`. Callers must pre-resolve
+  names/phones to a JID via `chatlytics_search` before invoking any
+  chatId-bearing tool. **`messageId` validation is unchanged** -- the
+  JS canonical bundle does not regex-validate messageIds; the Python
+  plugin matches. Closes v2.1 deferred item 2.
+
 ## [2.1.0] -- 2026-05-17
 
 Tech-debt resolution + critical safety fixes carried over from the v2.0
