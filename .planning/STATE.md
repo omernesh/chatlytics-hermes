@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: — Breaking-change harmonization + first public release
 status: planning
-stopped_at: v3.0 scaffolding complete; awaiting operator launch of `/gsd-autonomous --from 13 --to 21`.
-last_updated: "2026-05-18T07:13:45.220Z"
-last_activity: 2026-05-18 — v3.0 milestone scaffolded; 9 phases derived from v2.1 deferred backlog + cosmetics + cross-repo publish coordination.
+stopped_at: HERMES-17 done — 120/120 tests, 2 files changed (audit doc + PROJECT.md cross-ref), 0 BLOCKER/HIGH/MED findings. Awaiting Phase 18 (cosmetics sweep).
+last_updated: "2026-05-18T07:14:00.000Z"
+last_activity: 2026-05-18 — Phase 17 (HERMES-17) docs-only API audit shipped (.planning/HERMES-API-AUDIT.md). 120/120 tests baseline preserved. Phases 13-17 complete.
 progress:
   total_phases: 9
-  completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
-  percent: 0
+  completed_phases: 5
+  total_plans: 5
+  completed_plans: 5
+  percent: 55
 ---
 
 # Project State
