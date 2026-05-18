@@ -92,6 +92,45 @@ def _guess_content_type(filename: Optional[str]) -> str:
     return guess or "application/octet-stream"
 
 
+def _read_file_sync(path: str) -> Tuple[bytes, str]:
+    """Synchronous file read for ``asyncio.to_thread`` offload.
+
+    Returns ``(content_bytes, basename)``. Used by both the
+    explicit-``Path`` and string-path-that-exists branches in
+    :meth:`ChatlyticsAdapter._resolve_media_url` (HERMES-15).
+    Module-level so the two branches share one implementation site
+    instead of defining identical inner functions (LOW-01 fix from
+    Phase 15 code review).
+    """
+    with open(path, "rb") as fh:
+        return fh.read(), os.path.basename(path) or "upload.bin"
+
+
+class _RemovedMethod:
+    """Descriptor that raises ``AttributeError`` on access.
+
+    Shadows an inherited base-class method so v3.0 BREAKING removals
+    surface as a clear migration error instead of silently inheriting
+    the base implementation. Used by :class:`ChatlyticsAdapter` to
+    block access to the removed ``send_image_file`` method (HERMES-15).
+
+    Compared to overriding ``__getattribute__``, the descriptor pays
+    its cost only at the removed-method's access site — all other
+    attribute lookups go through the normal C-level slot without
+    paying a per-access Python comparison.
+    """
+
+    def __init__(self, message: str) -> None:
+        self._message = message
+
+    def __get__(self, obj: Any, objtype: Any = None) -> Any:
+        raise AttributeError(self._message)
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        # Stash the attribute name for nicer repr / introspection.
+        self._name = name
+
+
 # HERMES-10 (03-LOW-01 + PR-MED-01): webhook_path validation at __init__.
 # C0 + DEL control range; rejected so adapters fail fast on copy-paste glitches
 # and possible injection attempts. Module-level constant so the validator and
@@ -863,12 +902,9 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # Branch 2: explicit Path object — local file, allowlist-enforced.
         elif isinstance(resource, Path):
             resolved = self._enforce_upload_allowlist(resource)
-
-            def _read_file_path() -> tuple[bytes, str]:
-                with open(str(resolved), "rb") as fh:
-                    return fh.read(), os.path.basename(str(resolved)) or "upload.bin"
-
-            content, basename = await asyncio.to_thread(_read_file_path)
+            content, basename = await asyncio.to_thread(
+                _read_file_sync, str(resolved)
+            )
             name = upload_filename or basename
             ctype = content_type or _guess_content_type(name)
             upload_response = await self._client.upload_file(
@@ -882,12 +918,9 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # Branch 4: string path that exists on disk — local file.
         elif isinstance(resource, str) and Path(resource).expanduser().exists():
             resolved = self._enforce_upload_allowlist(Path(resource))
-
-            def _read_file_str() -> tuple[bytes, str]:
-                with open(str(resolved), "rb") as fh:
-                    return fh.read(), os.path.basename(str(resolved)) or "upload.bin"
-
-            content, basename = await asyncio.to_thread(_read_file_str)
+            content, basename = await asyncio.to_thread(
+                _read_file_sync, str(resolved)
+            )
             name = upload_filename or basename
             ctype = content_type or _guess_content_type(name)
             upload_response = await self._client.upload_file(
@@ -1184,29 +1217,22 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
     #
     # The base class ``BasePlatformAdapter.send_image_file`` provides
     # a generic text-fallback default. To honor the "clean break"
-    # intent (no silent degradation to a text bubble), we explicitly
-    # block inherited access via ``__getattribute__`` below so v2.x
-    # callers see a clear ``AttributeError`` on upgrade with migration
-    # guidance, instead of an unexpected text-message side effect.
-    # The plain ``del`` / ``__delattr__`` approach won't work on an
-    # inherited method, hence the ``__getattribute__`` shim.
-
-    def __getattribute__(self, name: str) -> Any:
-        # HERMES-15: hard-block the v2.x ``send_image_file`` method
-        # which was removed from this adapter. The base class still
-        # defines a text-fallback default; that fallback would silently
-        # degrade a v2.x caller's photo send to a text message. Raise
-        # explicitly so the caller sees the migration path.
-        if name == "send_image_file":
-            raise AttributeError(
-                "ChatlyticsAdapter.send_image_file was removed in v3.0 "
-                "(HERMES-15). Use adapter.send_image(chat_id, resource: "
-                "str | Path | bytes) — the unified method auto-detects "
-                "URL vs local-file vs raw-bytes inputs. See the v3.0 "
-                "CHANGELOG entry 'BREAKING — adapter send_* unified "
-                "resource shape' for migration guidance."
-            )
-        return super().__getattribute__(name)
+    # intent (no silent degradation to a text bubble), we shadow the
+    # inherited method with the ``_RemovedMethod`` descriptor below so
+    # v2.x callers see a clear ``AttributeError`` on upgrade with
+    # migration guidance, instead of an unexpected text-message side
+    # effect. Using a descriptor (rather than ``__getattribute__``)
+    # keeps the cost paid only at the removed-method's access site —
+    # all other attribute lookups continue through the C-level slot
+    # without paying a per-access Python comparison.
+    send_image_file = _RemovedMethod(
+        "ChatlyticsAdapter.send_image_file was removed in v3.0 "
+        "(HERMES-15). Use adapter.send_image(chat_id, resource: "
+        "str | Path | bytes) — the unified method auto-detects "
+        "URL vs local-file vs raw-bytes inputs. See the v3.0 "
+        "CHANGELOG entry 'BREAKING — adapter send_* unified "
+        "resource shape' for migration guidance."
+    )
 
     # --- UX polish (HERMES-04 + HERMES-08 BL-01 fix) -----------------------
 

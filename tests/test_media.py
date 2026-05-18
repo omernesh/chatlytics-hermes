@@ -402,18 +402,33 @@ class TestResourceAutoDetection:
         self,
         adapter: ChatlyticsAdapter,
         mock_router: respx.MockRouter,
+        tmp_path: Path,
     ) -> None:
         """Branch 5: str that's neither URL nor existing path -> SendResult(False, ...).
 
         ``_resolve_media_url`` raises ``ValueError`` and
         ``_send_media_payload`` catches it and surfaces a clean
         failure dict to the caller instead of an uncaught raise.
+
+        LOW-03 fix (15-REVIEW): the bare string ``"not-a-url-not-a-path-zzz"``
+        would accidentally hit Branch 4 if a developer happens to have a
+        file by that name in their CWD. Use ``tmp_path`` + a uuid suffix
+        to guarantee the path does NOT exist.
         """
+        import uuid
+
+        nonexistent = str(
+            tmp_path / f"definitely-not-a-real-path-{uuid.uuid4().hex}"
+        )
+        assert not Path(nonexistent).exists(), (
+            "Test invariant: synthesized path must not exist"
+        )
+
         mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
         # No upload route mocked — should never be called.
 
         await adapter.connect()
-        result = await adapter.send_image(CHAT_ID, "not-a-url-not-a-path-zzz")
+        result = await adapter.send_image(CHAT_ID, nonexistent)
         assert result.success is False
         assert "Invalid resource" in (result.error or "")
         await adapter.disconnect()
@@ -421,26 +436,34 @@ class TestResourceAutoDetection:
     def test_send_image_file_symbol_is_gone(
         self, adapter: ChatlyticsAdapter
     ) -> None:
-        """HERMES-15 acceptance criterion 4: send_image_file must NOT exist.
+        """HERMES-15 acceptance criterion 4: send_image_file must NOT be usable.
+
+        The base class ``BasePlatformAdapter`` defines a text-fallback
+        default for ``send_image_file``, which would silently degrade
+        a v2.x photo-send caller into a text bubble. ``ChatlyticsAdapter``
+        shadows the inherited method with a ``_RemovedMethod`` descriptor
+        that raises ``AttributeError`` on access — v2.x callers see a
+        clear migration error pointing at ``send_image``.
 
         Two-part check honoring the "clean break, no deprecation alias"
-        intent — the base class ``BasePlatformAdapter`` defines a
-        text-fallback default for ``send_image_file``, which would
-        silently degrade a v2.x photo-send caller into a text bubble.
-        The adapter explicitly blocks inherited access in
-        ``__getattribute__`` to surface a clear migration error:
+        intent:
 
-        1. Our class does NOT define ``send_image_file`` in its own
-           ``__dict__`` — the v2.0 override is gone.
-        2. Instance attribute access raises ``AttributeError`` with
+        1. Instance attribute access raises ``AttributeError`` with
            migration guidance — direct callers of
            ``adapter.send_image_file(...)`` see a clear error pointing
-           at ``send_image`` instead of silently degrading.
+           at ``send_image`` instead of silently degrading. This is
+           the load-bearing contract.
+        2. ``getattr(adapter, "send_image_file", None) is None`` —
+           the ROADMAP HERMES-15 acceptance criterion 4 literal text.
+           Satisfied because ``getattr`` with a default swallows the
+           ``AttributeError`` raised by the descriptor.
         """
-        assert "send_image_file" not in ChatlyticsAdapter.__dict__, (
-            "send_image_file must be fully removed from the class "
-            "(no shim, no alias) — found in ChatlyticsAdapter.__dict__"
+        # AC #4 literal: getattr with default returns None on AttributeError.
+        assert getattr(adapter, "send_image_file", None) is None, (
+            "send_image_file access must raise AttributeError (caught "
+            "by getattr-with-default) — no usable shim or alias"
         )
+        # Load-bearing contract: direct access raises with migration text.
         with pytest.raises(AttributeError, match="send_image_file was removed"):
             adapter.send_image_file  # noqa: B018 — access triggers AttributeError
 
