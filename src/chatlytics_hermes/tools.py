@@ -748,31 +748,27 @@ async def chatlytics_send_image(
 ) -> Dict[str, Any]:
     """Send an image via the Chatlytics gateway.
 
-    HERMES-10 (PR-review LOW-06): dispatches to the appropriate
-    adapter method based on which input is set:
+    HERMES-15 (v3.0 BREAKING — library API; tool surface unchanged):
+    dispatches to the unified ``adapter.send_image(chatId, resource,
+    ...)`` method. Either ``mediaUrl`` or ``filePath`` is required —
+    ``_resolve_resource`` picks one of them and hands it to the
+    adapter, which auto-detects URL vs local-path vs bytes in
+    :meth:`ChatlyticsAdapter._resolve_media_url`.
 
-    - ``mediaUrl`` -> ``adapter.send_image(chatId, mediaUrl, ...)``
-      (URL-first variant)
-    - ``filePath`` -> ``adapter.send_image_file(chatId, filePath, ...)``
-      (local-path variant)
+    The v2.0/v2.1 split (``adapter.send_image`` vs
+    ``adapter.send_image_file``) is gone at the adapter layer. The
+    tool layer has always exposed one face; only the internal
+    dispatch simplified.
 
-    The adapter retains the URL-vs-path split for v2.0 surface
-    backwards-compat; this tool offers a single unified entry point so
-    MCP / Claude Code users see one consistent ``chatlytics_send_image``
-    call shape regardless of source. The other four media tools
-    (``send_voice/video/file/animation``) use a single adapter method
-    that internally dispatches on input shape -- only the image surface
-    is split historically.
+    Tool surface stays at 21 tools — this is an internal simplification
+    only. MCP / Hermes callers see no behavior change.
     """
     if adapter is None:
         return {"success": False, "error": "Media tools require a live adapter; ensure register() ran."}
     resource = _resolve_resource(mediaUrl=mediaUrl, filePath=filePath)
     if not resource:
         return {"success": False, "error": "Either mediaUrl or filePath is required."}
-    if mediaUrl:
-        result = await adapter.send_image(chatId, mediaUrl, caption=caption)
-    else:
-        result = await adapter.send_image_file(chatId, filePath, caption=caption)
+    result = await adapter.send_image(chatId, resource, caption=caption)
     return _media_result_dict(result)
 
 
