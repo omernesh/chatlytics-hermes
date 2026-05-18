@@ -51,17 +51,21 @@ Full upstream-contract rebuild against `hermes-agent>=0.14,<0.15`. 6 phases, 45/
 - [x] **HERMES-11** — Test infra cleanup; conftest teardown + idempotency guard + shared `FakePlatformConfig` + `smoke.sh --fast`
 - [x] **HERMES-12** — Release v2.1.0 (LOCAL tag only); CHANGELOG/README/pyproject/plugin.yaml bumped; operator lock preserved
 
-### Active (v3.0 — planning)
+### Validated (v3.0) — 2026-05-18
 
-- [ ] **HERMES-13** — `get_chat_info` `_error` sentinel (BREAKING tool surface)
-- [ ] **HERMES-14** — Strict JID regex on `chatId` schemas (BREAKING tool surface)
-- [ ] **HERMES-15** — Adapter `send_*` collapse (BREAKING library API)
-- [ ] **HERMES-16** — `smoke.sh` wheel caching (additive)
-- [ ] **HERMES-17** — Hermes 0.14 API audit doc (docs-only)
-- [ ] **HERMES-18** — Cosmetics sweep (v2.1 LOW/INFO carry-forward)
-- [ ] **HERMES-19** — Release chatlytics-hermes 3.0.0 (first public PyPI publish; TestPyPI dress rehearsal first)
-- [ ] **HERMES-20** — JS bundle update for v3.0 coordination (cross-repo, sibling chatlytics-claude-code repo)
-- [ ] **HERMES-21** — Release chatlytics-claude-code 1.2.0 (first public npm publish under `@chatlytics` org)
+- [x] **HERMES-13** — `get_chat_info` `_error` sentinel (BREAKING tool surface; three-way contract)
+- [x] **HERMES-14** — Strict JID regex on `chatId` schemas (BREAKING; matches JS bundle pattern)
+- [x] **HERMES-15** — Adapter `send_*` collapse (BREAKING library API; unified `resource: str | Path` param; HI-01 allowlist preserved via `_enforce_upload_allowlist`)
+- [x] **HERMES-16** — `smoke.sh --cached` wheel caching (additive; ~90% network reduction on cache hit)
+- [x] **HERMES-17** — Hermes 0.14 API audit doc (`.planning/HERMES-API-AUDIT.md`; 5 module-symbol-set rows + 10-step migration checklist)
+- [x] **HERMES-18** — Cosmetics sweep (6 deferred LOW/INFO nits closed; zero behavior change)
+- [x] **HERMES-19** — First public PyPI publish: `chatlytics-hermes 3.0.0` LIVE; `v3.0.0` tag pushed
+- [x] **HERMES-20** — JS bundle cross-repo coordination (1.1.0 → 1.2.0; JID regex aligned; `chatlytics_send` resolveChatId drift fixed; bundle regenerated)
+- [x] **HERMES-21** — First public npm publish under `@chatlytics` org: `@chatlytics/claude-code 1.2.0` LIVE; `v1.2.0` tag pushed in sibling repo
+
+### Active (v3.1 — planning)
+
+- [ ] TBD — run `/gsd:new-milestone` to scope
 
 ### Shipped (v2.0) — 2026-05-17
 
@@ -137,4 +141,4 @@ This document evolves at phase transitions and milestone boundaries.
 3. Update Context with current state
 
 ---
-*Last updated: 2026-05-18 -- v3.0 milestone scaffolded. 9 phases (HERMES-13..21) covering BREAKING changes + cosmetics + first public PyPI publish (chatlytics-hermes 3.0.0) + cross-repo first public npm publish (@chatlytics/claude-code 1.2.0). Operator lock LIFTED. Launch: `/gsd-autonomous --from 13 --to 21`. v2.1.0 pushed publicly 2026-05-18; v2.0.0 tag deleted (was BL-01 pre-fix).*
+*Last updated: 2026-05-18 after v3.0 milestone close. All 9 phases (HERMES-13..21) shipped. First public releases LIVE: `chatlytics-hermes 3.0.0` on PyPI + `@chatlytics/claude-code 1.2.0` on npm. 120/120 tests passing (+32 net new tests from v2.1 baseline). Two minor tech-debt items deferred to v3.1 backlog. Audit: `.planning/milestones/v3.0-MILESTONE-AUDIT.md` (passed).*

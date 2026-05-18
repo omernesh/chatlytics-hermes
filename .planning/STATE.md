@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: — Breaking-change harmonization + first public release
-status: ready_for_audit
-stopped_at: HERMES-21 PART B done — @chatlytics/claude-code@1.2.0 LIVE on npm (https://www.npmjs.com/package/@chatlytics/claude-code). Real npm publish succeeded; post-publish install verified in scratch dir; load smoke `OK @chatlytics/claude-code 1.2.0`; v1.2.0 annotated tag pushed; sibling main pushed (after rebase onto remote docs commit d5ceb08). v3.0 milestone deliverables COMPLETE — chatlytics-hermes 3.0.0 on PyPI + @chatlytics/claude-code 1.2.0 on npm. Awaiting milestone audit.
-last_updated: "2026-05-18T15:00:00.000Z"
-last_activity: 2026-05-18 — Phase 21 PART B real npm publish complete. v1.2.0 SHIPPED. First public npm release under @chatlytics org. All 9 phases complete.
+status: Awaiting next milestone
+stopped_at: v3.0 scaffolding complete; awaiting operator launch of `/gsd-autonomous --from 13 --to 21`.
+last_updated: "2026-05-18T11:25:41.501Z"
+last_activity: 2026-05-18 — Milestone v3.0 completed and archived
 progress:
   total_phases: 9
-  completed_phases: 9
+  completed_phases: 4
   total_plans: 9
-  completed_plans: 9
-  percent: 100
+  completed_plans: 4
+  percent: 44
 ---
 
 # Project State
@@ -26,10 +26,10 @@ See: `.planning/PROJECT.md`
 
 ## Current Position
 
-Phase: HERMES-21 (DONE — PART A + PART B)
+Phase: Milestone v3.0 complete
 Plan: —
-Status: ready_for_audit
-Last activity: 2026-05-18 — Phase 21 PART B complete. @chatlytics/claude-code@1.2.0 LIVE on npm. v1.2.0 tag + main pushed in sibling repo. v3.0 milestone deliverables COMPLETE — both publishes live (PyPI + npm). Next: milestone audit.
+Status: Awaiting next milestone
+Last activity: 2026-05-18 — Milestone v3.0 completed and archived
 
 ## v3.0 Phase Plan (9 phases, HERMES-13 → HERMES-21)
 
@@ -94,8 +94,4 @@ Next action: `/gsd-autonomous --from 13 --to 21`. HERMES-13..18 are sequential s
 
 ## Operator Next Steps
 
-- **Credentials:** Both tokens configured (PyPI in `~/.pypirc`, npm in `~/.npmrc`). Ready to launch.
-- **Launch:** `/gsd-autonomous --from 13 --to 21`. Same autonomous pattern as v2.1 — smart-discuss infra-skip per phase, plan → execute → code-review → fix-pass → review-gate → Telegram per phase. Halt only on real publish failures.
-- **After Phase 19 succeeds:** chatlytics-hermes 3.0.0 is on PyPI. Anyone can `pip install chatlytics-hermes`. This is the first public publish — review the published artifact at https://pypi.org/project/chatlytics-hermes/ before letting Phase 20 proceed.
-- **After Phase 21 succeeds:** `@chatlytics/claude-code` is on npm. Anyone can `npm install @chatlytics/claude-code`. First publish under the `@chatlytics` org.
-- **Security:** The npm token pasted into the planning session is in `~/.npmrc`. Rotate after v3.0 ships if you want a fresh token for ongoing use.
+- Start the next milestone with /gsd:new-milestone
