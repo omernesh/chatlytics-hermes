@@ -2,10 +2,12 @@
 phase: 15
 verification_status: passed
 implemented_by: gsd-execute-phase
+reviewed_by: gsd-code-review
+fix_pass_by: gsd-code-review
 tests_total: 116
 tests_passed: 116
 files_changed: 4
-commits: 7
+commits: 8
 ---
 
 # HERMES-15 — Verification
