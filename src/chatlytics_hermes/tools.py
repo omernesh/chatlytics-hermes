@@ -960,6 +960,65 @@ async def chatlytics_dispatch(
 
 
 # ---------------------------------------------------------------------------
+# Tool-layer wrapper for adapter.get_chat_info (HERMES-13)
+# ---------------------------------------------------------------------------
+#
+# Not registered in the TOOLS tuple — scope-locked at 21 tools for HERMES-13;
+# only the SEMANTICS of get_chat_info break in this phase, not the tool count.
+# Exposed as a module-level coroutine so in-plugin callers and tests can use
+# the canonical {"success": bool, ...} shape with the v3.0 ``_error`` machine
+# code. A future v3.1 minor MAY add this wrapper to TOOLS if the operator
+# decides the tool surface needs an explicit get_chat_info entry.
+
+
+async def chatlytics_get_chat_info(
+    client: ChatlyticsClient,
+    *,
+    adapter: Any = None,
+    chatId: str,
+) -> Dict[str, Any]:
+    """Tool-layer wrapper for :meth:`ChatlyticsAdapter.get_chat_info`.
+
+    Translates the new v3.0 three-way adapter contract
+    (``dict | None | raises ChatlyticsLookupError``) into the canonical
+    tool-shape:
+
+    - ``{"success": True,  "chat": {...}}``    — chat found
+    - ``{"success": True,  "chat": None}``     — legitimate empty
+    - ``{"success": False, "error": "...",     — any error
+       "_error": "<code>"}``                     code per ChatlyticsLookupError
+
+    Codes (lowercase snake_case): ``transport_error``, ``auth_error``,
+    ``server_error``, ``validation_error``, ``unknown_error``.
+
+    ``client`` is accepted for signature parity with the other handlers
+    in this module (the adapter-level lookup uses ``adapter.client``
+    internally; the parameter is unused here but keeps the call shape
+    uniform).
+    """
+    # Local import keeps the module-load dependency direction consistent
+    # with the existing pattern (tools.py already imports the lower-level
+    # helper _coerce_success_payload from adapter at module top).
+    from .adapter import ChatlyticsLookupError
+
+    if adapter is None:
+        return {
+            "success": False,
+            "error": "chatlytics_get_chat_info requires a live adapter",
+            "_error": "unknown_error",
+        }
+    try:
+        chat = await adapter.get_chat_info(chatId)
+    except ChatlyticsLookupError as exc:
+        return {
+            "success": False,
+            "error": exc.message,
+            "_error": exc.code,
+        }
+    return {"success": True, "chat": chat}
+
+
+# ---------------------------------------------------------------------------
 # TOOLS registry -- iterated by chatlytics_hermes.adapter.register()
 # ---------------------------------------------------------------------------
 
