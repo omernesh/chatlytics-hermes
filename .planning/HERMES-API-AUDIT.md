@@ -63,7 +63,7 @@ upstream has strong incentive to keep them stable across minor
 releases. The most likely shape of a 0.15 change is **additive**:
 new `MessageType` enum members (e.g., a new media type), new
 `BasePlatformAdapter` hook methods with default implementations,
-or new optional fields on `MessageEvent` / `SendResult` / 
+or new optional fields on `MessageEvent` / `SendResult` /
 `PlatformConfig`. All three patterns are non-breaking for this
 plugin.
 
@@ -126,7 +126,7 @@ default mitigation).
 5. **Run full pytest suite** under a fresh venv with hermes-agent
    0.15 installed: `python -m pytest tests/ -q --no-header`.
    Baseline must remain at least 120 passing (Phase 16 floor).
-6. **If any of the seven `core` symbols changed shape:** Update
+6. **If any of the seven `core` symbols listed in the Low-risk surface subsection changed shape:** Update
    the adapter inheritance / dataclass construction sites in
    `src/chatlytics_hermes/adapter.py` and `inbound.py`, then add
    an entry to `CHANGELOG.md` under "BREAKING — Hermes 0.15
