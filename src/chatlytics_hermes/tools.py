@@ -193,41 +193,66 @@ def _media_result_dict(result: Any) -> Dict[str, Any]:
 _DRAFT = "https://json-schema.org/draft/2020-12/schema"
 
 
-# HERMES-10 (05-LOW-02 + PR-MED-01): permissive chatId / messageId validation.
+# HERMES-14 (v3.0 BREAKING -- see CHANGELOG entry "BREAKING -- strict JID
+# regex on chatId schemas"): replaces v2.1's permissive
+# ``_CHAT_ID_PATTERN`` (which only rejected empty + control chars) with
+# a strict JID-only validator. Matches the sibling JS bundle's canonical
+# ``looksLikeJid`` regex at
+# ``C:/Users/omern/.claude/plugins/marketplaces/chatlytics-claude-code/servers/chatlytics-mcp.js:58-61``:
 #
-# Reject only obvious garbage at the schema boundary: empty strings and any C0
-# control character (``\x00``-``\x1f``) or DEL (``\x7f``). These almost
-# certainly indicate a copy-paste glitch, a stray newline, or an injection
-# attempt -- they NEVER represent a real Chatlytics chatId.
+#     function looksLikeJid(s) {
+#       if (typeof s !== "string" || s.length === 0) return false;
+#       return /@(c\.us|g\.us|lid|newsletter)$/i.test(s);
+#     }
 #
-# We deliberately do NOT enforce strict JID format (``\d+@(c|g|newsletter)\.us``)
-# because Chatlytics accepts ALL of the following shapes interchangeably:
+# Suffix families (lowercase, per WAHA convention):
+#   - ``@c.us``       -- 1:1 contacts
+#   - ``@g.us``       -- groups
+#   - ``@lid``        -- NOWEB linked-id form
+#   - ``@newsletter`` -- channels / newsletters
 #
-#   - WhatsApp JIDs (``1234567890@c.us``, ``1234...@g.us``, ``...@newsletter``)
-#   - Phone numbers (``+1234567890``, ``1234567890``)
-#   - Group display names (some Chatlytics gateway versions resolve these
-#     server-side, e.g. ``"My Group Name"``)
+# Phones, display names, and ambiguous strings are now rejected at the
+# schema boundary. Callers MUST pre-resolve via ``chatlytics_search``
+# before invoking any chatId-bearing tool.
 #
-# Tightening past the permissive pattern would break legitimate user inputs
-# typed at ``/chatlytics_send``. Schema-layer validation here is cosmetic --
-# better error messages early, NOT a stricter accept-set.
-_CHAT_ID_PATTERN: str = r"^[^\x00-\x1f\x7f]+$"
+# Note on case-sensitivity: JSON Schema ``pattern`` flags are
+# implementation-defined; jsonschema's Python validator treats the
+# pattern as case-sensitive by default. The JS ``/i`` flag is permissive
+# but real-world WAHA JIDs are lowercase, so case-sensitivity matches
+# the JS bundle's behavior for every legitimate input.
+_JID_PATTERN: str = r"^.+@(c\.us|g\.us|lid|newsletter)$"
+
+# ``_message_id_field`` stays on the v2.1 permissive validator (empty +
+# control-char rejection only). The JS canonical bundle does NOT regex-
+# validate WhatsApp messageIds -- they are treated as opaque strings --
+# so the Python plugin matches. Renamed from ``_CHAT_ID_PATTERN`` to
+# make the dual intent explicit; the messageId helper still uses it.
+_PERMISSIVE_ID_PATTERN: str = r"^[^\x00-\x1f\x7f]+$"
 
 
 def _chat_id_field(
-    description: str = "Chat JID, phone, or group identifier.",
+    description: str = (
+        "WhatsApp JID. Format: <id>@<suffix> where suffix is one of "
+        "c.us (1:1), g.us (groups), lid (NOWEB linked-id), "
+        "newsletter (channels). Phones and display names are rejected -- "
+        "use chatlytics_search first to resolve them to a JID."
+    ),
 ) -> Dict[str, Any]:
-    """Reusable schema fragment for ``chatId`` properties.
+    """Reusable schema fragment for ``chatId`` properties (strict JID).
 
-    Returns a Draft 2020-12 string schema with ``minLength: 1`` and a
-    ``pattern`` that rejects empty strings + control characters. Used
-    by every chatId-bearing tool schema so the wording stays consistent
-    and any future tightening lands in exactly one place.
+    HERMES-14 (v3.0 BREAKING): emits a Draft 2020-12 string schema with
+    ``minLength: 1`` and a ``pattern`` enforcing the JID suffix families
+    (c.us / g.us / lid / newsletter). Inputs that lack a valid suffix --
+    bare phones, display names, ambiguous strings -- are rejected at
+    validation time.
+
+    Callers needing a permissive identifier (e.g. ``messageId``) should
+    use :func:`_message_id_field` instead.
     """
     return {
         "type": "string",
         "minLength": 1,
-        "pattern": _CHAT_ID_PATTERN,
+        "pattern": _JID_PATTERN,
         "description": description,
     }
 
@@ -237,14 +262,16 @@ def _message_id_field(
 ) -> Dict[str, Any]:
     """Reusable schema fragment for ``messageId`` properties.
 
-    Same permissive validation as :func:`_chat_id_field`. Empty strings
-    and control characters are obvious garbage; everything else is
-    accepted (Chatlytics gateway versions vary on the exact format).
+    HERMES-14: stays permissive (empty + control-char rejection only).
+    The sibling JS bundle (``looksLikeJid`` at
+    ``servers/chatlytics-mcp.js``) does NOT regex-validate WhatsApp
+    messageIds -- they are treated as opaque strings. Matching that
+    behavior here keeps the Python plugin and JS bundle in lockstep.
     """
     return {
         "type": "string",
         "minLength": 1,
-        "pattern": _CHAT_ID_PATTERN,
+        "pattern": _PERMISSIVE_ID_PATTERN,
         "description": description,
     }
 
@@ -256,7 +283,8 @@ SEND_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
         "chatId": _chat_id_field(
-            "Chat JID (e.g. 12036...@g.us, 9725...@c.us) or phone."
+            "Chat JID (e.g. 12036...@g.us, 9725...@c.us). "
+            "Use chatlytics_search to resolve names/phones to a JID."
         ),
         "text": {"type": "string", "minLength": 1, "description": "Message text."},
         "replyTo": _message_id_field("Optional message ID to reply to."),
@@ -414,7 +442,7 @@ def _media_schema(title: str, description: str, extra_props: Optional[Dict[str, 
         "description": description,
         "type": "object",
         "properties": {
-            # HERMES-10 (05-LOW-02 + PR-MED-01): permissive chatId validation.
+            # HERMES-14 (v3.0 BREAKING): strict JID validation via _chat_id_field().
             "chatId": _chat_id_field(),
             "mediaUrl": {"type": "string", "format": "uri", "description": "https:// URL of the media."},
             "filePath": {"type": "string", "description": "Local file path; uploaded to /api/v1/upload."},
