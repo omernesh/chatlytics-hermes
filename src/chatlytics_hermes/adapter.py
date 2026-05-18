@@ -138,6 +138,17 @@ class _RemovedMethod:
 _CONTROL_CHARS: str = "".join(chr(i) for i in range(32)) + "\x7f"
 
 
+# HERMES-18 (closes v2.1 Phase 9 INFO-02): module-level constant for the
+# reserved top-level keys of the /api/v1/send request body. ``send()``
+# assigns these keys unconditionally (chatId/text) or conditionally
+# (accountId/replyTo) above the metadata-merge block and must NOT let a
+# caller-passed metadata kwarg shadow them. Lifting the set here ensures
+# a future contributor who adds a new top-level body field updates the
+# reserved-key check in lockstep instead of silently regressing the
+# 02-LOW-01 WARNING contract.
+_RESERVED_BODY_KEYS: frozenset = frozenset({"chatId", "text", "accountId", "replyTo"})
+
+
 def _validate_webhook_path(path: Any) -> None:
     """Validate ``webhook_path`` at adapter ``__init__``.
 
@@ -579,9 +590,11 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             # HERMES-09 (closes 02-LOW-01): dropped reserved keys now emit
             # a WARNING so the caller learns their intent was unrealized
             # instead of silently mismatching the body shape.
-            _reserved = {"chatId", "text", "accountId", "replyTo"}
+            # HERMES-18 (closes Phase 9 INFO-02): reserved set lifted to
+            # the module-level ``_RESERVED_BODY_KEYS`` constant so the
+            # set stays in lockstep with the body-field assignments above.
             for key, value in metadata.items():
-                if key in _reserved:
+                if key in _RESERVED_BODY_KEYS:
                     logger.warning(
                         "send() ignoring reserved metadata key %r "
                         "(would shadow body field)",
