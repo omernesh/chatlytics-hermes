@@ -45,14 +45,18 @@ HERMES_AGENT_PIN_SPEC="hermes-agent @ git+https://github.com/NousResearch/hermes
 # --- Argument parsing ---------------------------------------------------------
 
 FAST=0
+CACHED=0
 for arg in "$@"; do
   case "$arg" in
     --fast)
       FAST=1
       ;;
+    --cached)
+      CACHED=1
+      ;;
     -h|--help)
       cat <<'USAGE'
-Usage: scripts/smoke.sh [--fast]
+Usage: scripts/smoke.sh [--fast] [--cached]
 
 Modes:
   (default)   Full dockerized smoke: fresh python:3.13-slim, pip install
@@ -62,10 +66,19 @@ Modes:
               Assumes hermes-agent + plugin already installed locally.
               Used for local iteration -- NOT a substitute for the full
               smoke before tagging a release. ~10-20s.
+  --cached    Cache the hermes-agent wheel at .smoke-cache/ between
+              runs. First --cached run populates the cache via
+              pip download; subsequent runs install with --no-index
+              (no network). Cache invalidates automatically when the
+              pinned hermes-agent tag changes. Falls back to a normal
+              network install if the cache install fails. No-op in
+              --fast mode. ~60-90s first run; ~15-25s subsequent runs.
 
 Examples:
-  bash scripts/smoke.sh                 # release-gate smoke
-  bash scripts/smoke.sh --fast          # quick local pytest
+  bash scripts/smoke.sh                       # release-gate smoke
+  bash scripts/smoke.sh --fast                # quick local pytest
+  bash scripts/smoke.sh --cached              # cached docker smoke
+  bash scripts/smoke.sh --cached --fast       # cached flag is a no-op in --fast
 USAGE
       exit 0
       ;;
@@ -76,6 +89,12 @@ USAGE
       ;;
   esac
 done
+
+# --cached is a no-op in --fast mode (host venv never installs hermes-
+# agent fresh). Print a one-line note for clarity, continue normally.
+if [ "$CACHED" = "1" ] && [ "$FAST" = "1" ]; then
+  echo "smoke.sh: --cached is a no-op in --fast mode (host venv reused)" >&2
+fi
 
 # --- Fast path: host-venv pytest only -----------------------------------------
 
