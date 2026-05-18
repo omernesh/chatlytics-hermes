@@ -8,7 +8,7 @@ A first-class platform plugin for [Hermes Agent](https://github.com/NousResearch
 
 Hermes agents get production-grade WhatsApp messaging — text, media (image/voice/video/document/animation/image-file), reactions, groups, contacts, channels, polls, presence, profile management — via a single `pip install` and a config block. Inbound webhooks arrive as Hermes-native `MessageEvent` objects with proper `MessageType` discrimination; outbound goes through Chatlytics REST with auth, retry, and gate enforcement handled upstream.
 
-## Current State: v3.0 — Breaking-change harmonization + first public release (planning)
+## Current State: v3.0 — shipped 2026-05-18 (Python on PyPI, JS on npm)
 
 v2.1 shipped publicly 2026-05-18 (main + `v2.1.0` tag pushed to GitHub). Local `v2.0.0` tag deleted (was BL-01 pre-fix). 88/88 tests baseline carried into v3.0.
 

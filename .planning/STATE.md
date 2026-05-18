@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: — Breaking-change harmonization + first public release
-status: in_progress
-stopped_at: HERMES-21 PART A done — npm manifest prepared for first public publish of @chatlytics/claude-code 1.2.0. Sibling repo flipped private:false + renamed scoped + files: allowlist (8 entries) + publishConfig.access:public + engines.node:>=18. npm pack dry-run OK (9 files, 147.7 kB). npm publish --dry-run --access=public OK (+ @chatlytics/claude-code@1.2.0). npm view -> 404 (name available). whoami -> omernesh. 1 sibling commit (270b23e), 3 Python commits (CONTEXT, PLAN, SUMMARY+REVIEW+NPM-READY). Code review 0/0/0/0/1 INFO (postinstall waste, deferred). AWAITING OPERATOR GO/NO-GO for PART B (real npm publish + tag v1.2.0 + push tag + push main in sibling repo).
-last_updated: "2026-05-18T14:00:00.000Z"
-last_activity: 2026-05-18 — Phase 21 PART A implemented + reviewed + dry-run validated. Manifest prep only — no real publish, no tag, no push (PART B owns those). Phases 13-20 complete; 21 part-A complete; 21 part-B pending operator.
+status: ready_for_audit
+stopped_at: HERMES-21 PART B done — @chatlytics/claude-code@1.2.0 LIVE on npm (https://www.npmjs.com/package/@chatlytics/claude-code). Real npm publish succeeded; post-publish install verified in scratch dir; load smoke `OK @chatlytics/claude-code 1.2.0`; v1.2.0 annotated tag pushed; sibling main pushed (after rebase onto remote docs commit d5ceb08). v3.0 milestone deliverables COMPLETE — chatlytics-hermes 3.0.0 on PyPI + @chatlytics/claude-code 1.2.0 on npm. Awaiting milestone audit.
+last_updated: "2026-05-18T15:00:00.000Z"
+last_activity: 2026-05-18 — Phase 21 PART B real npm publish complete. v1.2.0 SHIPPED. First public npm release under @chatlytics org. All 9 phases complete.
 progress:
   total_phases: 9
-  completed_phases: 8
-  total_plans: 8
-  completed_plans: 8
-  percent: 88
+  completed_phases: 9
+  total_plans: 9
+  completed_plans: 9
+  percent: 100
 ---
 
 # Project State
@@ -26,10 +26,10 @@ See: `.planning/PROJECT.md`
 
 ## Current Position
 
-Phase: HERMES-21 (not started)
+Phase: HERMES-21 (DONE — PART A + PART B)
 Plan: —
-Status: in_progress
-Last activity: 2026-05-18 — Phase 20 done. chatlytics-claude-code bundle aligned at 1.2.0 in sibling repo; drift fix landed; bundle rebuilt; npm pack dry-run OK. Awaiting Phase 21 (npm publish — scope flip + rename + files allowlist + tag).
+Status: ready_for_audit
+Last activity: 2026-05-18 — Phase 21 PART B complete. @chatlytics/claude-code@1.2.0 LIVE on npm. v1.2.0 tag + main pushed in sibling repo. v3.0 milestone deliverables COMPLETE — both publishes live (PyPI + npm). Next: milestone audit.
 
 ## v3.0 Phase Plan (9 phases, HERMES-13 → HERMES-21)
 
@@ -43,7 +43,7 @@ Last activity: 2026-05-18 — Phase 20 done. chatlytics-claude-code bundle align
 | HERMES-18 — Cosmetics sweep | chatlytics-hermes | nits | **DONE** (120/120 tests; 0B/0H/0M/0L/1I) | HERMES-17 | v2.1 Phase 9 LOW-01 + INFO-02..04, Phase 10 LOW-02 + INFO-01..03 | Close v2.1 audit's deferred LOW/INFO nits: log-level/style consistency in adapter+tools, docstring tightening, minor lint nits. No behavior change. Optional skip if reviewer pushes back. |
 | HERMES-19 — Release chatlytics-hermes 3.0.0 (PyPI) | chatlytics-hermes | **release** | **DONE** (v3.0.0 LIVE on PyPI; tag pushed; main pushed) | HERMES-13..18 | first public PyPI publish | CHANGELOG 3.0.0 (BREAKING), README rewrite, pyproject + plugin.yaml bumped to 3.0.0. Build sdist + wheel. **Local wheel-install dress rehearsal** (`twine check` + scratch venv pip install + pytest against installed wheel) → **real PyPI publish** → post-publish install verification. Tag `v3.0.0` + push tag + push main. **HALT conditions:** `twine check` errors; local dress-rehearsal pytest fails; package name already taken on PyPI (`pip index versions chatlytics-hermes` pre-check); `twine upload` auth failure. |
 | HERMES-20 — JS bundle update for v3.0 coordination | chatlytics-claude-code | cross-repo | **DONE** (4 sibling commits + 3 Python commits; npm pack OK; 0/0/0/0/1 INFO review) | HERMES-19 | bundle version reconciliation | **Cross-repo done.** Bumped `1.1.0`→`1.2.0` across 3 sites (drift between package.json `1.1.0` and CHANGELOG `1.1.2` reconciled). `looksLikeJid` already aligned with Python Phase 14 (verified, no code change). `chatlytics_send` resolveChatId drift bug FIXED (mirror of `chatlytics_read` pattern). Esbuild bundle regenerated (714.4 KB). 8 tools (unchanged). README already correct. Phase 21 scope guard preserved (no publish/rename/files/private-flip/tag). |
-| HERMES-21 — Release chatlytics-claude-code 1.2.0 (npm) | chatlytics-claude-code | **release** | Ready | HERMES-20 | first public npm publish | **Cross-repo**: flip `"private": true` → `false` on both `package.json` files. Add `files:` allowlist (servers/, README.md, CHANGELOG.md, LICENSE, skills/ if applicable). Rename package to `@chatlytics/claude-code` (operator's `@chatlytics` npm org). `npm pack` → `npm publish --dry-run` (no auth needed) → `npm publish --access=public` (auth via `~/.npmrc`). Tag `v1.2.0` + push. **HALT conditions:** `@chatlytics` org doesn't accept publish (token scope insufficient); `@chatlytics/claude-code` name taken; npm validation rejects manifest. |
+| HERMES-21 — Release chatlytics-claude-code 1.2.0 (npm) | chatlytics-claude-code | **release** | **DONE** (v1.2.0 LIVE on npm; tag pushed; main pushed; post-publish install verified) | HERMES-20 | first public npm publish | **Cross-repo**: flip `"private": true` → `false` on both `package.json` files. Add `files:` allowlist (servers/, README.md, CHANGELOG.md, LICENSE, skills/ if applicable). Rename package to `@chatlytics/claude-code` (operator's `@chatlytics` npm org). `npm pack` → `npm publish --dry-run` (no auth needed) → `npm publish --access=public` (auth via `~/.npmrc`). Tag `v1.2.0` + push. **HALT conditions:** `@chatlytics` org doesn't accept publish (token scope insufficient); `@chatlytics/claude-code` name taken; npm validation rejects manifest. |
 
 ## v3.0 Architectural Invariants (every phase preserves)
 
