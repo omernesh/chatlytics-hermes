@@ -186,7 +186,7 @@ Close every deferred breaking-change item from the v2.1 Backlog, sweep v2.1 cosm
 ---
 
 ### Phase 19: Release chatlytics-hermes 3.0.0 (PyPI)
-**Goal:** First public PyPI publish of chatlytics-hermes. CHANGELOG 3.0.0 (BREAKING) entry, README rewrite for breaking changes, pyproject + plugin.yaml bumped to 3.0.0. TestPyPI dress rehearsal validates the artifact before real PyPI publish. Tag `v3.0.0`, push main + tag.
+**Goal:** First public PyPI publish of chatlytics-hermes. CHANGELOG 3.0.0 (BREAKING) entry, README rewrite for breaking changes, pyproject + plugin.yaml bumped to 3.0.0. **Local wheel-install dress rehearsal** validates the artifact before real PyPI publish. Tag `v3.0.0`, push main + tag.
 
 **Depends on:** HERMES-13..18 (all v3.0 substantive work must land first)
 
@@ -195,16 +195,20 @@ Close every deferred breaking-change item from the v2.1 Backlog, sweep v2.1 cosm
 - README rewrite: "v3.0 Breaking Changes" section near the top, migration section, updated tool reference for Phase 13/14 changes
 - `pyproject.toml` — `version = "3.0.0"`, double-check `[project.urls]` are correct for public publish (Homepage, Repository, Documentation)
 - `plugin.yaml` — `version: 3.0.0`
+- Install build tooling in a scratch venv: `python -m pip install --upgrade build twine`
 - Build: `python -m build` → produces sdist + wheel in `dist/`
-- `twine check dist/*` — validate metadata
-- **TestPyPI publish:** `twine upload --repository testpypi dist/*` (needs TestPyPI token; HALT if missing)
-- Install from TestPyPI in a scratch venv: `pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ chatlytics-hermes==3.0.0` (the second index is for transitive deps that don't exist on TestPyPI)
-- Run `pytest` against the installed wheel → must pass
-- **Real PyPI publish:** `twine upload dist/*` (needs real PyPI token; HALT if missing)
-- Verify on https://pypi.org/project/chatlytics-hermes/
-- Install from real PyPI in another scratch venv → run pytest → must pass
-- `git tag v3.0.0` (annotated) + `git push origin main && git push origin v3.0.0`
-- HALT conditions: TestPyPI/PyPI credentials missing; package name `chatlytics-hermes` already taken (highly unlikely but check at publish time); smoke install from TestPyPI fails; `twine check` finds metadata errors
+- `twine check dist/*` — validate PyPI metadata (catches malformed README, missing classifiers, etc.)
+- **Local dress rehearsal** (replaces TestPyPI — operator chose local-only):
+  - Create a fresh scratch venv: `python -m venv .venv-pypi-rehearsal`
+  - Install from the local wheel: `.venv-pypi-rehearsal/bin/pip install dist/chatlytics_hermes-3.0.0-py3-none-any.whl` (or `Scripts/pip` on Windows)
+  - Sanity import: `python -c "from chatlytics_hermes import register; print(register.__name__)"` → `register`
+  - Run full pytest suite against the installed wheel: `pytest tests/ -q --no-header` (88+N must pass)
+  - Tear down scratch venv on success
+- **Real PyPI publish:** `twine upload dist/*` (uses `~/.pypirc[pypi]` token; HALT if `twine` reports auth failure or rejected metadata)
+- Verify on https://pypi.org/project/chatlytics-hermes/ — page exists, version is 3.0.0, description renders, repository link works
+- Post-publish install verification: `pip install --no-deps chatlytics-hermes==3.0.0` in another fresh venv, then `python -c "import chatlytics_hermes; print(chatlytics_hermes.__version__)"` → `3.0.0`
+- `git tag -a v3.0.0 -m "v3.0.0 — first public PyPI release"` + `git push origin main && git push origin v3.0.0`
+- HALT conditions: `twine check` finds metadata errors; local dress-rehearsal pytest fails; package name `chatlytics-hermes` already taken on PyPI (highly unlikely — pre-check via `pip index versions chatlytics-hermes` before upload, halt if any version already exists); `twine upload` reports auth failure or metadata rejection
 
 **Out of scope:**
 - npm publish (Phase 21)
@@ -219,12 +223,12 @@ Close every deferred breaking-change item from the v2.1 Backlog, sweep v2.1 cosm
 - CREATE `scripts/release.sh` (optional — codifies the build + TestPyPI + PyPI + tag flow for reproducibility)
 
 **Acceptance criteria:**
-1. `chatlytics-hermes==3.0.0` installs from `pip install chatlytics-hermes` (real PyPI) in a scratch venv
-2. After install, `from chatlytics_hermes import register; register.__name__ == "register"` works
-3. Full pytest suite passes against the installed wheel (88+N tests)
-4. Tag `v3.0.0` exists on GitHub: `git ls-remote --tags origin | grep v3.0.0`
-5. PyPI page at https://pypi.org/project/chatlytics-hermes/ shows version 3.0.0 with correct description + repository link
-6. `twine check dist/*` — clean (no metadata warnings)
+1. `twine check dist/*` — clean (no metadata warnings or errors)
+2. Local dress rehearsal passes: scratch venv installs `dist/chatlytics_hermes-3.0.0-*.whl`, `from chatlytics_hermes import register` works, full pytest suite (88+N) passes against the installed wheel
+3. `chatlytics-hermes==3.0.0` installs from `pip install chatlytics-hermes` (real PyPI) in a fresh post-publish scratch venv
+4. Post-publish: `python -c "import chatlytics_hermes"` works; `__version__` is `3.0.0`
+5. Tag `v3.0.0` exists on GitHub: `git ls-remote --tags origin | grep v3.0.0`
+6. PyPI page at https://pypi.org/project/chatlytics-hermes/ shows version 3.0.0 with correct description + repository link + license
 7. CHANGELOG 3.0.0 lists every breaking change with migration guidance
 
 ---

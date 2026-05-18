@@ -41,7 +41,7 @@ Last activity: 2026-05-18 — v3.0 milestone scaffolded; 9 phases derived from v
 | HERMES-16 — `smoke.sh` wheel caching | chatlytics-hermes | additive | Ready | HERMES-15 | v2.1-deferred-4 | Cache the hermes-agent wheel between smoke runs via `pip download` to `.smoke-cache/` + `pip install --no-index --find-links=.smoke-cache/`. Falls back to network if cache miss. Non-breaking, opt-in via `--cached` flag (default: existing behavior). |
 | HERMES-17 — Hermes 0.14 API audit doc | chatlytics-hermes | docs-only | Ready | HERMES-16 | v2.1-deferred-5 (downgraded) | hermes-agent 0.15 doesn't exist yet (Nous Research project, not ours). Audit becomes inventory: every `hermes.*` import + which 0.14 module/version it came from + likely breaking surface for a future 0.15. Writes `.planning/HERMES-API-AUDIT.md`. **No code changes** — pure documentation. |
 | HERMES-18 — Cosmetics sweep | chatlytics-hermes | nits | Ready | HERMES-17 | v2.1 Phase 9 LOW-01 + INFO-02..04, Phase 10 LOW-02 + INFO-01..03 | Close v2.1 audit's deferred LOW/INFO nits: log-level/style consistency in adapter+tools, docstring tightening, minor lint nits. No behavior change. Optional skip if reviewer pushes back. |
-| HERMES-19 — Release chatlytics-hermes 3.0.0 (PyPI) | chatlytics-hermes | **release** | Ready | HERMES-13..18 | first public PyPI publish | CHANGELOG 3.0.0 (BREAKING), README rewrite for breaking changes, pyproject + plugin.yaml bumped to 3.0.0. Build sdist + wheel. **TestPyPI dress rehearsal** → install from TestPyPI in clean venv → run smoke → **real PyPI publish**. Tag `v3.0.0` + push tag + push main. **HALT conditions:** `TWINE_PASSWORD` missing for TestPyPI/PyPI; package name `chatlytics-hermes` already taken on TestPyPI/PyPI; smoke install fails. |
+| HERMES-19 — Release chatlytics-hermes 3.0.0 (PyPI) | chatlytics-hermes | **release** | Ready | HERMES-13..18 | first public PyPI publish | CHANGELOG 3.0.0 (BREAKING), README rewrite, pyproject + plugin.yaml bumped to 3.0.0. Build sdist + wheel. **Local wheel-install dress rehearsal** (`twine check` + scratch venv pip install + pytest against installed wheel) → **real PyPI publish** → post-publish install verification. Tag `v3.0.0` + push tag + push main. **HALT conditions:** `twine check` errors; local dress-rehearsal pytest fails; package name already taken on PyPI (`pip index versions chatlytics-hermes` pre-check); `twine upload` auth failure. |
 | HERMES-20 — JS bundle update for v3.0 coordination | chatlytics-claude-code | cross-repo | Ready | HERMES-19 | bundle version reconciliation | **Cross-repo**: subagent `cd`s into `C:/Users/omern/.claude/plugins/marketplaces/chatlytics-claude-code/`. Bump version `1.1.2` → `1.2.0` (MINOR, not major — no JS API breaks). Reconcile tool count in README/CHANGELOG (was 6 in 1.1.0, actually 8 now). Tighten `looksLikeJid()` regex to match Python's stricter rule from HERMES-14. Fix `chatlytics_send` to call `resolveChatId()` (was bypassing it — drift). Rebuild esbuild bundle. |
 | HERMES-21 — Release chatlytics-claude-code 1.2.0 (npm) | chatlytics-claude-code | **release** | Ready | HERMES-20 | first public npm publish | **Cross-repo**: flip `"private": true` → `false` on both `package.json` files. Add `files:` allowlist (servers/, README.md, CHANGELOG.md, LICENSE, skills/ if applicable). Rename package to `@chatlytics/claude-code` (operator's `@chatlytics` npm org). `npm pack` → `npm publish --dry-run` (no auth needed) → `npm publish --access=public` (auth via `~/.npmrc`). Tag `v1.2.0` + push. **HALT conditions:** `@chatlytics` org doesn't accept publish (token scope insufficient); `@chatlytics/claude-code` name taken; npm validation rejects manifest. |
 
@@ -75,11 +75,13 @@ Autonomous-only base (unchanged from v2.1):
 
 | Credential | Required for | Status | Halt if missing |
 |------------|--------------|--------|-----------------|
-| TestPyPI token (in `~/.pypirc[testpypi]` or `TWINE_PASSWORD` env) | HERMES-19 dress rehearsal | NOT configured (no ~/.pypirc) | HALT Phase 19a, ask operator to configure |
-| Real PyPI token (in `~/.pypirc[pypi]` or `TWINE_PASSWORD` env) | HERMES-19 real publish | NOT configured | HALT Phase 19b, ask operator to configure |
-| npm token (in `~/.npmrc` under `//registry.npmjs.org/:_authToken=`) | HERMES-21 real publish | CONFIGURED (verified `npm whoami` → omernesh) | — |
+| Real PyPI token (in `~/.pypirc[pypi]`) | HERMES-19 real publish | **CONFIGURED** | — |
+| TestPyPI token | (not used — replaced with local wheel-install dress rehearsal) | n/a | n/a |
+| npm token (in `~/.npmrc`) | HERMES-21 real publish | **CONFIGURED** (verified `npm whoami` → omernesh) | — |
 
 **Token scope note (npm):** Token is a granular access token. Can publish, cannot introspect orgs (`npm org ls` returns 403). Phase 21 publish-attempt is the actual gate for `@chatlytics` org membership / package-name availability.
+
+**Dress rehearsal note (PyPI):** Operator chose local wheel-install dress rehearsal over TestPyPI (avoids managing two tokens). Phase 19 runs `twine check dist/*` + scratch-venv install + pytest against the installed wheel. PyPI runs the same validators at upload time, so metadata errors are caught BEFORE public indexing.
 
 ## Session Continuity
 
@@ -90,8 +92,8 @@ Next action: `/gsd-autonomous --from 13 --to 21`. HERMES-13..18 are sequential s
 
 ## Operator Next Steps
 
-- **Before launching autonomous:** Configure TestPyPI + real PyPI tokens. Recommended: `~/.pypirc` with `[testpypi]` + `[pypi]` sections (one token per registry).
-- **Launch:** `/gsd-autonomous --from 13 --to 21`. Same autonomous pattern as v2.1 — smart-discuss infra-skip per phase, plan → execute → code-review → fix-pass → review-gate → Telegram per phase. Halt only on credential gaps or real publish failures.
+- **Credentials:** Both tokens configured (PyPI in `~/.pypirc`, npm in `~/.npmrc`). Ready to launch.
+- **Launch:** `/gsd-autonomous --from 13 --to 21`. Same autonomous pattern as v2.1 — smart-discuss infra-skip per phase, plan → execute → code-review → fix-pass → review-gate → Telegram per phase. Halt only on real publish failures.
 - **After Phase 19 succeeds:** chatlytics-hermes 3.0.0 is on PyPI. Anyone can `pip install chatlytics-hermes`. This is the first public publish — review the published artifact at https://pypi.org/project/chatlytics-hermes/ before letting Phase 20 proceed.
 - **After Phase 21 succeeds:** `@chatlytics/claude-code` is on npm. Anyone can `npm install @chatlytics/claude-code`. First publish under the `@chatlytics` org.
 - **Security:** The npm token pasted into the planning session is in `~/.npmrc`. Rotate after v3.0 ships if you want a fresh token for ongoing use.
