@@ -13,8 +13,9 @@ Covers ROADMAP Phase 5 acceptance criteria:
 from __future__ import annotations
 
 import jsonschema
+import pytest
 
-from chatlytics_hermes.tools import TOOLS
+from chatlytics_hermes.tools import SEND_SCHEMA, TOOLS
 
 
 # Sets that drive the per-group required-field check.  Kept module-level
@@ -119,3 +120,88 @@ def test_every_tool_disallows_extra_properties() -> None:
         assert schema.get("additionalProperties") is False, (
             f"{name}: schema should set additionalProperties=False"
         )
+
+
+# ---------------------------------------------------------------------------
+# HERMES-14: strict JID regex on chatId schemas (BREAKING)
+# ---------------------------------------------------------------------------
+#
+# v3.0 BREAKING -- see CHANGELOG entry "BREAKING -- strict JID regex on
+# chatId schemas". The v2.1 permissive accept-set (anything non-empty,
+# no control chars) is replaced with strict JID-only validation
+# matching the sibling JS bundle's ``looksLikeJid`` regex.
+
+
+class TestJidValidation:
+    """Strict JID regex enforcement on chatId schemas (HERMES-14)."""
+
+    @pytest.mark.parametrize(
+        "chat_id,family",
+        [
+            ("972501234567@c.us", "c.us -- 1:1 contact"),
+            ("120363012345678901@g.us", "g.us -- group"),
+            ("123456789012345@lid", "lid -- NOWEB linked-id"),
+            ("123456789@newsletter", "newsletter -- channels"),
+        ],
+    )
+    def test_jid_accepted_for_each_suffix_family(
+        self, chat_id: str, family: str
+    ) -> None:
+        """All 4 JID suffix families validate cleanly."""
+        validator = jsonschema.Draft202012Validator(SEND_SCHEMA)
+        # Should NOT raise.
+        validator.validate({"chatId": chat_id, "text": "hi"})
+
+    @pytest.mark.parametrize(
+        "chat_id,reason",
+        [
+            ("12025551234", "bare phone -- was permissive in v2.1"),
+            ("Omer Nesher", "display name -- was permissive in v2.1"),
+            ("", "empty string"),
+            ("12025551234@s.whatsapp.net", "JID-shaped but wrong suffix"),
+            ("@c.us", "missing local part (id before @)"),
+            ("12025551234@c.us ", "trailing whitespace breaks the anchor"),
+            ("12025551234@C.US", "uppercase suffix (case-sensitive pattern)"),
+            ("prefix-12025551234@c.us-suffix", "suffix not at end of string"),
+        ],
+    )
+    def test_jid_rejected_for_invalid_inputs(
+        self, chat_id: str, reason: str
+    ) -> None:
+        """v3.0 schema tightening -- these inputs were permissive in v2.1.
+
+        Callers must pre-resolve names/phones via ``chatlytics_search``
+        before invoking any chatId-bearing tool.
+        """
+        validator = jsonschema.Draft202012Validator(SEND_SCHEMA)
+        with pytest.raises(jsonschema.ValidationError):
+            validator.validate({"chatId": chat_id, "text": "hi"})
+
+    def test_jid_validator_applied_to_all_15_chat_id_schemas(self) -> None:
+        """Audit: every schema with a ``chatId`` property uses the strict pattern.
+
+        Guards against drift where a new chatId-bearing tool is added
+        with a hand-rolled string schema instead of via
+        ``_chat_id_field()``.
+        """
+        from chatlytics_hermes.tools import _JID_PATTERN
+
+        chat_id_schemas = []
+        for name, schema, _ in TOOLS:
+            props = schema.get("properties", {})
+            if "chatId" in props:
+                chat_id_schemas.append((name, props["chatId"]))
+
+        # Sanity: at least the 15 chatId-bearing tools enumerated in
+        # 14-CONTEXT D-section are present.
+        assert len(chat_id_schemas) >= 15, (
+            f"Expected at least 15 chatId-bearing schemas; "
+            f"found {len(chat_id_schemas)}: "
+            f"{[n for n, _ in chat_id_schemas]}"
+        )
+
+        for name, field in chat_id_schemas:
+            assert field.get("pattern") == _JID_PATTERN, (
+                f"{name}: chatId schema must use the strict _JID_PATTERN; "
+                f"got pattern={field.get('pattern')!r}. Use _chat_id_field()."
+            )
