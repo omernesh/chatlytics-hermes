@@ -1,5 +1,320 @@
 # ROADMAP — chatlytics-hermes
 
+## v3.0 — Breaking-change harmonization + first public release (PyPI + npm)
+
+Close every deferred breaking-change item from the v2.1 Backlog, sweep v2.1 cosmetic carry-forward nits, and ship the **first public release** on PyPI (`chatlytics-hermes 3.0.0`) and npm (`@chatlytics/claude-code 1.2.0`). Nine phases (HERMES-13..21), designed for end-to-end execution via `/gsd-autonomous --from 13 --to 21`. Operator lock LIFTED — TestPyPI/npm dry-run dress rehearsals precede real publishes.
+
+### Phase 13: `get_chat_info` `_error` sentinel (BREAKING tool surface)
+**Goal:** Disambiguate empty-success vs error on `get_chat_info`. New return shape: `{success: true, chat: {...}}` for chat-found, `{success: true, chat: null}` for chat-not-found (legitimate empty), `{success: false, error: "<human msg>", _error: "<machine code>"}` for transport/auth/server errors. Closes v2.1 deferred item 1 (sentinel `_error` key on `get_chat_info`).
+
+**Depends on:** v2.1 shipped (88/88 baseline)
+
+**In scope:**
+- `src/chatlytics_hermes/tools.py::chatlytics_get_chat_info` — update return shape
+- `src/chatlytics_hermes/adapter.py::get_chat_info` — three-way return (chat dict | None | raise)
+- Update existing v2.1 tests that asserted `{}` ambiguous shape → new explicit shape
+- New tests covering all three branches (found, empty, error)
+- Docstring + README "Tool reference" section updated
+
+**Out of scope:**
+- Other tools' error shape (only `get_chat_info` changes in this phase; broader rollout if needed is a v3.1 minor)
+- Caller migration (callers using the old `{}` shape break by design — that's the point)
+
+**Files (create/modify):**
+- MODIFY `src/chatlytics_hermes/tools.py`
+- MODIFY `src/chatlytics_hermes/adapter.py`
+- MODIFY `tests/test_adapter.py` (or wherever `get_chat_info` is tested — check existing v2.1 test files)
+- MODIFY `README.md` — Tool reference section
+- MODIFY `CHANGELOG.md` — under unreleased / 3.0.0 BREAKING entries
+
+**Acceptance criteria (all must pass autonomously):**
+1. `pytest tests/ -q` — 88/88 baseline + N new tests for the three branches; zero regressions outside the explicitly-updated `get_chat_info` tests
+2. `chatlytics_get_chat_info(chatId="<known>")` returns `{success: true, chat: {...}}`
+3. `chatlytics_get_chat_info(chatId="<unknown>")` returns `{success: true, chat: null}`
+4. `chatlytics_get_chat_info(chatId="<causes-500>")` returns `{success: false, error: "<msg>", _error: "<code>"}` (code drawn from a small set: `transport`, `auth`, `server`, `validation`)
+5. CHANGELOG 3.0.0 has BREAKING entry: `### Breaking — chatlytics_get_chat_info return shape`
+
+---
+
+### Phase 14: Strict JID regex on `chatId` schemas (BREAKING tool surface)
+**Goal:** Tighten `chatId` validation across all tool schemas to match the JS bundle's JID regex `/@(c\.us|g\.us|lid|newsletter)$/i`. Reject phone numbers, display names, and ambiguous strings at the schema layer — chat-resolution becomes the caller's responsibility (call `chatlytics_search` first). Closes v2.1 deferred item 2.
+
+**Depends on:** HERMES-13 (sequencing — schema tightening AFTER return-shape change so error path is uniform)
+
+**In scope:**
+- Replace v2.1's permissive `_chat_id_field` helper (rejects empty + control chars only) with strict JID-only validator
+- All 15 chatId-bearing schemas in `src/chatlytics_hermes/tools.py` get the strict validator
+- Rejected inputs return `{success: false, error: "Invalid chatId (expected JID format @c.us|@g.us|@lid|@newsletter)", _error: "validation"}` per the Phase 13 shape
+- Update v2.1's `tests/test_validation.py` — 21 schemas were tightened in v2.1; those tests need updating to assert the *new* strict accept-set
+- Optional: helpful error message points caller to `chatlytics_search` for resolution
+
+**Out of scope:**
+- Server-side JID validation (Chatlytics REST already does this — this phase is local schema enforcement for better UX)
+- Phone-number-to-JID auto-resolution (caller's job; we won't be magic)
+
+**Files (create/modify):**
+- MODIFY `src/chatlytics_hermes/tools.py` — `_chat_id_field` helper + 15 schema sites
+- MODIFY `tests/test_validation.py` — flip v2.1 permissive-accept assertions to v3.0 strict-reject assertions
+- MODIFY `README.md` — document strict JID requirement + caller responsibility
+- MODIFY `CHANGELOG.md` — BREAKING entry
+
+**Acceptance criteria:**
+1. `chatlytics_send(chatId="12025551234", text="hi")` → `{success: false, error: "Invalid chatId...", _error: "validation"}` (was: passed through to API in v2.1)
+2. `chatlytics_send(chatId="12025551234@c.us", text="hi")` → proceeds normally (JID format accepted)
+3. `chatlytics_send(chatId="Omer Nesher", text="hi")` → rejected with helpful error mentioning `chatlytics_search`
+4. All 4 JID families accepted: `@c.us`, `@g.us`, `@lid`, `@newsletter`
+5. pytest passes; v2.1 permissive-accept tests are now flipped to strict-reject assertions (NOT deleted — converted, with CHANGELOG cross-ref)
+
+---
+
+### Phase 15: Adapter `send_*` collapse (BREAKING library API)
+**Goal:** Merge `adapter.send_image(chatId, mediaUrl, ...)` and `adapter.send_image_file(chatId, filePath, ...)` into one `adapter.send_image(chatId, resource: str | Path, ...)` where `resource` is auto-detected as a URL or local path. Same collapse for `send_animation`, `send_video`, `send_file`. **Tool surface unchanged** — `chatlytics_send_image` and friends already unify both at the tool layer (see `tools.py:712-748`); this phase collapses the lower adapter layer. Closes v2.1 deferred item 3.
+
+**Depends on:** HERMES-14 (sequencing only — no functional dependency)
+
+**In scope:**
+- `src/chatlytics_hermes/adapter.py` — collapse paired methods; old method names removed (no deprecation alias — clean break)
+- `src/chatlytics_hermes/tools.py::_resolve_resource` simplifies (no longer needs to dispatch to two adapter methods)
+- Adapter-layer tests updated to call the new unified method
+- Resource detection: starts with `http://` or `https://` → URL; otherwise → local path (validated against `CHATLYTICS_UPLOAD_ALLOWED_ROOTS` per v2.1 Phase 8 — DO NOT REGRESS the allowlist check)
+
+**Out of scope:**
+- Tool surface changes (already unified in v2.0 at tool layer)
+- Deprecation aliases for old adapter methods (operator preference: clean break)
+- Adding new media types (only collapse existing image/animation/video/file)
+
+**Files (create/modify):**
+- MODIFY `src/chatlytics_hermes/adapter.py`
+- MODIFY `src/chatlytics_hermes/tools.py` (only `_resolve_resource` and call sites within tool handlers)
+- MODIFY `tests/test_adapter.py` (or wherever paired methods are tested)
+- MODIFY `CHANGELOG.md` — BREAKING entry under "Library API" sub-section
+
+**Acceptance criteria:**
+1. `adapter.send_image(chatId, "https://example.com/cat.jpg")` → uploads via URL path (no local file access)
+2. `adapter.send_image(chatId, "/allowed/root/cat.jpg")` → uploads via file path (allowlist enforced)
+3. `adapter.send_image(chatId, "/etc/passwd")` → rejected with same error as v2.1 HI-01 fix (allowlist preserved)
+4. `adapter.send_image_file` symbol is gone — `getattr(adapter, "send_image_file", None) is None` (NOT a deprecation alias)
+5. Same for `send_animation`, `send_video`, `send_file`
+6. pytest passes; all v2.1 HI-01 regression tests still pass (allowlist unchanged)
+
+---
+
+### Phase 16: `smoke.sh` wheel caching (additive)
+**Goal:** Cache the `hermes-agent` wheel between smoke runs to cut docker rebuild time. Non-breaking, opt-in via `--cached` flag (default behavior unchanged). Closes v2.1 deferred item 4. Closes PR-MED-03's remaining open portion (v2.1 only added `--retries 3`).
+
+**Depends on:** HERMES-15
+
+**In scope:**
+- `scripts/smoke.sh` — new `--cached` flag (default off for back-compat)
+- When `--cached` is on: `pip download hermes-agent==<pinned-version> -d .smoke-cache/` once, then `pip install --no-index --find-links=.smoke-cache/ hermes-agent` for subsequent runs
+- Cache miss (e.g., version pin changed) → fall back to network download + repopulate cache
+- `.smoke-cache/` added to `.gitignore`
+- README "Development" section documents `--cached`
+
+**Out of scope:**
+- Pre-built docker base image (heavier solution — defer to v3.1 if needed)
+- CI cache integration (no CI exists yet)
+- Caching plugin dependencies (only hermes-agent — the slow one)
+
+**Files (create/modify):**
+- MODIFY `scripts/smoke.sh`
+- MODIFY `.gitignore` — add `.smoke-cache/`
+- MODIFY `README.md` — Development section
+
+**Acceptance criteria:**
+1. `bash scripts/smoke.sh` (no args) — behaves exactly as v2.1 (`--retries 3`, no caching)
+2. `bash scripts/smoke.sh --cached` (first run) — downloads to `.smoke-cache/`, then installs from cache, runs tests
+3. `bash scripts/smoke.sh --cached` (second run) — installs from cache only (network calls down by ≥ 90%)
+4. `bash scripts/smoke.sh --cached --fast` — works (composes with v2.1's `--fast` flag)
+5. Cache miss (e.g., delete .smoke-cache/wheel, re-run) — falls back to network gracefully
+
+---
+
+### Phase 17: Hermes 0.14 API audit doc (docs-only)
+**Goal:** Inventory every `hermes.*` import in chatlytics-hermes + which 0.14 module/version introduced it + likely breaking surface for a future 0.15. Writes `.planning/HERMES-API-AUDIT.md`. No code changes. v2.1 deferred item 5 downgraded from "0.15 readiness" (hermes-agent 0.15 doesn't exist; Nous Research's project, not ours) to "0.14 API surface inventory."
+
+**Depends on:** HERMES-16 (sequencing only)
+
+**In scope:**
+- Grep all `from hermes` and `import hermes` in `src/` and `tests/`
+- For each symbol, document: module path, what it's used for, public-vs-private (does it start with `_`?), how stable (check `/tmp/hermes-ref-v0.14.0/RELEASE_v0.14.0.md` for change frequency)
+- Identify risk surface: which imports are most likely to break in a hypothetical 0.15 (e.g., underscore-prefixed internals, recently-added APIs)
+- Recommendation section: if 0.15 lands, here are the imports to check first
+
+**Out of scope:**
+- Actually upgrading anything (0.15 doesn't exist)
+- Writing a compat shim (premature without a real 0.15 to compat against)
+- Modifying any source file
+
+**Files (create/modify):**
+- CREATE `.planning/HERMES-API-AUDIT.md`
+
+**Acceptance criteria:**
+1. `.planning/HERMES-API-AUDIT.md` exists
+2. Lists ≥ all `from hermes` / `import hermes` lines in `src/chatlytics_hermes/`
+3. Each entry has: import path, used-where, public-vs-private flag, stability note
+4. Has a "Risk surface for future 0.15" recommendations section
+5. References `/tmp/hermes-ref-v0.14.0/RELEASE_v0.14.0.md` for change-frequency signals
+6. No `.py` files modified in the phase commits (audit is doc-only)
+
+---
+
+### Phase 18: Cosmetics sweep (nits)
+**Goal:** Close v2.1 audit's deferred LOW/INFO carry-forward: Phase 9 LOW-01 + INFO-02..04, Phase 10 LOW-02 + INFO-01..03. Log-level/style consistency in adapter+tools, docstring tightening, minor lint nits. No behavior change.
+
+**Depends on:** HERMES-17 (sequencing — cosmetics last before release)
+
+**In scope:**
+- Read `.planning/milestones/v2.1-phases/HERMES-09-observability-log-hygiene/09-REVIEW.md` and `HERMES-10-input-validation-ux-alignment/10-REVIEW.md` (or REVIEW-FIX) to extract the specific deferred LOW/INFO items
+- Apply each fix individually — atomic commits per nit
+- Run pytest after each fix to confirm zero behavior change
+
+**Out of scope:**
+- New features
+- Anything that changes test counts (only style/doc/comment changes)
+- Re-opening closed findings — only the explicitly-deferred ones
+
+**Files (create/modify):**
+- MODIFY various source files for style nits (the v2.1 REVIEW docs spell them out)
+
+**Acceptance criteria:**
+1. Every LOW/INFO item from v2.1 deferred audit list is addressed (or has a written "still deferred" justification in CHANGELOG)
+2. pytest 88/88 still passes (or 88+N if Phase 13/14/15 added tests; the regression bar is "no test count decreases")
+3. `git diff --stat` shows only style/doc/comment-line changes
+4. Final REVIEW pass clean or fix-pass closes any remaining nits
+
+---
+
+### Phase 19: Release chatlytics-hermes 3.0.0 (PyPI)
+**Goal:** First public PyPI publish of chatlytics-hermes. CHANGELOG 3.0.0 (BREAKING) entry, README rewrite for breaking changes, pyproject + plugin.yaml bumped to 3.0.0. TestPyPI dress rehearsal validates the artifact before real PyPI publish. Tag `v3.0.0`, push main + tag.
+
+**Depends on:** HERMES-13..18 (all v3.0 substantive work must land first)
+
+**In scope:**
+- CHANGELOG 3.0.0 entry, BREAKING-led: `get_chat_info` shape (Phase 13), JID regex (Phase 14), adapter collapse (Phase 15), plus additive items (16, 18) and docs (17). Migration notes for breaking changes.
+- README rewrite: "v3.0 Breaking Changes" section near the top, migration section, updated tool reference for Phase 13/14 changes
+- `pyproject.toml` — `version = "3.0.0"`, double-check `[project.urls]` are correct for public publish (Homepage, Repository, Documentation)
+- `plugin.yaml` — `version: 3.0.0`
+- Build: `python -m build` → produces sdist + wheel in `dist/`
+- `twine check dist/*` — validate metadata
+- **TestPyPI publish:** `twine upload --repository testpypi dist/*` (needs TestPyPI token; HALT if missing)
+- Install from TestPyPI in a scratch venv: `pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ chatlytics-hermes==3.0.0` (the second index is for transitive deps that don't exist on TestPyPI)
+- Run `pytest` against the installed wheel → must pass
+- **Real PyPI publish:** `twine upload dist/*` (needs real PyPI token; HALT if missing)
+- Verify on https://pypi.org/project/chatlytics-hermes/
+- Install from real PyPI in another scratch venv → run pytest → must pass
+- `git tag v3.0.0` (annotated) + `git push origin main && git push origin v3.0.0`
+- HALT conditions: TestPyPI/PyPI credentials missing; package name `chatlytics-hermes` already taken (highly unlikely but check at publish time); smoke install from TestPyPI fails; `twine check` finds metadata errors
+
+**Out of scope:**
+- npm publish (Phase 21)
+- JS bundle work (Phase 20)
+- Backporting to 2.x
+
+**Files (create/modify):**
+- MODIFY `CHANGELOG.md`
+- MODIFY `README.md`
+- MODIFY `pyproject.toml`
+- MODIFY `plugin.yaml`
+- CREATE `scripts/release.sh` (optional — codifies the build + TestPyPI + PyPI + tag flow for reproducibility)
+
+**Acceptance criteria:**
+1. `chatlytics-hermes==3.0.0` installs from `pip install chatlytics-hermes` (real PyPI) in a scratch venv
+2. After install, `from chatlytics_hermes import register; register.__name__ == "register"` works
+3. Full pytest suite passes against the installed wheel (88+N tests)
+4. Tag `v3.0.0` exists on GitHub: `git ls-remote --tags origin | grep v3.0.0`
+5. PyPI page at https://pypi.org/project/chatlytics-hermes/ shows version 3.0.0 with correct description + repository link
+6. `twine check dist/*` — clean (no metadata warnings)
+7. CHANGELOG 3.0.0 lists every breaking change with migration guidance
+
+---
+
+### Phase 20: JS bundle update for v3.0 coordination (cross-repo)
+**Goal:** Bring the sibling chatlytics-claude-code JS MCP bundle in sync with chatlytics-hermes 3.0.0. Bump `1.1.2` → `1.2.0` (MINOR — no JS API breaks). Reconcile drifted version/tool-count documentation. Tighten `looksLikeJid()` to match the Python plugin's stricter rule. Fix `chatlytics_send` to call `resolveChatId()` (currently bypasses it — drift bug). Rebuild esbuild bundle.
+
+**Depends on:** HERMES-19 (Python release published — JS bundle CHANGELOG can reference the published 3.0.0)
+
+**In scope (in `C:/Users/omern/.claude/plugins/marketplaces/chatlytics-claude-code/`):**
+- `servers/chatlytics-mcp.js` — tighten `looksLikeJid()` regex to match the Python regex from HERMES-14; add `resolveChatId` call to `chatlytics_send` handler (currently only `chatlytics_read` resolves)
+- `package.json` + `servers/package.json` — version bump `1.1.2` → `1.2.0`; **prepare for publish** by adding `files:` allowlist (do not flip `private` here — that's Phase 21)
+- `CHANGELOG.md` — 1.2.0 entry, mention sync with chatlytics-hermes 3.0.0
+- `README.md` — reconcile tool count (was "6 MCP tools" in 1.1.0; actually 8 since 1.1.x — was drifted)
+- Rebuild bundle: `npm --prefix servers run build` (or esbuild command per package.json scripts)
+- `servers/chatlytics-mcp.bundle.js` — regenerated artifact (committed as in v1.1.x pattern)
+- Run smoke test: `npm --prefix servers test`
+
+**Out of scope:**
+- npm publish (Phase 21)
+- Flipping `private: true` → `false` (Phase 21)
+- New tools / new dependencies
+
+**Files (create/modify) — all in `C:/Users/omern/.claude/plugins/marketplaces/chatlytics-claude-code/`:**
+- MODIFY `package.json`
+- MODIFY `servers/package.json`
+- MODIFY `servers/chatlytics-mcp.js`
+- MODIFY `servers/chatlytics-mcp.bundle.js` (rebuild output)
+- MODIFY `CHANGELOG.md`
+- MODIFY `README.md`
+
+**Acceptance criteria:**
+1. `node servers/chatlytics-mcp.bundle.js --version` (or equivalent) reports 1.2.0
+2. `looksLikeJid()` regex matches Python's strict rule
+3. `chatlytics_send` test exercises name-resolution path (search-based) for non-JID inputs
+4. `npm --prefix servers test` passes
+5. CHANGELOG 1.2.0 entry references chatlytics-hermes 3.0.0 release
+6. README tool count is accurate (8 tools)
+7. Commits land cleanly in the sibling repo (separate `git log` from chatlytics-hermes-split)
+
+---
+
+### Phase 21: Release chatlytics-claude-code 1.2.0 (npm)
+**Goal:** First public npm publish under operator's `@chatlytics` org. Flip `"private": true` → `false`, rename package to `@chatlytics/claude-code` (scoped), add `files:` allowlist, dress-rehearse via `npm publish --dry-run`, then real `npm publish --access=public`. Tag `v1.2.0` + push.
+
+**Depends on:** HERMES-20
+
+**In scope (in `C:/Users/omern/.claude/plugins/marketplaces/chatlytics-claude-code/`):**
+- `package.json` — `"name": "@chatlytics/claude-code"` (was `chatlytics-claude-code`), `"private": false` (was `true`), `"files": ["servers/", "skills/", "README.md", "CHANGELOG.md", "LICENSE"]` (or appropriate allowlist)
+- `servers/package.json` — same private flag flip if applicable; keep its `private: true` IF it's an internal sub-package not meant to publish separately (verify)
+- `.npmignore` — ensure `.planning/`, `node_modules/`, build artifacts (other than bundle.js) aren't published
+- `npm pack` — generates a tarball; inspect with `tar tzf <tarball>.tgz` to confirm only intended files
+- `npm publish --dry-run --access=public` — validates manifest, simulates publish (no auth needed)
+- `npm publish --access=public` — real publish (`~/.npmrc` token configured)
+- Verify on https://www.npmjs.com/package/@chatlytics/claude-code
+- `git tag v1.2.0` (annotated) + push tag + push main on sibling repo
+- HALT conditions: `@chatlytics` org doesn't accept publish (token scope insufficient); `@chatlytics/claude-code` name taken or reserved; `npm publish --dry-run` reports manifest errors; published tarball doesn't install cleanly in `npm install @chatlytics/claude-code` smoke test
+
+**Out of scope:**
+- Python repo work (already done in Phase 19)
+- GitHub Actions / CI setup (none exists; defer)
+- Backporting to 1.1.x
+
+**Files (create/modify) — all in `C:/Users/omern/.claude/plugins/marketplaces/chatlytics-claude-code/`:**
+- MODIFY `package.json`
+- MODIFY `servers/package.json` (review private flag)
+- CREATE `.npmignore` (if not present)
+- MODIFY `CHANGELOG.md` — note "First npm publish" in 1.2.0 entry
+
+**Acceptance criteria:**
+1. `@chatlytics/claude-code@1.2.0` installs from `npm install @chatlytics/claude-code` in a scratch directory
+2. Installed package contains `servers/chatlytics-mcp.bundle.js` and runs as an MCP stdio server (smoke: pipe an MCP initialize handshake, expect proper response)
+3. npm page at https://www.npmjs.com/package/@chatlytics/claude-code shows 1.2.0
+4. Tag `v1.2.0` on sibling repo (NOT chatlytics-hermes-split); pushed to origin
+5. `npm publish --dry-run` output (logged in VERIFICATION.md) shows the intended file list
+6. No accidental file leaks — `.planning/`, `node_modules/`, large test artifacts NOT in the published tarball
+7. After milestone close: cross-repo summary (this repo's milestone archive notes the JS bundle release as the cross-repo deliverable)
+
+---
+
+## Recommended /gsd-autonomous sequence (v3.0)
+
+```
+/gsd-autonomous --from 13 --to 21
+```
+
+Sequential single-repo work for HERMES-13..19. Cross-repo phases (20, 21) operate in `C:/Users/omern/.claude/plugins/marketplaces/chatlytics-claude-code/` via subagent `cd`. Halt only on credential gaps (TestPyPI / PyPI token missing at Phase 19; npm publish errors at Phase 21) or real publish failures.
+
+---
+
 <details>
 <summary>v2.0 — Hermes plugin v2.0 (upstream-contract rebuild) — SHIPPED 2026-05-17</summary>
 

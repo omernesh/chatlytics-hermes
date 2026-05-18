@@ -8,27 +8,21 @@ A first-class platform plugin for [Hermes Agent](https://github.com/NousResearch
 
 Hermes agents get production-grade WhatsApp messaging — text, media (image/voice/video/document/animation/image-file), reactions, groups, contacts, channels, polls, presence, profile management — via a single `pip install` and a config block. Inbound webhooks arrive as Hermes-native `MessageEvent` objects with proper `MessageType` discrimination; outbound goes through Chatlytics REST with auth, retry, and gate enforcement handled upstream.
 
-## Current State: v2.1 SHIPPED 2026-05-17 (local tag, operator push pending)
+## Current State: v3.0 — Breaking-change harmonization + first public release (planning)
 
-All 6 v2.1 phases (HERMES-07 through HERMES-12) shipped. 88/88 tests passing (45 v2.0 baseline + 43 v2.1 additions; zero regressions). The BL-01 BLOCKER and 2 HIGHs from the v2.0 milestone code review are fixed and locked under regression tests. `v2.1.0` annotated tag created LOCAL ONLY (operator push pending; operator lock preserved). Archive: `.planning/milestones/v2.1-ROADMAP.md`. Audit: `.planning/milestones/v2.1-MILESTONE-AUDIT.md` (verdict: passed).
+v2.1 shipped publicly 2026-05-18 (main + `v2.1.0` tag pushed to GitHub). Local `v2.0.0` tag deleted (was BL-01 pre-fix). 88/88 tests baseline carried into v3.0.
 
-**Operator next:** Review v2.1.0 artifact, then `git push origin main && git push origin v2.1.0` when ready. Optionally delete local `v2.0.0` tag (points at BL-01 pre-fix artifact superseded by v2.1.0).
+**v3.0 scope:** Close every deferred breaking-change item from the v2.1 Backlog, sweep v2.1 cosmetic carry-forward nits, and ship the **first public release** on PyPI (`chatlytics-hermes 3.0.0`) and npm (`@chatlytics/claude-code 1.2.0`). 9 phases (HERMES-13..21). **Operator lock LIFTED** — TestPyPI + npm dry-run dress rehearsals precede real publishes.
 
-## Next Milestone Goals: v2.2 (planning)
+**Cross-repo coordination:**
+- chatlytics-hermes (this repo, Python) — Phases 13-19: breaking changes + cosmetics + first PyPI publish
+- chatlytics-claude-code (sibling JS repo at `C:/Users/omern/.claude/plugins/marketplaces/chatlytics-claude-code/`) — Phases 20-21: version reconciliation, JID-regex sync, first npm publish under `@chatlytics` org
 
-Deferred from v2.1 close (none are blockers — v2.1.0 ships clean):
+**Launch:** `/gsd-autonomous --from 13 --to 21` (after configuring TestPyPI + real PyPI tokens in `~/.pypirc`; npm token already configured).
 
-- Sentinel `_error` key on `get_chat_info` return shape (would be breaking — v2.2 minor)
-- Strict JID regex enforcement on `chatId` schemas (would break phone numbers / display names)
-- Collapse `send_image` / `send_image_file` into one method (breaking change — v2.2 minor)
-- Long-term wheel caching in `scripts/smoke.sh` beyond `--retries 3` (build-perf nice-to-have)
-- Hermes `0.15` readiness review (deferred to v3.0 — not a v2.2 item)
+## Previous Milestone: v2.1 — Critical safety fixes + tech debt resolution + live-loader integration — SHIPPED 2026-05-18
 
-Start next milestone via `/gsd:new-milestone` to refine scope.
-
-## Previous Milestone: v2.1 — Critical safety fixes + tech debt resolution + live-loader integration — SHIPPED 2026-05-17
-
-All 6 phases delivered. BL-01 + HI-01 + HI-03 from v2.0 milestone review CLOSED. Every carry-forward MED/LOW from v2.0 audit + PR-style review CLOSED. Live-loader integration smoke locks BL-01 under regression test. 88/88 tests green. Archive: `.planning/milestones/v2.1-ROADMAP.md`.
+All 6 phases delivered (HERMES-07 through HERMES-12). 88/88 tests passing. BL-01 / HI-01 / HI-03 fixed and locked under regression tests. `v2.1.0` tag pushed publicly 2026-05-18. Archive: `.planning/milestones/v2.1-ROADMAP.md`. Audit: `.planning/milestones/v2.1-MILESTONE-AUDIT.md`.
 
 ## Previous Milestone: v2.0 — Hermes plugin v2.0 (upstream-contract rebuild) — SHIPPED 2026-05-17
 
@@ -57,9 +51,17 @@ Full upstream-contract rebuild against `hermes-agent>=0.14,<0.15`. 6 phases, 45/
 - [x] **HERMES-11** — Test infra cleanup; conftest teardown + idempotency guard + shared `FakePlatformConfig` + `smoke.sh --fast`
 - [x] **HERMES-12** — Release v2.1.0 (LOCAL tag only); CHANGELOG/README/pyproject/plugin.yaml bumped; operator lock preserved
 
-### Active (v2.2 — planning)
+### Active (v3.0 — planning)
 
-(See "Next Milestone Goals" above. Run `/gsd:new-milestone` to refine.)
+- [ ] **HERMES-13** — `get_chat_info` `_error` sentinel (BREAKING tool surface)
+- [ ] **HERMES-14** — Strict JID regex on `chatId` schemas (BREAKING tool surface)
+- [ ] **HERMES-15** — Adapter `send_*` collapse (BREAKING library API)
+- [ ] **HERMES-16** — `smoke.sh` wheel caching (additive)
+- [ ] **HERMES-17** — Hermes 0.14 API audit doc (docs-only)
+- [ ] **HERMES-18** — Cosmetics sweep (v2.1 LOW/INFO carry-forward)
+- [ ] **HERMES-19** — Release chatlytics-hermes 3.0.0 (first public PyPI publish; TestPyPI dress rehearsal first)
+- [ ] **HERMES-20** — JS bundle update for v3.0 coordination (cross-repo, sibling chatlytics-claude-code repo)
+- [ ] **HERMES-21** — Release chatlytics-claude-code 1.2.0 (first public npm publish under `@chatlytics` org)
 
 ### Shipped (v2.0) — 2026-05-17
 
@@ -70,13 +72,19 @@ Full upstream-contract rebuild against `hermes-agent>=0.14,<0.15`. 6 phases, 45/
 - [x] **HERMES-05** — Full Chatlytics tool surface (every action as a Hermes tool via `ctx.register_tool()`)
 - [x] **HERMES-06** — Release + smoke test (README/CHANGELOG, smoke install, tag `v2.0.0`, no PyPI publish)
 
-### Out of Scope (v2.1)
+### Out of Scope (v3.0)
 
-- PyPI publish — operator lock remains. Manifest stays publish-ready (1-command future op).
-- Breaking changes — v2.1 is strictly additive/fix-only. Any breaking change requires a v3.0 milestone.
+- Hermes pin bump — `>=0.14,<0.15` stays. hermes-agent 0.15 doesn't exist yet (Nous Research's project, not ours); HERMES-17 audits the 0.14 surface so a future upgrade is fast but does not actually upgrade.
+- New tools — v3.0 changes semantics of existing tools (HERMES-13/14) but keeps the count at 21. New tools require a v3.1 minor.
+- Backward-compat shims for the removed adapter methods (HERMES-15) — operator preference: clean break.
 - Live integration tests against a real Chatlytics gateway — autonomous ceiling preserved.
-- New tool surface — the 21 tools from v2.0 are the locked surface for v2.x. New tools require a v2.2 minor.
-- Hermes pin bump — `>=0.14,<0.15` stays. 0.15 readiness is a v3.0 decision.
+- Backporting to 2.x once 3.0 ships.
+
+### Out of Scope (v2.1, historical)
+
+- PyPI publish — operator lock remained (LIFTED for v3.0).
+- Breaking changes — v2.1 was strictly additive/fix-only. All breaking changes deferred to v3.0.
+- Live integration tests against a real Chatlytics gateway — autonomous ceiling preserved.
 
 ### Out of Scope (v2.0)
 
@@ -129,4 +137,4 @@ This document evolves at phase transitions and milestone boundaries.
 3. Update Context with current state
 
 ---
-*Last updated: 2026-05-17 -- v2.1 SHIPPED (local). All 6 HERMES-07..12 phases complete (88/88 tests, BL-01/HI-01/HI-03 fixed, v2.1.0 tagged local). Audit: `.planning/milestones/v2.1-MILESTONE-AUDIT.md`. Archive: `.planning/milestones/v2.1-ROADMAP.md`. Operator push of `main` + `v2.1.0` tag pending; PyPI publish deferred per lock; local v2.0.0 tag may be deleted after v2.1.0 push.*
+*Last updated: 2026-05-18 -- v3.0 milestone scaffolded. 9 phases (HERMES-13..21) covering BREAKING changes + cosmetics + first public PyPI publish (chatlytics-hermes 3.0.0) + cross-repo first public npm publish (@chatlytics/claude-code 1.2.0). Operator lock LIFTED. Launch: `/gsd-autonomous --from 13 --to 21`. v2.1.0 pushed publicly 2026-05-18; v2.0.0 tag deleted (was BL-01 pre-fix).*
