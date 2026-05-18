@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased]
+
+### Breaking
+
+- **`get_chat_info` return shape** (HERMES-13): `ChatlyticsAdapter.get_chat_info`
+  now returns `dict | None` (chat-found or legitimate-empty) and raises
+  `ChatlyticsLookupError(code, message)` on transport/auth/server/validation
+  errors. The v2.1 bare-`{}` return on errors is gone. Tool-layer callers
+  use the new `chatlytics_get_chat_info` wrapper which returns
+  `{success: bool, ...}` with error responses additionally including
+  `_error: "<machine_code>"`. Codes: `transport_error`, `auth_error`,
+  `server_error`, `validation_error`, `unknown_error`. **404 from the
+  gateway for an unknown chatId is `validation_error`** (NOT a legitimate
+  empty). Closes v2.1 deferred item 1.
+
 ## [2.1.0] -- 2026-05-17
 
 Tech-debt resolution + critical safety fixes carried over from the v2.0
