@@ -74,7 +74,7 @@ Full upstream-contract rebuild against `hermes-agent>=0.14,<0.15`. 6 phases, 45/
 
 ### Out of Scope (v3.0)
 
-- Hermes pin bump — `>=0.14,<0.15` stays. hermes-agent 0.15 doesn't exist yet (Nous Research's project, not ours); HERMES-17 audits the 0.14 surface so a future upgrade is fast but does not actually upgrade.
+- Hermes pin bump — `>=0.14,<0.15` stays. hermes-agent 0.15 doesn't exist yet (Nous Research's project, not ours); HERMES-17 audits the 0.14 surface so a future upgrade is fast but does not actually upgrade. See `.planning/HERMES-API-AUDIT.md` for the 0.14 inventory.
 - New tools — v3.0 changes semantics of existing tools (HERMES-13/14) but keeps the count at 21. New tools require a v3.1 minor.
 - Backward-compat shims for the removed adapter methods (HERMES-15) — operator preference: clean break.
 - Live integration tests against a real Chatlytics gateway — autonomous ceiling preserved.
