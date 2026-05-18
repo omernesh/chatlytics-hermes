@@ -752,98 +752,151 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             )
         return payload
 
-    # --- Media handlers (HERMES-04) ---------------------------------------
+    # --- Media handlers (HERMES-04 / HERMES-15) ---------------------------
+
+    def _enforce_upload_allowlist(self, candidate: Path) -> Path:
+        """Resolve + allowlist-check a local upload path. HI-01 fix preserved.
+
+        Returns the resolved ``Path`` on success. Raises
+        :class:`PermissionError` when the allowlist is empty
+        (default-deny) or the path is outside every configured root.
+
+        Used by :meth:`_resolve_media_url` from BOTH the explicit
+        ``Path`` object branch and the implicit ``str`` + ``exists()``
+        branch (HERMES-15). Pulled out so the security check has exactly
+        one canonical implementation site — drift here would silently
+        weaken HI-01.
+        """
+        try:
+            resolved = candidate.expanduser().resolve()
+        except (OSError, RuntimeError) as exc:
+            raise PermissionError(
+                f"Cannot resolve upload path {str(candidate)!r}: {exc}"
+            ) from exc
+        if not self.upload_allowed_roots:
+            raise PermissionError(
+                "Local file uploads are disabled: set "
+                "CHATLYTICS_UPLOAD_ALLOWED_ROOTS to an allowlist of "
+                "absolute paths (OS-pathsep separated) to enable "
+                "local-file uploads."
+            )
+        for root in self.upload_allowed_roots:
+            # Path.is_relative_to landed in 3.9; we pin >=3.10 in
+            # pyproject so this is safe. Equality also matches
+            # uploading the root itself when it's a regular file.
+            try:
+                if resolved == root or resolved.is_relative_to(root):
+                    return resolved
+            except AttributeError:
+                # Defensive fallback for 3.8 hosts if a downstream
+                # consumer ever loosens the >=3.10 pin in pyproject.
+                rs = str(resolved)
+                rr = str(root)
+                if rs == rr or rs.startswith(rr + os.sep):
+                    return resolved
+        raise PermissionError(
+            f"Refusing upload outside CHATLYTICS_UPLOAD_ALLOWED_ROOTS: "
+            f"{resolved}"
+        )
 
     async def _resolve_media_url(
         self,
-        resource: Union[str, bytes, bytearray],
+        resource: Union[str, Path, bytes, bytearray],
         *,
         upload_filename: Optional[str] = None,
         content_type: Optional[str] = None,
     ) -> str:
         """Resolve a media resource to a remotely-hosted URL.
 
-        Three input shapes are accepted:
+        HERMES-15 (v3.0 BREAKING — library API): unified resolver with
+        explicit ``Path`` support and an unambiguous failure mode.
 
-        - ``http(s)://...`` string -- returned as-is (URL path)
-        - ``bytes`` / ``bytearray`` -- uploaded to ``/api/v1/upload``,
-          the returned ``{url}`` is used as ``mediaUrl``
-        - any other string -- treated as a local file path; the file is
-          read in full and uploaded as above
+        Branches (evaluated IN ORDER — order matters for correctness):
 
-        Raises :class:`RuntimeError` when the upload endpoint does not
-        return a ``url`` field in its JSON body; callers wrap this into
-        a ``SendResult(success=False, error=...)``.
+        1. ``bytes`` / ``bytearray`` — uploaded to ``/api/v1/upload``;
+           returned ``{url}`` becomes the media URL. Preserved from
+           HERMES-04 — caller-supplied raw bytes is a legitimate path.
+        2. ``Path`` object — resolved + allowlist-checked + read +
+           uploaded. New in HERMES-15 for explicit ergonomics.
+        3. ``str`` starting with ``http://`` or ``https://`` — returned
+           as-is (URL passthrough, no upload).
+        4. ``str`` whose ``Path(s).expanduser().exists()`` is true —
+           treated as a local path; resolved + allowlist-checked + read
+           + uploaded.
+        5. Anything else (typically a malformed ``str`` that is neither
+           a URL nor an existing path) — raises :class:`ValueError`.
+
+        The blocking ``open()+read()`` for local files runs in a worker
+        thread via :func:`asyncio.to_thread` so concurrent media tool
+        invocations do not stall the event loop while a multi-MB file
+        is read off disk (fix for 04-MED-02 / surfaced by HERMES-05
+        tool layer in 05-MED-02). Both file branches share this wrap.
+
+        Raises:
+
+        - :class:`PermissionError` — path is outside
+          ``CHATLYTICS_UPLOAD_ALLOWED_ROOTS`` (HI-01 default-deny
+          preserved).
+        - :class:`ValueError` — input is not bytes / Path / URL /
+          existing string path. Caught by :meth:`_send_media_payload`
+          and surfaced as ``SendResult(success=False, error=...)``.
+        - :class:`RuntimeError` — upload endpoint did not return a
+          ``url`` field in its JSON body.
+
+        Callers wrap exceptions into
+        ``SendResult(success=False, error=...)`` via
+        :meth:`_send_media_payload`.
         """
         assert self._client is not None  # caller guards
 
+        # Branch 1: raw bytes — upload as-is.
         if isinstance(resource, (bytes, bytearray)):
             name = upload_filename or "upload.bin"
             ctype = content_type or _guess_content_type(name)
             upload_response = await self._client.upload_file(
                 filename=name, content=bytes(resource), content_type=ctype
             )
-        elif isinstance(resource, str) and resource.startswith(("http://", "https://")):
-            return resource
-        else:
-            # Local file path. The blocking ``open()+read()`` runs in a
-            # worker thread via ``asyncio.to_thread`` so concurrent media
-            # tool invocations do not stall the event loop while a
-            # multi-MB file is read off disk (fix for 04-MED-02 / surfaced
-            # by HERMES-05 tool layer in 05-MED-02).
-            path = str(resource)
 
-            # HI-01 fix (HERMES-08): reject paths outside the configured
-            # allowlist BEFORE opening the file. Default-deny — when the
-            # env var ``CHATLYTICS_UPLOAD_ALLOWED_ROOTS`` is unset, the
-            # allowlist is empty and EVERY local upload is refused. This
-            # closes the prompt-injection / LLM-manipulation path to
-            # ``open("/etc/passwd")``.
-            try:
-                resolved = Path(path).expanduser().resolve()
-            except (OSError, RuntimeError) as exc:
-                raise PermissionError(
-                    f"Cannot resolve upload path {path!r}: {exc}"
-                ) from exc
-            if not self.upload_allowed_roots:
-                raise PermissionError(
-                    "Local file uploads are disabled: set "
-                    "CHATLYTICS_UPLOAD_ALLOWED_ROOTS to an allowlist of "
-                    "absolute paths (OS-pathsep separated) to enable "
-                    "filePath uploads."
-                )
-            allowed = False
-            for root in self.upload_allowed_roots:
-                # Path.is_relative_to landed in 3.9; we pin >=3.10 in
-                # pyproject so this is safe. Equality also matches
-                # uploading the root itself when it's a regular file.
-                try:
-                    if resolved == root or resolved.is_relative_to(root):
-                        allowed = True
-                        break
-                except AttributeError:
-                    # Defensive fallback for 3.8 hosts if a downstream
-                    # consumer ever loosens the pin.
-                    rs = str(resolved)
-                    rr = str(root)
-                    if rs == rr or rs.startswith(rr + os.sep):
-                        allowed = True
-                        break
-            if not allowed:
-                raise PermissionError(
-                    f"Refusing upload outside CHATLYTICS_UPLOAD_ALLOWED_ROOTS: "
-                    f"{resolved}"
-                )
+        # Branch 2: explicit Path object — local file, allowlist-enforced.
+        elif isinstance(resource, Path):
+            resolved = self._enforce_upload_allowlist(resource)
 
-            def _read_file() -> tuple[bytes, str]:
+            def _read_file_path() -> tuple[bytes, str]:
                 with open(str(resolved), "rb") as fh:
                     return fh.read(), os.path.basename(str(resolved)) or "upload.bin"
 
-            content, basename = await asyncio.to_thread(_read_file)
+            content, basename = await asyncio.to_thread(_read_file_path)
             name = upload_filename or basename
             ctype = content_type or _guess_content_type(name)
             upload_response = await self._client.upload_file(
                 filename=name, content=content, content_type=ctype
+            )
+
+        # Branch 3: URL string — passthrough.
+        elif isinstance(resource, str) and resource.startswith(("http://", "https://")):
+            return resource
+
+        # Branch 4: string path that exists on disk — local file.
+        elif isinstance(resource, str) and Path(resource).expanduser().exists():
+            resolved = self._enforce_upload_allowlist(Path(resource))
+
+            def _read_file_str() -> tuple[bytes, str]:
+                with open(str(resolved), "rb") as fh:
+                    return fh.read(), os.path.basename(str(resolved)) or "upload.bin"
+
+            content, basename = await asyncio.to_thread(_read_file_str)
+            name = upload_filename or basename
+            ctype = content_type or _guess_content_type(name)
+            upload_response = await self._client.upload_file(
+                filename=name, content=content, content_type=ctype
+            )
+
+        # Branch 5: unresolvable input — clean ValueError.
+        else:
+            raise ValueError(
+                "resource must be a URL (http://, https://) or a local "
+                f"file path that exists; got {type(resource).__name__}="
+                f"{resource!r}"
             )
 
         if upload_response.status_code != 200:
@@ -930,6 +983,11 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             # OR the allowlist is empty (default-deny). Distinct from a
             # generic OSError so the tool layer / operator can tell why.
             return SendResult(success=False, error=f"Permission denied: {exc}")
+        except ValueError as exc:
+            # HERMES-15: resource was neither a URL, a Path, nor an
+            # existing string path. _resolve_media_url raised cleanly;
+            # surface as a regular SendResult failure for the caller.
+            return SendResult(success=False, error=f"Invalid resource: {exc}")
         except OSError as exc:
             return SendResult(success=False, error=f"File read error: {exc}")
         except RuntimeError as exc:
