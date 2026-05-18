@@ -654,12 +654,13 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         which uses :meth:`_send_typing_once` internally so it can detect
         degraded sends without forcing :meth:`send_typing` to raise.
         """
-        await self._send_typing_once(chat_id, duration)
+        await self._send_typing_once(chat_id, duration, metadata=metadata)
 
     async def _send_typing_once(
         self,
         chat_id: str,
         duration: float = 3.0,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """POST one typing request; return True on success, False on degraded.
 
@@ -669,6 +670,13 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         but :meth:`_keep_typing` still needs to know whether the FIRST
         fire failed so it can emit a WARNING (06-LOW-02 fix).  Returning
         a status bool lets both call sites share one request path.
+
+        ``metadata`` is accepted for signature parity with
+        :meth:`send_typing` (HERMES-18 LOW-01); the Chatlytics typing
+        endpoint does not currently consume it, so the kwarg is
+        silently dropped at the request layer. Forwarding it here
+        keeps the helper future-proof if upstream ever evolves a
+        metadata-aware typing endpoint.
 
         Not-connected branch (HERMES-18 INFO-04 doc clarification):
         when ``self._client is None`` (adapter never connected, or
