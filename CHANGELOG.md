@@ -28,6 +28,41 @@
   JS canonical bundle does not regex-validate messageIds; the Python
   plugin matches. Closes v2.1 deferred item 2.
 
+- **Library API: adapter `send_*` unified resource shape** (HERMES-15):
+  `ChatlyticsAdapter.send_image_file` is **removed**. The unified
+  `adapter.send_image(chat_id, resource: str | Path | bytes, ...)`
+  auto-detects which branch to use:
+  - `http://` / `https://` string -> `mediaUrl` passthrough (no upload)
+  - `Path` object -> local file upload (allowlist-enforced)
+  - `str` whose path exists -> local file upload (parity with `Path`)
+  - `bytes` / `bytearray` -> raw upload
+  - anything else -> `SendResult(success=False, error="Invalid resource: ...")`
+
+  The other media methods (`send_animation`, `send_voice`, `send_video`,
+  `send_document`) have their second positional parameter **renamed to
+  `resource`** and their type hint broadened to
+  `Union[str, Path, bytes, bytearray]`. **Tool surface unchanged** --
+  `chatlytics_send_image` and the other four media tools keep their
+  schemas and external behavior; the `_file` companion at the adapter
+  layer is the only break. The `CHATLYTICS_UPLOAD_ALLOWED_ROOTS`
+  default-deny allowlist (HI-01) is preserved on every file branch.
+
+  Direct access to `adapter.send_image_file` raises a clear
+  `AttributeError` pointing at `send_image` -- the base class's
+  text-fallback default is explicitly blocked via `__getattribute__`
+  to prevent silent degradation of v2.x photo sends to text bubbles.
+
+  **Migration:** replace `adapter.send_image_file(chat_id, path, ...)`
+  with `adapter.send_image(chat_id, Path(path), ...)` (or just
+  `adapter.send_image(chat_id, path, ...)` -- the auto-detector
+  handles existing string paths). Keyword-arg callers using
+  `image_url=...` / `audio_path=...` / `video_path=...` /
+  `animation_url=...` / `file_path=...` must switch to `resource=...`.
+  Direct callers of the removed `send_image_file` symbol see an
+  `AttributeError` on upgrade by design; this is a clean break with
+  no deprecation wrapper per the operator's lifted-lock preference.
+  Closes v2.1 deferred item 3.
+
 ## [2.1.0] -- 2026-05-17
 
 Tech-debt resolution + critical safety fixes carried over from the v2.0
