@@ -1075,7 +1075,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
     async def send_animation(
         self,
         chat_id: str,
-        animation_url: Union[str, bytes, bytearray],
+        resource: Union[str, Path, bytes, bytearray],
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
@@ -1089,15 +1089,18 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
         ``**kwargs`` is swallowed for forward-compat with upstream base
         signature evolution (HI-03 fix from HERMES-08).
+
+        HERMES-15: ``resource`` accepts URL str, Path, string path, or
+        bytes (auto-detected by :meth:`_resolve_media_url`).
         """
         return await self._send_media_payload(
-            chat_id, "animation", animation_url, caption=caption
+            chat_id, "animation", resource, caption=caption
         )
 
     async def send_voice(
         self,
         chat_id: str,
-        audio_path: Union[str, bytes, bytearray],
+        resource: Union[str, Path, bytes, bytearray],
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
@@ -1111,32 +1114,39 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         handler always emits voice; callers needing the media-player
         experience should use :meth:`send_document` with an
         appropriate filename.
+
+        HERMES-15: ``resource`` accepts URL str, Path, string path, or
+        bytes (auto-detected by :meth:`_resolve_media_url`).
         """
         # caption is accepted for signature parity; voice bubbles
         # technically support it but the gateway hides captions in some
         # clients.  Pass it through anyway so the gateway can decide.
         return await self._send_media_payload(
-            chat_id, "voice", audio_path, caption=caption
+            chat_id, "voice", resource, caption=caption
         )
 
     async def send_video(
         self,
         chat_id: str,
-        video_path: Union[str, bytes, bytearray],
+        resource: Union[str, Path, bytes, bytearray],
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> "SendResult":
-        """Send a video as inline playable media."""
+        """Send a video as inline playable media.
+
+        HERMES-15: ``resource`` accepts URL str, Path, string path, or
+        bytes (auto-detected by :meth:`_resolve_media_url`).
+        """
         return await self._send_media_payload(
-            chat_id, "video", video_path, caption=caption
+            chat_id, "video", resource, caption=caption
         )
 
     async def send_document(
         self,
         chat_id: str,
-        file_path: Union[str, bytes, bytearray],
+        resource: Union[str, Path, bytes, bytearray],
         caption: Optional[str] = None,
         file_name: Optional[str] = None,
         reply_to: Optional[str] = None,
@@ -1147,8 +1157,11 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
         ``file_name`` is the displayed attachment name in the recipient's
         chat -- it does NOT have to match the local path's basename.
-        When omitted and ``file_path`` is a local path or bytes, we fall
+        When omitted and ``resource`` is a local path or bytes, we fall
         back to the basename / a generic ``upload.bin``.
+
+        HERMES-15: ``resource`` accepts URL str, Path, string path, or
+        bytes (auto-detected by :meth:`_resolve_media_url`).
         """
         # base signature uses ``file_name``; we ALSO accept ``filename``
         # via kwargs because every other handler in this module uses the
@@ -1158,7 +1171,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         return await self._send_media_payload(
             chat_id,
             "document",
-            file_path,
+            resource,
             caption=caption,
             filename=file_name,
         )
