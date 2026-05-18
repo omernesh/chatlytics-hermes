@@ -202,6 +202,19 @@ container -- it installs hermes-agent + this plugin in a clean Python
 environment, asserts the `chatlytics` entry point is discoverable, then runs
 the full test suite. Use this to validate a release before tagging.
 
+For faster local iteration, pass `--cached` to cache the `hermes-agent`
+wheel between runs at `.smoke-cache/`:
+
+```bash
+bash scripts/smoke.sh --cached
+```
+
+The first cached run downloads the wheel; subsequent runs install from
+the local cache (no network). The cache invalidates automatically when
+the pinned `hermes-agent` tag changes. If the cached install fails
+(corrupted wheel, missing dep), the script falls back to a normal
+network install and refreshes the cache.
+
 ## Architecture notes
 
 A few intentional design decisions, surfaced here so they don't surprise
