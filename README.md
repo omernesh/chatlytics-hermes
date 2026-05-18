@@ -10,11 +10,65 @@ through the `hermes_agent.plugins` entry-point group.
 
 ## Status
 
-**v2.1.0 BETA.** Requires `hermes-agent>=0.14,<0.15`.
+**Stable v3.0.0 release.** Requires `hermes-agent>=0.14,<0.15`.
 
 `hermes-agent` v0.14 is not yet on PyPI; install it from the GitHub tag
 `v2026.5.16` (see [Install](#install) below). When v0.14 ships to PyPI the
 install line simplifies to a plain `pip install hermes-agent>=0.14`.
+
+## Migration from 2.x
+
+v3.0 is the first public PyPI release and carries three breaking changes
+that close every deferred breaking-change item from the v2.1 backlog.
+**Tool-surface count unchanged at 21 tools.**
+
+If you call the MCP tool surface only:
+
+- **`chatlytics_get_chat_info`** -- callers checking
+  `result.get("success") is False` to detect "chat not found" must
+  now check `result.get("chat") is None` (success path). Error
+  detection: `result.get("success") is False and result.get("_error")`
+  surfaces the machine-readable code (`transport_error`, `auth_error`,
+  `server_error`, `validation_error`, `unknown_error`).
+- **`chatId` validation** -- bare phone numbers and display names are
+  now rejected at the schema layer. Resolve to a JID via
+  `chatlytics_search` first, then pass the
+  `@c.us`/`@g.us`/`@lid`/`@newsletter` JID to chatId-bearing tools.
+  Regex: `/@(c\.us|g\.us|lid|newsletter)$/i`.
+
+If you call the Python adapter directly (library users):
+
+- **`adapter.send_image_file` / `send_animation_file` /
+  `send_video_file` / `send_file_file`** -- removed. Use
+  `adapter.send_image(chat_id, resource=...)` etc. The `resource`
+  argument auto-detects URL vs local-path. `Path` objects, existing
+  path strings, `bytes`, and `bytearray` are all accepted. The
+  `CHATLYTICS_UPLOAD_ALLOWED_ROOTS` default-deny allowlist from v2.1
+  is preserved on every file branch.
+
+See [CHANGELOG.md](CHANGELOG.md) `## [3.0.0]` for the full breaking
+list, additive items (smoke wheel caching, API audit doc), and
+migration notes.
+
+## What's new in v3.0
+
+**Breaking-change harmonization.** Three deferred breaking changes
+from the v2.1 backlog ship in 3.0: `chatlytics_get_chat_info` return
+shape disambiguates empty-vs-error with a machine-readable `_error`
+sentinel code, `chatId` schemas tighten to JID-only (matches the
+sibling JS bundle's regex), and the adapter's six `send_*_file`
+methods collapse into unified `send_*(resource=...)` with
+URL-vs-path auto-detection. **Tool surface unchanged at 21 tools.**
+
+**Additive.** `scripts/smoke.sh --cached` caches the `hermes-agent`
+wheel between smoke runs for faster local iteration.
+`.planning/HERMES-API-AUDIT.md` inventories every `hermes.*` import
+in the plugin so a future hermes 0.15 upgrade is fast.
+
+**Quality.** Cosmetics sweep across `adapter.py` and `tools.py`
+closes six explicitly-deferred LOW/INFO nits from the v2.1 audit
+(docstring tightening, signature parity, module-level constants).
+Zero behavior change. Test count: 120/120, preserved exactly.
 
 ## What's new in v2.1
 
@@ -45,15 +99,23 @@ See [CHANGELOG.md](CHANGELOG.md) for the full Security / Added / Changed
 ## Install
 
 ```bash
+pip install "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@v2026.5.16"
+pip install chatlytics-hermes
+```
+
+`pip install chatlytics-hermes` pulls the latest 3.x from PyPI and
+registers the `chatlytics` plugin under the `hermes_agent.plugins`
+entry-point group, so Hermes discovers it automatically on next
+gateway start.
+
+For a development install from source:
+
+```bash
 git clone https://github.com/omernesh/chatlytics-hermes.git
 cd chatlytics-hermes
 pip install "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@v2026.5.16"
-pip install -e .
+pip install -e ".[dev]"
 ```
-
-The `pip install -e .` step registers the `chatlytics` plugin under the
-`hermes_agent.plugins` entry-point group, so Hermes discovers it
-automatically on next gateway start.
 
 ## Configuration
 
@@ -261,14 +323,6 @@ contributors:
   filename downstream. Tracking upstream; if you rely on filename
   control, prefer the local-path mode and the
   `CHATLYTICS_UPLOAD_ALLOWED_ROOTS` allowlist.
-- **`get_chat_info` returns `{}` on error.** When the underlying
-  `GET /api/v1/chat?chatId=...` returns a non-2xx response or the
-  payload cannot be parsed, the tool returns an empty dict rather than
-  raising. Callers should treat `{}` as "info unavailable" (typically
-  unknown chat or transient gateway issue), distinct from a populated
-  dict with empty fields (which means the gateway returned info but
-  some keys were null upstream).
-
 ## License
 
 MIT. See [LICENSE](LICENSE).
