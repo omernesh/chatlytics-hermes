@@ -1176,13 +1176,37 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             filename=file_name,
         )
 
-    # HERMES-15 (v3.0 BREAKING): ``send_image_file`` was DELETED.
-    # The unified :meth:`send_image` now accepts ``str | Path | bytes``
-    # and auto-detects which branch to use via
-    # :meth:`_resolve_media_url`. No deprecation alias — clean break
-    # per operator preference. Direct callers of the removed symbol
-    # see ``AttributeError`` on upgrade by design; documented in the
-    # v3.0 CHANGELOG.
+    # HERMES-15 (v3.0 BREAKING): ``send_image_file`` was DELETED from
+    # the Chatlytics adapter. The unified :meth:`send_image` now
+    # accepts ``str | Path | bytes`` and auto-detects which branch to
+    # use via :meth:`_resolve_media_url`. No deprecation alias — clean
+    # break per operator preference.
+    #
+    # The base class ``BasePlatformAdapter.send_image_file`` provides
+    # a generic text-fallback default. To honor the "clean break"
+    # intent (no silent degradation to a text bubble), we explicitly
+    # block inherited access via ``__getattribute__`` below so v2.x
+    # callers see a clear ``AttributeError`` on upgrade with migration
+    # guidance, instead of an unexpected text-message side effect.
+    # The plain ``del`` / ``__delattr__`` approach won't work on an
+    # inherited method, hence the ``__getattribute__`` shim.
+
+    def __getattribute__(self, name: str) -> Any:
+        # HERMES-15: hard-block the v2.x ``send_image_file`` method
+        # which was removed from this adapter. The base class still
+        # defines a text-fallback default; that fallback would silently
+        # degrade a v2.x caller's photo send to a text message. Raise
+        # explicitly so the caller sees the migration path.
+        if name == "send_image_file":
+            raise AttributeError(
+                "ChatlyticsAdapter.send_image_file was removed in v3.0 "
+                "(HERMES-15). Use adapter.send_image(chat_id, resource: "
+                "str | Path | bytes) — the unified method auto-detects "
+                "URL vs local-file vs raw-bytes inputs. See the v3.0 "
+                "CHANGELOG entry 'BREAKING — adapter send_* unified "
+                "resource shape' for migration guidance."
+            )
+        return super().__getattribute__(name)
 
     # --- UX polish (HERMES-04 + HERMES-08 BL-01 fix) -----------------------
 

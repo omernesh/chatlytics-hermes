@@ -180,14 +180,20 @@ async def test_send_animation(
     await adapter.disconnect()
 
 
-# --- AC-6: send_image_file uploads local bytes ------------------------
+# --- AC-6: send_image with a Path object uploads local bytes -----------
 
-async def test_send_image_file_uploads_local_bytes(
+async def test_send_image_local_path_uploads_bytes(
     adapter: ChatlyticsAdapter,
     mock_router: respx.MockRouter,
     tmp_path: Path,
 ) -> None:
-    """Local-path variant reads bytes, uploads, then references returned URL."""
+    """HERMES-15: send_image(Path) reads bytes, uploads, references URL.
+
+    Renamed from ``test_send_image_file_uploads_local_bytes`` when the
+    v2.0 ``send_image_file`` companion was deleted. The unified
+    ``send_image`` method now accepts a ``Path`` object and routes
+    through the auto-detection branch in ``_resolve_media_url``.
+    """
     img_path = tmp_path / "x.png"
     fake_png = b"\x89PNG\r\n\x1a\n" + b"some-bytes-x123"
     img_path.write_bytes(fake_png)
@@ -205,7 +211,8 @@ async def test_send_image_file_uploads_local_bytes(
     )
 
     await adapter.connect()
-    result = await adapter.send_image_file(CHAT_ID, str(img_path), caption="local")
+    # HERMES-15: was adapter.send_image_file(CHAT_ID, str(img_path), ...).
+    result = await adapter.send_image(CHAT_ID, Path(img_path), caption="local")
     assert result.success is True
     assert result.message_id == "m-imgfile"
 
@@ -226,7 +233,7 @@ async def test_send_image_file_uploads_local_bytes(
 
 # --- 04-MED-02 regression: file read off the event loop ---------------
 
-async def test_send_image_file_reads_off_event_loop(
+async def test_send_image_local_path_reads_off_event_loop(
     adapter: ChatlyticsAdapter,
     mock_router: respx.MockRouter,
     tmp_path: Path,
@@ -239,6 +246,12 @@ async def test_send_image_file_reads_off_event_loop(
     ``open()`` + ``fh.read()`` directly on the event loop thread, which
     blocks all other coroutines for the duration of the read on
     multi-MB files. HERMES-06 wraps the read in ``asyncio.to_thread``.
+
+    HERMES-15: renamed from ``test_send_image_file_reads_off_event_loop``
+    when the v2.0 ``send_image_file`` companion was deleted; the call
+    now goes through ``adapter.send_image(Path(...))`` (Branch 2 of
+    ``_resolve_media_url``) and still exercises the same
+    ``asyncio.to_thread`` wrap.
 
     We assert the wrap is in effect by capturing the thread on which
     ``open()`` runs: it must NOT be the main thread (the loop thread).
@@ -275,7 +288,8 @@ async def test_send_image_file_reads_off_event_loop(
     monkeypatch.setattr(builtins, "open", spy_open)
 
     await adapter.connect()
-    result = await adapter.send_image_file(CHAT_ID, str(img_path), caption="thr")
+    # HERMES-15: was adapter.send_image_file(CHAT_ID, str(img_path), ...).
+    result = await adapter.send_image(CHAT_ID, Path(img_path), caption="thr")
     assert result.success is True
 
     assert threads_seen, "open() was never called against the test file"
@@ -285,6 +299,146 @@ async def test_send_image_file_reads_off_event_loop(
             f"({thr!r}); _resolve_media_url must use asyncio.to_thread"
         )
     await adapter.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# HERMES-15: send_image resource auto-detection (BREAKING library API)
+# ---------------------------------------------------------------------------
+#
+# v3.0 BREAKING — see CHANGELOG entry "BREAKING — adapter send_* unified
+# resource shape". The v2.0 send_image / send_image_file split collapsed
+# into a single send_image(resource) that auto-detects URL vs Path vs
+# string-path-exists vs raw bytes. Anything else raises ValueError and
+# surfaces as SendResult(success=False, error=...).
+
+
+class TestResourceAutoDetection:
+    """Adapter.send_image auto-detection branches (HERMES-15)."""
+
+    async def test_url_string_passes_through_without_upload(
+        self,
+        adapter: ChatlyticsAdapter,
+        mock_router: respx.MockRouter,
+    ) -> None:
+        """Branch 3: http(s):// string -> mediaUrl passthrough, NO upload call."""
+        mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+        upload_route = mock_router.post("/api/v1/upload").mock(
+            return_value=httpx.Response(200, json={"url": "should-not-be-used"})
+        )
+        media_route = mock_router.post("/api/v1/send-media").mock(
+            return_value=httpx.Response(200, json={"success": True, "messageId": "m-url"})
+        )
+
+        await adapter.connect()
+        result = await adapter.send_image(
+            CHAT_ID, "https://cdn.test/cat.jpg", caption="url branch"
+        )
+        assert result.success is True
+        assert not upload_route.called, (
+            "URL passthrough must not trigger an upload"
+        )
+
+        body = _json.loads(media_route.calls.last.request.content)
+        assert body["mediaUrl"] == "https://cdn.test/cat.jpg"
+        await adapter.disconnect()
+
+    async def test_path_object_uploads_via_multipart(
+        self,
+        adapter: ChatlyticsAdapter,
+        mock_router: respx.MockRouter,
+        tmp_path: Path,
+    ) -> None:
+        """Branch 2: explicit Path object -> multipart upload + URL reference."""
+        img_path = tmp_path / "p.png"
+        img_path.write_bytes(b"path-object-bytes")
+
+        mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+        upload_route = mock_router.post("/api/v1/upload").mock(
+            return_value=httpx.Response(200, json={"url": "https://cdn.test/p.png"})
+        )
+        mock_router.post("/api/v1/send-media").mock(
+            return_value=httpx.Response(200, json={"success": True, "messageId": "m-path"})
+        )
+
+        await adapter.connect()
+        result = await adapter.send_image(CHAT_ID, Path(img_path))
+        assert result.success is True
+        assert upload_route.called, "Path branch must upload via multipart"
+        assert b"path-object-bytes" in upload_route.calls.last.request.content
+        await adapter.disconnect()
+
+    async def test_string_path_that_exists_uploads_via_multipart(
+        self,
+        adapter: ChatlyticsAdapter,
+        mock_router: respx.MockRouter,
+        tmp_path: Path,
+    ) -> None:
+        """Branch 4: ``str`` whose path exists -> multipart upload (parity with Path)."""
+        img_path = tmp_path / "s.png"
+        img_path.write_bytes(b"string-path-bytes")
+
+        mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+        upload_route = mock_router.post("/api/v1/upload").mock(
+            return_value=httpx.Response(200, json={"url": "https://cdn.test/s.png"})
+        )
+        mock_router.post("/api/v1/send-media").mock(
+            return_value=httpx.Response(200, json={"success": True, "messageId": "m-str"})
+        )
+
+        await adapter.connect()
+        result = await adapter.send_image(CHAT_ID, str(img_path))
+        assert result.success is True
+        assert upload_route.called, (
+            "String-path-that-exists branch must upload via multipart"
+        )
+        assert b"string-path-bytes" in upload_route.calls.last.request.content
+        await adapter.disconnect()
+
+    async def test_unresolvable_string_returns_invalid_resource_error(
+        self,
+        adapter: ChatlyticsAdapter,
+        mock_router: respx.MockRouter,
+    ) -> None:
+        """Branch 5: str that's neither URL nor existing path -> SendResult(False, ...).
+
+        ``_resolve_media_url`` raises ``ValueError`` and
+        ``_send_media_payload`` catches it and surfaces a clean
+        failure dict to the caller instead of an uncaught raise.
+        """
+        mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+        # No upload route mocked — should never be called.
+
+        await adapter.connect()
+        result = await adapter.send_image(CHAT_ID, "not-a-url-not-a-path-zzz")
+        assert result.success is False
+        assert "Invalid resource" in (result.error or "")
+        await adapter.disconnect()
+
+    def test_send_image_file_symbol_is_gone(
+        self, adapter: ChatlyticsAdapter
+    ) -> None:
+        """HERMES-15 acceptance criterion 4: send_image_file must NOT exist.
+
+        Two-part check honoring the "clean break, no deprecation alias"
+        intent — the base class ``BasePlatformAdapter`` defines a
+        text-fallback default for ``send_image_file``, which would
+        silently degrade a v2.x photo-send caller into a text bubble.
+        The adapter explicitly blocks inherited access in
+        ``__getattribute__`` to surface a clear migration error:
+
+        1. Our class does NOT define ``send_image_file`` in its own
+           ``__dict__`` — the v2.0 override is gone.
+        2. Instance attribute access raises ``AttributeError`` with
+           migration guidance — direct callers of
+           ``adapter.send_image_file(...)`` see a clear error pointing
+           at ``send_image`` instead of silently degrading.
+        """
+        assert "send_image_file" not in ChatlyticsAdapter.__dict__, (
+            "send_image_file must be fully removed from the class "
+            "(no shim, no alias) — found in ChatlyticsAdapter.__dict__"
+        )
+        with pytest.raises(AttributeError, match="send_image_file was removed"):
+            adapter.send_image_file  # noqa: B018 — access triggers AttributeError
 
 
 # --- AC-7: _keep_typing heartbeats every interval --------------------
