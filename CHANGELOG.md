@@ -1,6 +1,17 @@
 # Changelog
 
-## [Unreleased]
+## [3.0.0] - 2026-05-18 (BREAKING)
+
+First public PyPI release of `chatlytics-hermes`. Closes every deferred
+breaking-change item from the v2.1 backlog. Two breaking changes affect
+the tool surface (`chatlytics_get_chat_info` return shape, strict JID
+regex on `chatId` schemas); one breaking change affects the library API
+only (adapter `send_*_file` methods collapsed into unified `send_*`).
+Tool-surface count unchanged at 21 tools. v2.1 → 3.0 callers using only
+the MCP tool surface need only the two tool-shape migrations; library
+callers using `adapter.send_*_file` must additionally migrate to the
+unified `send_*(resource=...)` form. See `### Breaking` subsections
+below for migration guidance.
 
 ### Breaking
 
@@ -62,6 +73,57 @@
   `AttributeError` on upgrade by design; this is a clean break with
   no deprecation wrapper per the operator's lifted-lock preference.
   Closes v2.1 deferred item 3.
+
+### Added
+
+- **`scripts/smoke.sh --cached` flag** (HERMES-16): caches the
+  `hermes-agent` wheel between smoke runs via `pip download` to
+  `.smoke-cache/` + `pip install --no-index --find-links=.smoke-cache/`.
+  Falls back to network if cache miss or corruption. Non-breaking,
+  opt-in via the new `--cached` flag (default behavior unchanged).
+  Cache invalidates automatically when the pinned `hermes-agent` tag
+  changes. Closes v2.1 deferred item 4.
+- **`.planning/HERMES-API-AUDIT.md`** (HERMES-17): inventory of every
+  `hermes.*` import in `chatlytics-hermes` and the 0.14 module/version
+  it came from, plus the likely breaking surface for a future 0.15.
+  Pure documentation; no code changes. Closes v2.1 deferred item 5
+  (downgraded scope -- hermes 0.15 doesn't exist yet).
+
+### Internal
+
+- **Cosmetics sweep** (HERMES-18): closed six explicitly-deferred
+  LOW/INFO nits from the v2.1 audit -- `_send_typing_once` docstring
+  + `metadata` kwarg signature parity, `_RESERVED_BODY_KEYS` module
+  constant lift-out, deliberate-redundancy comments above
+  `minLength: 1` in `chatId`/`messageId` schemas, audit-doc whitespace
+  + wording cleanup. **Zero behavior change** -- the 21-tool surface,
+  the response shapes, and the request-layer semantics are identical
+  to v2.1.x. Test count exactly preserved at 120/120.
+
+### Migration from 2.x
+
+If you call the MCP tool surface only:
+
+1. **`chatlytics_get_chat_info`** -- callers checking
+   `result.get("success") is False` to detect "chat not found" must
+   now check `result.get("chat") is None` (success path). Error
+   detection: `result.get("success") is False and result.get("_error")`
+   surfaces the machine-readable code (`transport_error`, `auth_error`,
+   `server_error`, `validation_error`, `unknown_error`).
+2. **`chatId` validation** -- bare phone numbers and display names
+   are now rejected at the schema layer. Resolve to a JID via
+   `chatlytics_search` first, then pass the `@c.us`/`@g.us`/`@lid`/
+   `@newsletter` JID to chatId-bearing tools.
+
+If you call the Python adapter directly (library users):
+
+3. **`adapter.send_image_file` / `send_animation_file` /
+   `send_video_file` / `send_file_file`** -- removed. Use
+   `adapter.send_image(chat_id, resource=...)` etc. The `resource`
+   argument auto-detects URL vs local-path. `Path` objects,
+   existing path strings, `bytes`, and `bytearray` are all accepted.
+   The `CHATLYTICS_UPLOAD_ALLOWED_ROOTS` default-deny allowlist
+   from v2.1 is preserved.
 
 ## [2.1.0] -- 2026-05-17
 
