@@ -15,8 +15,11 @@ Future phases:
 - HERMES-03 -- embedded aiohttp inbound webhook server inside
   ``connect`` / ``disconnect`` (inbound transport migration)
 - HERMES-04 -- media handlers (``send_image``, ``send_voice``,
-  ``send_video``, ``send_document``, ``send_animation``,
-  ``send_image_file``) and ``_keep_typing`` heartbeat
+  ``send_video``, ``send_document``, ``send_animation``) and
+  ``_keep_typing`` heartbeat. HERMES-15 (v3.0 BREAKING) collapsed
+  the v2.0 ``send_image`` / ``send_image_file`` split into one
+  unified ``send_image(chat_id, resource: str | Path | bytes, ...)``;
+  ``send_image_file`` is gone.
 - HERMES-05 -- full Chatlytics tool surface via ``ctx.register_tool``
 
 The upstream import block is wrapped in ``try/except ImportError`` so
@@ -1029,7 +1032,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
     async def send_image(
         self,
         chat_id: str,
-        image_url: Union[str, bytes, bytearray],
+        resource: Union[str, Path, bytes, bytearray],
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
@@ -1037,30 +1040,36 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
     ) -> "SendResult":
         """Send an image as a native WhatsApp photo attachment.
 
-        Accepts either an ``http(s)://...`` URL (used as ``mediaUrl``
-        directly) or raw ``bytes`` (uploaded to ``/api/v1/upload``
-        first).  ``caption`` is optional.  ``reply_to`` / ``metadata``
-        are accepted for base-class signature parity but currently
-        ignored -- Chatlytics's send-media endpoint does not expose
-        per-message reply context (HERMES-05 may revisit).
+        HERMES-15 (v3.0 BREAKING — library API): unified resource shape.
+        The v2.0/v2.1 ``send_image_file`` companion is GONE. Callers
+        pass ``resource`` in any of four forms; the adapter auto-detects
+        which branch applies in :meth:`_resolve_media_url`:
+
+        - ``http(s)://...`` ``str`` — used as ``mediaUrl`` directly.
+        - ``Path`` object — local file, uploaded via multipart.
+        - ``str`` whose ``Path(s).exists()`` is true — local file (the
+          adapter resolves + uploads the same as the ``Path`` branch).
+        - ``bytes`` / ``bytearray`` — uploaded as raw bytes (preserved
+          from HERMES-04).
+        - Anything else — :class:`ValueError`, surfaced by
+          :meth:`_send_media_payload` as
+          ``SendResult(success=False, ...)``.
+
+        ``caption`` is optional. ``reply_to`` / ``metadata`` are
+        accepted for base-class signature parity but currently ignored
+        — the Chatlytics send-media endpoint does not expose
+        per-message reply context.
 
         ``**kwargs`` is swallowed for forward-compat with upstream base
         signature evolution (HI-03 fix from HERMES-08): future Hermes
         versions may add new kwargs (``priority``, ``force_native``,
         etc.) that this override should not trip on.
 
-        HERMES-10 (PR-review LOW-06) -- API-shape cross-reference:
-        companion method :meth:`send_image_file` exists for backwards
-        compat with the v1.x API surface that exposed a path-only
-        variant; v2.0 preserved both. Both methods accept
-        ``Union[str, bytes, bytearray]`` internally and route through
-        the same :meth:`_send_media_payload` so behavior is identical
-        given equivalent inputs. New code should prefer
-        :meth:`send_image` (URL-or-bytes-or-path Union shape) and
-        treat :meth:`send_image_file` as a legacy alias.
+        See CHANGELOG entry "BREAKING — adapter send_* unified resource
+        shape" for migration guidance from v2.x callers.
         """
         return await self._send_media_payload(
-            chat_id, "image", image_url, caption=caption
+            chat_id, "image", resource, caption=caption
         )
 
     async def send_animation(
@@ -1154,39 +1163,13 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             filename=file_name,
         )
 
-    async def send_image_file(
-        self,
-        chat_id: str,
-        image_path: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        **kwargs: Any,
-    ) -> "SendResult":
-        """Send a local image file as a native WhatsApp photo.
-
-        Reads ``image_path`` from disk, uploads the bytes via
-        ``/api/v1/upload``, then sends the returned URL via
-        ``/api/v1/send-media`` with ``mediaType=image``.
-
-        HERMES-10 (PR-review LOW-06) -- API-shape cross-reference:
-        companion to :meth:`send_image`. v2.0 retained both methods
-        for v1.x API-shape backwards-compat; new code may prefer
-        :meth:`send_image` since it accepts the same
-        ``Union[str, bytes, bytearray]`` shape. Both methods share
-        the same :meth:`_send_media_payload` body, so they return
-        identical ``SendResult`` shapes given equivalent inputs.
-        """
-        # Even if the caller hands us a URL by mistake, treat it as a
-        # path-or-bytes case -- send_image is the URL-first handler.
-        filename = os.path.basename(str(image_path)) or "upload.png"
-        return await self._send_media_payload(
-            chat_id,
-            "image_file",
-            image_path,
-            caption=caption,
-            filename=filename,
-        )
+    # HERMES-15 (v3.0 BREAKING): ``send_image_file`` was DELETED.
+    # The unified :meth:`send_image` now accepts ``str | Path | bytes``
+    # and auto-detects which branch to use via
+    # :meth:`_resolve_media_url`. No deprecation alias — clean break
+    # per operator preference. Direct callers of the removed symbol
+    # see ``AttributeError`` on upgrade by design; documented in the
+    # v3.0 CHANGELOG.
 
     # --- UX polish (HERMES-04 + HERMES-08 BL-01 fix) -----------------------
 
