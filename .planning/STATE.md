@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: — Breaking-change harmonization + first public release
-status: planning
-stopped_at: HERMES-18 done — 120/120 tests preserved, 2 source files + 1 audit doc changed, 0 BLOCKER/HIGH/MED/LOW findings (1 INFO non-blocking). 6 deferred LOW/INFO items closed, 4 explicitly skipped with v2.1-reviewer justification. Awaiting Phase 19 (release 3.0.0 to PyPI).
-last_updated: "2026-05-18T08:30:00.000Z"
-last_activity: 2026-05-18 — Phase 18 (HERMES-18) cosmetics sweep shipped. 120/120 tests preserved (zero behavior change). 6 deferred LOW/INFO nits closed from v2.1 Phase 9/10 + v3.0 Phase 17 carry-forward. Phases 13-18 complete.
+status: in_progress
+stopped_at: HERMES-19 PART B done — chatlytics-hermes 3.0.0 LIVE on PyPI (https://pypi.org/project/chatlytics-hermes/3.0.0/). Post-publish install verified in scratch venv against real PyPI artifact (23/23 smoke pytest). Tag v3.0.0 created + pushed. main pushed (a872fe4..971bc1f). Awaiting Phase 20 (cross-repo JS bundle update).
+last_updated: "2026-05-18T11:15:00.000Z"
+last_activity: 2026-05-18 — Phase 19 PART B shipped. v3.0.0 published to PyPI (first public release ever). twine upload OK; PyPI install verification OK; smoke pytest 23/23 against PyPI artifact; v3.0.0 annotated tag pushed; main pushed. Phases 13-19 complete.
 progress:
   total_phases: 9
-  completed_phases: 6
-  total_plans: 6
-  completed_plans: 6
-  percent: 66
+  completed_phases: 7
+  total_plans: 7
+  completed_plans: 7
+  percent: 77
 ---
 
 # Project State
@@ -26,10 +26,10 @@ See: `.planning/PROJECT.md`
 
 ## Current Position
 
-Phase: HERMES-13 (not started)
+Phase: HERMES-20 (not started)
 Plan: —
-Status: planning
-Last activity: 2026-05-18 — v3.0 milestone scaffolded; 9 phases derived from v2.1 deferred backlog + cosmetics + cross-repo publish coordination.
+Status: in_progress
+Last activity: 2026-05-18 — Phase 19 PART B shipped. chatlytics-hermes 3.0.0 LIVE on PyPI. Tag v3.0.0 + main pushed to origin.
 
 ## v3.0 Phase Plan (9 phases, HERMES-13 → HERMES-21)
 
@@ -41,7 +41,7 @@ Last activity: 2026-05-18 — v3.0 milestone scaffolded; 9 phases derived from v
 | HERMES-16 — `smoke.sh` wheel caching | chatlytics-hermes | additive | **DONE** (120/120 tests; 0B/0H/0M/2L/2I) | HERMES-15 | v2.1-deferred-4 | Cache the hermes-agent wheel between smoke runs via `pip download` to `.smoke-cache/` + `pip install --no-index --find-links=.smoke-cache/`. Falls back to network if cache miss. Non-breaking, opt-in via `--cached` flag (default: existing behavior). |
 | HERMES-17 — Hermes 0.14 API audit doc | chatlytics-hermes | docs-only | Ready | HERMES-16 | v2.1-deferred-5 (downgraded) | hermes-agent 0.15 doesn't exist yet (Nous Research project, not ours). Audit becomes inventory: every `hermes.*` import + which 0.14 module/version it came from + likely breaking surface for a future 0.15. Writes `.planning/HERMES-API-AUDIT.md`. **No code changes** — pure documentation. |
 | HERMES-18 — Cosmetics sweep | chatlytics-hermes | nits | **DONE** (120/120 tests; 0B/0H/0M/0L/1I) | HERMES-17 | v2.1 Phase 9 LOW-01 + INFO-02..04, Phase 10 LOW-02 + INFO-01..03 | Close v2.1 audit's deferred LOW/INFO nits: log-level/style consistency in adapter+tools, docstring tightening, minor lint nits. No behavior change. Optional skip if reviewer pushes back. |
-| HERMES-19 — Release chatlytics-hermes 3.0.0 (PyPI) | chatlytics-hermes | **release** | Ready | HERMES-13..18 | first public PyPI publish | CHANGELOG 3.0.0 (BREAKING), README rewrite, pyproject + plugin.yaml bumped to 3.0.0. Build sdist + wheel. **Local wheel-install dress rehearsal** (`twine check` + scratch venv pip install + pytest against installed wheel) → **real PyPI publish** → post-publish install verification. Tag `v3.0.0` + push tag + push main. **HALT conditions:** `twine check` errors; local dress-rehearsal pytest fails; package name already taken on PyPI (`pip index versions chatlytics-hermes` pre-check); `twine upload` auth failure. |
+| HERMES-19 — Release chatlytics-hermes 3.0.0 (PyPI) | chatlytics-hermes | **release** | **DONE** (v3.0.0 LIVE on PyPI; tag pushed; main pushed) | HERMES-13..18 | first public PyPI publish | CHANGELOG 3.0.0 (BREAKING), README rewrite, pyproject + plugin.yaml bumped to 3.0.0. Build sdist + wheel. **Local wheel-install dress rehearsal** (`twine check` + scratch venv pip install + pytest against installed wheel) → **real PyPI publish** → post-publish install verification. Tag `v3.0.0` + push tag + push main. **HALT conditions:** `twine check` errors; local dress-rehearsal pytest fails; package name already taken on PyPI (`pip index versions chatlytics-hermes` pre-check); `twine upload` auth failure. |
 | HERMES-20 — JS bundle update for v3.0 coordination | chatlytics-claude-code | cross-repo | Ready | HERMES-19 | bundle version reconciliation | **Cross-repo**: subagent `cd`s into `C:/Users/omern/.claude/plugins/marketplaces/chatlytics-claude-code/`. Bump version `1.1.2` → `1.2.0` (MINOR, not major — no JS API breaks). Reconcile tool count in README/CHANGELOG (was 6 in 1.1.0, actually 8 now). Tighten `looksLikeJid()` regex to match Python's stricter rule from HERMES-14. Fix `chatlytics_send` to call `resolveChatId()` (was bypassing it — drift). Rebuild esbuild bundle. |
 | HERMES-21 — Release chatlytics-claude-code 1.2.0 (npm) | chatlytics-claude-code | **release** | Ready | HERMES-20 | first public npm publish | **Cross-repo**: flip `"private": true` → `false` on both `package.json` files. Add `files:` allowlist (servers/, README.md, CHANGELOG.md, LICENSE, skills/ if applicable). Rename package to `@chatlytics/claude-code` (operator's `@chatlytics` npm org). `npm pack` → `npm publish --dry-run` (no auth needed) → `npm publish --access=public` (auth via `~/.npmrc`). Tag `v1.2.0` + push. **HALT conditions:** `@chatlytics` org doesn't accept publish (token scope insufficient); `@chatlytics/claude-code` name taken; npm validation rejects manifest. |
 
