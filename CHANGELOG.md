@@ -1,5 +1,31 @@
 # Changelog
 
+## [3.0.1] - 2026-05-18
+
+Cosmetic release — no functional changes, no test changes, no API surface
+changes. `pip install chatlytics-hermes==3.0.0` and `==3.0.1` are
+behaviourally identical. The bump exists solely so the marketing-flair
+description and README tagline land on the PyPI registry page (PyPI bakes
+the description into the published artifact and refuses re-uploads of the
+same version).
+
+### Changed
+
+- **Package description** (`pyproject.toml`) sharpened to
+  "Production-grade WhatsApp for Hermes Agent — full upstream contract,
+  21 tools, every media type, via the Chatlytics gateway"
+- **README opening** rewritten with a bold superlative tagline, shields.io
+  badges (PyPI version, Python compat, license), capability sweep, and
+  "Why chatlytics-hermes?" section with bold-led bullets. Inspired by the
+  positioning style of the deprecated `waha-openclaw-channel` npm package.
+
+### Preserved (all from 3.0.0)
+
+- 120/120 tests passing (unchanged)
+- 21 Hermes tools (unchanged)
+- `BasePlatformAdapter` contract coverage (unchanged)
+- All Phase 13-18 breaking changes from 3.0.0 (unchanged)
+
 ## [3.0.0] - 2026-05-18 (BREAKING)
 
 First public PyPI release of `chatlytics-hermes`. Closes every deferred
