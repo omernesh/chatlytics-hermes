@@ -151,6 +151,12 @@ async def test_tool_returns_success_false_on_400(
     mock_router.post("/api/v1/send").mock(
         return_value=httpx.Response(400, json={"error": "invalid chatId"})
     )
+    # v3.0 schema tightening (HERMES-14): in production, "not-a-jid"
+    # would be rejected at the Hermes framework's schema-validation
+    # layer BEFORE reaching this handler. This test calls the handler
+    # directly to exercise its 4xx error-shape contract, simulating a
+    # gateway-side rejection (which can still happen even with valid
+    # JIDs -- e.g. unknown chat).
     result = await chatlytics_send(client, chatId="not-a-jid", text="hi")
     assert result["success"] is False
     assert result["error"] == "invalid chatId"

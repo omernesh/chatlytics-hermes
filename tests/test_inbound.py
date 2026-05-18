@@ -33,7 +33,12 @@ from tests._fixtures import FakePlatformConfig
 
 BASE_URL = "https://gateway.test.chatlytics.ai"
 API_KEY = "test-api-key-abc123"
-CHAT_ID = "chat-001"
+# v3.0 schema tightening (HERMES-14) -- was "chat-001" synthetic ID in
+# v2.1; now uses a proper JID. Inbound webhook payloads bypass the
+# tool-layer schema (they hit the aiohttp inbound handler, not a tool
+# handler), so the swap is mechanical -- but it keeps test data
+# aligned with the v3.0 strict JID accept-set.
+CHAT_ID = "120363100000000000@g.us"
 WEBHOOK_SECRET = "shhh-very-secret"
 
 

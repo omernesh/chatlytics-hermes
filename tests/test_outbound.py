@@ -21,7 +21,12 @@ from tests._fixtures import FakePlatformConfig
 
 BASE_URL = "https://gateway.test.chatlytics.ai"
 API_KEY = "test-api-key-abc123"
-CHAT_ID = "chat-001"
+# v3.0 schema tightening (HERMES-14) -- was "chat-001" synthetic ID in
+# v2.1; now uses a proper JID for documentation/discipline. Adapter
+# tests bypass tool schema validation so this swap is mechanical, but
+# the canonical JID format keeps test inputs aligned with the v3.0
+# accept-set enforced at the tool-schema layer.
+CHAT_ID = "120363100000000000@g.us"
 
 # Bearer header assertion helper -- AC-8 says "every request carries
 # Authorization: Bearer {api_key}".  Asserted in every test.
