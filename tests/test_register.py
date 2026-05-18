@@ -113,7 +113,7 @@ def test_plugin_yaml_is_valid() -> None:
 
     assert manifest["name"] == "chatlytics"
     assert manifest["kind"] == "platform"
-    assert manifest["version"] == "2.1.0"
+    assert manifest["version"] == "3.0.0"
 
     required = {entry["name"] for entry in manifest["requires_env"]}
     assert required == {"CHATLYTICS_BASE_URL", "CHATLYTICS_API_KEY"}
@@ -145,7 +145,7 @@ def test_pyproject_declares_hermes_entry_point() -> None:
     assert entry_points["chatlytics"] == "chatlytics_hermes:register"
 
     project = data["project"]
-    assert project["version"] == "2.1.0"
+    assert project["version"] == "3.0.0"
     assert project["name"] == "chatlytics-hermes"
 
     deps = project["dependencies"]

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chatlytics-hermes"
-version = "2.1.0"
+version = "3.0.0"
 description = "Chatlytics WhatsApp platform plugin for Hermes Agent (v0.14+)"
 license = {text = "MIT"}
 readme = "README.md"

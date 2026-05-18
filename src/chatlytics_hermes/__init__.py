@@ -37,4 +37,6 @@ un-xfails the markers.
 """
 from .adapter import register
 
-__all__ = ["register"]
+__version__ = "3.0.0"
+
+__all__ = ["register", "__version__"]
