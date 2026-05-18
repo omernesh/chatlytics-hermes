@@ -239,6 +239,39 @@ class ChatlyticsConnectError(RuntimeError):
     """Raised when the adapter cannot complete its health check on connect."""
 
 
+class ChatlyticsLookupError(RuntimeError):
+    """Raised by :meth:`ChatlyticsAdapter.get_chat_info` on lookup failures.
+
+    Carries a machine-readable ``code`` so the tool-layer wrapper
+    (:func:`chatlytics_hermes.tools.chatlytics_get_chat_info`) can
+    translate the exception into the v3.0 canonical failure dict
+    (``{"success": False, "error": str, "_error": code}``) without
+    re-classifying the underlying cause.
+
+    Codes (lowercase snake_case):
+
+    - ``transport_error``  — :class:`httpx.RequestError`
+      (network / timeout / DNS / connection-refused).
+    - ``auth_error``       — HTTP 401 / 403.
+    - ``server_error``     — HTTP 5xx.
+    - ``validation_error`` — HTTP 4xx other than 401/403. **404 from
+      the gateway for an unknown chatId is `validation_error`** (the
+      JID was malformed or unknown — NOT a "chat-not-found legitimate
+      empty"; the empty branch is reserved for HTTP 200 + falsy body).
+    - ``unknown_error``    — non-JSON body on 2xx, unexpected raise,
+      or adapter-not-connected.
+
+    Introduced in HERMES-13 (v3.0 BREAKING). The v2.1 bare-``{}``
+    return on lookup errors is gone. See the v3.0 CHANGELOG entry
+    "BREAKING — get_chat_info return shape" for migration guidance.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
     """Async Chatlytics adapter implementing the ``BasePlatformAdapter`` contract.
 
@@ -619,38 +652,46 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
         return True
 
-    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
-        """GET /api/v1/chat?chatId={id} and return the JSON body as a dict.
+    async def get_chat_info(self, chat_id: str) -> Optional[Dict[str, Any]]:
+        """GET /api/v1/chat?chatId={id} with v3.0 three-way return contract.
 
-        HERMES-10 (02-LOW-03): empty-vs-error semantics.
+        HERMES-13 (v3.0 BREAKING — see CHANGELOG entry
+        "BREAKING — get_chat_info return shape"): replaces the v2.1
+        ambiguous bare-``{}`` return with explicit semantics.
 
-        Returns ``{}`` in four distinct paths -- callers cannot
-        distinguish from the return value alone; consult logs for the
-        cause:
+        Returns:
 
-        1. Adapter not connected (``self._client is None``) -- no
-           log; this indicates a programmer error (called before
-           ``connect()``).
-        2. Transport error (``httpx.RequestError``) -- WARNING log
-           ``"get_chat_info transport error: ..."``.
-        3. Non-200 response from the gateway -- WARNING log
-           ``"get_chat_info returned <status> for chat <id>"``.
-        4. Malformed JSON body or non-dict payload -- DEBUG log
-           ``"get_chat_info JSON decode failed; returning {}"``.
+        - ``dict`` — chat-found. Gateway responded 200 with a JSON
+          object payload. Returned as-is; the adapter does NOT
+          validate the schema beyond ``isinstance(payload, dict)``.
+        - ``None`` — chat-not-found legitimate empty. Gateway
+          responded 200 with a falsy / non-dict body (``None``,
+          ``{}``, ``[]``). Currently unreachable for known gateway
+          versions but the code path is defined for forward-compat.
 
-        When the gateway returns 200 with a valid JSON object, the
-        dict is returned as-is and is expected to contain ``name``,
-        ``phone``, ``isGroup``, ... per the Chatlytics gateway
-        contract. The adapter does NOT validate the schema beyond
-        ``isinstance(payload, dict)``.
+        Raises:
 
-        Future v2.2+ may introduce a richer return shape
-        (``{"success": bool, "chat": dict | None, "error": str |
-        None}``) to distinguish these paths without log inspection;
-        that is a breaking change and is out of scope for v2.1.
+        - :class:`ChatlyticsLookupError` — on transport / auth /
+          server / validation errors. ``exc.code`` is one of:
+
+          - ``transport_error``  (``httpx.RequestError``)
+          - ``auth_error``       (HTTP 401 / 403)
+          - ``server_error``     (HTTP 5xx)
+          - ``validation_error`` (HTTP 4xx other than 401/403, incl.
+            **404 — unknown JID, NOT a legitimate empty**)
+          - ``unknown_error``    (non-JSON body on 2xx, non-dict
+            2xx payload, or adapter not connected)
+
+        The 404-disambiguation rule is the trickiest case: a 404
+        from the gateway means the JID was malformed or unknown —
+        ``validation_error``, not legitimate empty. The empty branch
+        (``None``) is reserved for HTTP 200 with a falsy body.
         """
         if self._client is None:
-            return {}
+            raise ChatlyticsLookupError(
+                "unknown_error",
+                "Adapter not connected: call connect() before get_chat_info()",
+            )
 
         try:
             response = await self._client.get(
@@ -659,26 +700,57 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             )
         except httpx.RequestError as exc:
             logger.warning("get_chat_info transport error: %s", exc)
-            return {}
+            raise ChatlyticsLookupError(
+                "transport_error", f"Transport error: {exc}"
+            ) from exc
 
-        if response.status_code != 200:
+        status = response.status_code
+        if status in (401, 403):
             logger.warning(
-                "get_chat_info returned %s for chat %s",
-                response.status_code,
+                "get_chat_info auth error %s for chat %s", status, chat_id
+            )
+            raise ChatlyticsLookupError(
+                "auth_error", f"Authentication error: HTTP {status}"
+            )
+        if 500 <= status < 600:
+            logger.warning(
+                "get_chat_info server error %s for chat %s", status, chat_id
+            )
+            raise ChatlyticsLookupError(
+                "server_error", f"Server error: HTTP {status}"
+            )
+        if 400 <= status < 500:
+            # 404 from gateway for an unknown chatId is validation_error per
+            # the v3.0 contract (NOT a legitimate empty).
+            logger.warning(
+                "get_chat_info validation error %s for chat %s",
+                status,
                 chat_id,
             )
-            return {}
-
+            raise ChatlyticsLookupError(
+                "validation_error", f"Validation error: HTTP {status}"
+            )
+        # 2xx path.
         try:
             payload = response.json()
-        except Exception:  # noqa: BLE001
-            # HERMES-09 (closes 02-LOW-01): distinguish "malformed body"
-            # from "empty success" in the operator log -- the bare {}
-            # return is otherwise ambiguous to callers debugging.
-            logger.debug("get_chat_info JSON decode failed; returning {}")
-            return {}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "get_chat_info JSON decode failed on 2xx response: %s", exc
+            )
+            raise ChatlyticsLookupError(
+                "unknown_error", f"Malformed JSON in 2xx response: {exc}"
+            ) from exc
 
-        return payload if isinstance(payload, dict) else {}
+        if not payload:
+            # Legitimate empty: gateway 200 with falsy body (None, {}, []).
+            return None
+        if not isinstance(payload, dict):
+            # 2xx with non-dict body — treat as malformed.
+            raise ChatlyticsLookupError(
+                "unknown_error",
+                f"Expected dict payload, got {type(payload).__name__}",
+            )
+        return payload
 
     # --- Media handlers (HERMES-04) ---------------------------------------
 
