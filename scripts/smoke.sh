@@ -34,6 +34,14 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# The hermes-agent git tag this smoke run pins against. Extracted to
+# a variable (rather than embedded inline in the pip install line) so
+# HERMES-16's --cached mode can sha256 it for cache invalidation.
+# Bumping this tag here automatically invalidates an existing
+# .smoke-cache/ on the next --cached run.
+HERMES_AGENT_PIN_TAG="v2026.5.16"
+HERMES_AGENT_PIN_SPEC="hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@${HERMES_AGENT_PIN_TAG}"
+
 # --- Argument parsing ---------------------------------------------------------
 
 FAST=0
@@ -84,14 +92,14 @@ fi
 MSYS_NO_PATHCONV=1 docker run --rm \
   -v "${REPO_DIR}:/work" \
   -w /work \
+  -e HERMES_AGENT_PIN_SPEC="${HERMES_AGENT_PIN_SPEC}" \
   python:3.13-slim sh -c '
     set -euo pipefail
 
     apt-get update -qq >/dev/null 2>&1
     apt-get install -y -qq --no-install-recommends git ca-certificates >/dev/null 2>&1
 
-    pip install --quiet --no-cache-dir --retries 3 \
-        "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@v2026.5.16"
+    pip install --quiet --no-cache-dir --retries 3 "${HERMES_AGENT_PIN_SPEC}"
     pip install --quiet --no-cache-dir --retries 3 -e ".[dev]"
 
     echo "--- smoke step 1/3: import chatlytics_hermes.register ---"
