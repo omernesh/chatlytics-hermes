@@ -669,6 +669,17 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         but :meth:`_keep_typing` still needs to know whether the FIRST
         fire failed so it can emit a WARNING (06-LOW-02 fix).  Returning
         a status bool lets both call sites share one request path.
+
+        Not-connected branch (HERMES-18 INFO-04 doc clarification):
+        when ``self._client is None`` (adapter never connected, or
+        already disconnected), the helper returns ``False`` without
+        attempting a request and without logging. The False is
+        deliberately indistinguishable from a "gateway returned non-200"
+        degraded result so callers like :meth:`_keep_typing` can apply
+        one uniform "degraded first-fire" code path. Production callers
+        always invoke this after ``connect()`` populates ``_client``;
+        the branch exists to keep defensive callers (and pre-connect
+        unit tests) safe rather than crash on attribute access.
         """
         if self._client is None:
             return False
