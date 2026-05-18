@@ -1,9 +1,13 @@
 """HERMES-04 acceptance tests for the chatlytics-hermes media surface.
 
-Seven ``respx``-mocked tests cover the 6 media handlers (``send_image``,
-``send_voice``, ``send_video``, ``send_document``, ``send_animation``,
-``send_image_file``) plus the ``_keep_typing`` 30s heartbeat
-asynccontextmanager.
+Seven ``respx``-mocked tests cover the 5 media handlers (``send_image``,
+``send_voice``, ``send_video``, ``send_document``, ``send_animation``)
+plus the ``_keep_typing`` 30s heartbeat asynccontextmanager.
+
+HERMES-15 (v3.0 BREAKING): the v2.0 ``send_image_file`` companion was
+removed. The ``TestResourceAutoDetection`` class at the bottom covers
+the unified ``send_image(resource: str | Path | bytes)`` auto-detection
+contract.
 
 The 8th acceptance test (``_standalone_send`` cron hook) lives in
 ``tests/test_cron.py`` because it does not require an adapter instance.

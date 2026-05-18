@@ -15,7 +15,9 @@ Total: 19 tests. All other Phase 10 deliverables are docstring-only
 SUPERSEDED in v3.0 HERMES-13, the adapter now returns ``dict | None``
 and raises ``ChatlyticsLookupError`` with an ``_error`` machine code;
 see the v3.0 CHANGELOG entry "BREAKING — get_chat_info return shape";
-``send_image`` / ``send_image_file`` cross-reference; tool-layer
+``send_image`` / ``send_image_file`` cross-reference (SUPERSEDED in
+v3.0 HERMES-15 — ``send_image_file`` was removed; ``send_image`` now
+accepts ``str | Path | bytes`` and auto-detects); tool-layer
 ``chatlytics_send_image`` docstring) and verified by code review.
 """
 
