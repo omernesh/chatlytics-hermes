@@ -147,7 +147,14 @@ async def test_send_typing_calls_typing_endpoint(
     await adapter.disconnect()
 
 
-# --- AC-6: get_chat_info returns dict ---------------------------------
+# --- AC-6: get_chat_info returns dict (HERMES-13 contract preserved) ---
+#
+# v3.0 HERMES-13 (BREAKING — see CHANGELOG entry "BREAKING —
+# get_chat_info return shape"): the chat-found branch still returns
+# a dict, but the error / empty branches changed (chat-not-found is
+# now None; errors raise ChatlyticsLookupError). This test exercises
+# only the success branch; the new branches are covered in the
+# test_get_chat_info_* / test_tool_wrapper_* tests below.
 
 async def test_get_chat_info_returns_dict(
     adapter: ChatlyticsAdapter, mock_router: respx.MockRouter
@@ -226,4 +233,229 @@ async def test_all_requests_carry_bearer_auth(
     # Sanity: connect + send + send_typing + get_chat_info = 4 requests.
     assert request_count == 4
 
+    await adapter.disconnect()
+
+
+# --- HERMES-13: get_chat_info three-way contract -----------------------
+#
+# v3.0 BREAKING — see CHANGELOG entry "BREAKING — get_chat_info return
+# shape". The adapter now returns ``dict | None`` and raises
+# ``ChatlyticsLookupError`` on error paths with a machine-readable
+# ``.code``. The tool-layer wrapper translates this into
+# ``{"success": bool, ...}`` with error responses additionally
+# including ``_error: "<code>"``.
+#
+# Branches covered:
+#   1. 200 + dict payload                       -> dict (AC-6 above)
+#   2. 200 + falsy/empty payload                -> None (legitimate empty)
+#   3. httpx.RequestError                       -> code='transport_error'
+#   4. 401                                      -> code='auth_error'
+#   5. 403                                      -> code='auth_error'
+#   6. 500                                      -> code='server_error'
+#   7. 404                                      -> code='validation_error'
+#      (404 from gateway is malformed/unknown JID, NOT empty)
+#   8. wrapper: chat found                      -> {success: True, chat: {...}}
+#   9. wrapper: legitimate empty                -> {success: True, chat: None}
+#  10. wrapper: 5xx                             -> {success: False, _error: 'server_error'}
+#  11. wrapper: 404                             -> {success: False, _error: 'validation_error'}
+
+
+async def test_get_chat_info_returns_none_on_legitimate_empty(
+    adapter: ChatlyticsAdapter, mock_router: respx.MockRouter
+) -> None:
+    """200 + falsy payload (None, {}, []) -> adapter returns None (chat-not-found)."""
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    # NB: ``httpx.Response(200, json=None)`` sends an EMPTY body (httpx
+    # treats ``json=None`` as "no JSON kwarg"), which would surface as
+    # ``unknown_error`` via the malformed-JSON path. Use ``content=b"null"``
+    # with an explicit JSON content-type to deliver a literal JSON ``null``
+    # — the legitimate-empty contract is "2xx + falsy JSON body".
+    mock_router.get("/api/v1/chat").mock(
+        return_value=httpx.Response(
+            200, content=b"null", headers={"content-type": "application/json"}
+        )
+    )
+    await adapter.connect()
+    result = await adapter.get_chat_info(CHAT_ID)
+    assert result is None
+    await adapter.disconnect()
+
+
+async def test_get_chat_info_raises_transport_error(
+    adapter: ChatlyticsAdapter, mock_router: respx.MockRouter
+) -> None:
+    """httpx.RequestError on the chat call -> ChatlyticsLookupError('transport_error')."""
+    from chatlytics_hermes.adapter import ChatlyticsLookupError
+
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    mock_router.get("/api/v1/chat").mock(
+        side_effect=httpx.ConnectError("connection refused")
+    )
+    await adapter.connect()
+    with pytest.raises(ChatlyticsLookupError) as excinfo:
+        await adapter.get_chat_info(CHAT_ID)
+    assert excinfo.value.code == "transport_error"
+    await adapter.disconnect()
+
+
+async def test_get_chat_info_raises_auth_error_on_401(
+    adapter: ChatlyticsAdapter, mock_router: respx.MockRouter
+) -> None:
+    from chatlytics_hermes.adapter import ChatlyticsLookupError
+
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    mock_router.get("/api/v1/chat").mock(
+        return_value=httpx.Response(401, json={"error": "unauthorized"})
+    )
+    await adapter.connect()
+    with pytest.raises(ChatlyticsLookupError) as excinfo:
+        await adapter.get_chat_info(CHAT_ID)
+    assert excinfo.value.code == "auth_error"
+    await adapter.disconnect()
+
+
+async def test_get_chat_info_raises_auth_error_on_403(
+    adapter: ChatlyticsAdapter, mock_router: respx.MockRouter
+) -> None:
+    from chatlytics_hermes.adapter import ChatlyticsLookupError
+
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    mock_router.get("/api/v1/chat").mock(
+        return_value=httpx.Response(403, json={"error": "forbidden"})
+    )
+    await adapter.connect()
+    with pytest.raises(ChatlyticsLookupError) as excinfo:
+        await adapter.get_chat_info(CHAT_ID)
+    assert excinfo.value.code == "auth_error"
+    await adapter.disconnect()
+
+
+async def test_get_chat_info_raises_server_error_on_500(
+    adapter: ChatlyticsAdapter, mock_router: respx.MockRouter
+) -> None:
+    from chatlytics_hermes.adapter import ChatlyticsLookupError
+
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    mock_router.get("/api/v1/chat").mock(
+        return_value=httpx.Response(500, json={"error": "internal"})
+    )
+    await adapter.connect()
+    with pytest.raises(ChatlyticsLookupError) as excinfo:
+        await adapter.get_chat_info(CHAT_ID)
+    assert excinfo.value.code == "server_error"
+    await adapter.disconnect()
+
+
+async def test_get_chat_info_raises_validation_error_on_404(
+    adapter: ChatlyticsAdapter, mock_router: respx.MockRouter
+) -> None:
+    """404 from gateway -> validation_error (unknown JID), NOT legitimate empty."""
+    from chatlytics_hermes.adapter import ChatlyticsLookupError
+
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    mock_router.get("/api/v1/chat").mock(
+        return_value=httpx.Response(404, json={"error": "not found"})
+    )
+    await adapter.connect()
+    with pytest.raises(ChatlyticsLookupError) as excinfo:
+        await adapter.get_chat_info(CHAT_ID)
+    assert excinfo.value.code == "validation_error"
+    await adapter.disconnect()
+
+
+async def test_tool_wrapper_returns_success_true_with_chat_on_found(
+    adapter: ChatlyticsAdapter, mock_router: respx.MockRouter
+) -> None:
+    """Tool-layer wrapper: chat-found -> {success: True, chat: {...}}."""
+    from chatlytics_hermes.tools import chatlytics_get_chat_info
+
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    mock_router.get("/api/v1/chat").mock(
+        return_value=httpx.Response(
+            200, json={"name": "Alice", "isGroup": False}
+        )
+    )
+    await adapter.connect()
+    result = await chatlytics_get_chat_info(
+        adapter.client, adapter=adapter, chatId=CHAT_ID
+    )
+    assert result == {
+        "success": True,
+        "chat": {"name": "Alice", "isGroup": False},
+    }
+    await adapter.disconnect()
+
+
+async def test_tool_wrapper_returns_success_true_with_null_on_empty(
+    adapter: ChatlyticsAdapter, mock_router: respx.MockRouter
+) -> None:
+    """Tool-layer wrapper: legitimate empty -> {success: True, chat: None}.
+
+    HERMES-13 NEW ASSERTION #1 (per phase brief): explicit null branch.
+    """
+    from chatlytics_hermes.tools import chatlytics_get_chat_info
+
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    # NB: ``httpx.Response(200, json=None)`` sends an EMPTY body (httpx
+    # treats ``json=None`` as "no JSON kwarg"), which would surface as
+    # ``unknown_error`` via the malformed-JSON path. Use ``content=b"null"``
+    # with an explicit JSON content-type to deliver a literal JSON ``null``
+    # — the legitimate-empty contract is "2xx + falsy JSON body".
+    mock_router.get("/api/v1/chat").mock(
+        return_value=httpx.Response(
+            200, content=b"null", headers={"content-type": "application/json"}
+        )
+    )
+    await adapter.connect()
+    result = await chatlytics_get_chat_info(
+        adapter.client, adapter=adapter, chatId=CHAT_ID
+    )
+    assert result == {"success": True, "chat": None}
+    await adapter.disconnect()
+
+
+async def test_tool_wrapper_returns_error_with_underscore_error_on_500(
+    adapter: ChatlyticsAdapter, mock_router: respx.MockRouter
+) -> None:
+    """Tool-layer wrapper: 5xx -> {success: False, _error: 'server_error'}.
+
+    HERMES-13 NEW ASSERTION #2 (per phase brief): explicit _error sentinel
+    on the error branch.
+    """
+    from chatlytics_hermes.tools import chatlytics_get_chat_info
+
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    mock_router.get("/api/v1/chat").mock(
+        return_value=httpx.Response(500, json={"error": "boom"})
+    )
+    await adapter.connect()
+    result = await chatlytics_get_chat_info(
+        adapter.client, adapter=adapter, chatId=CHAT_ID
+    )
+    assert result["success"] is False
+    assert result["_error"] == "server_error"
+    assert "error" in result and isinstance(result["error"], str)
+    await adapter.disconnect()
+
+
+async def test_tool_wrapper_returns_validation_error_on_404(
+    adapter: ChatlyticsAdapter, mock_router: respx.MockRouter
+) -> None:
+    """Tool-layer wrapper: 404 -> {success: False, _error: 'validation_error'}.
+
+    Explicit coverage of the 404-disambiguation rule (404 from gateway is
+    a malformed/unknown JID, NOT a chat-not-found legitimate empty).
+    """
+    from chatlytics_hermes.tools import chatlytics_get_chat_info
+
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    mock_router.get("/api/v1/chat").mock(
+        return_value=httpx.Response(404, json={"error": "not found"})
+    )
+    await adapter.connect()
+    result = await chatlytics_get_chat_info(
+        adapter.client, adapter=adapter, chatId=CHAT_ID
+    )
+    assert result["success"] is False
+    assert result["_error"] == "validation_error"
     await adapter.disconnect()

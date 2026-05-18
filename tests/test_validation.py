@@ -7,7 +7,10 @@ Covers Phase 10 acceptance criteria:
 - ``chatlytics_login`` MCP-aligned semantics (5 tests; 05-LOW-03 + PR-LOW-03)
 
 Total: 19 tests. All other Phase 10 deliverables are docstring-only
-(``get_chat_info`` empty-vs-error semantics in adapter.py docstring;
+(``get_chat_info`` empty-vs-error semantics in adapter.py docstring —
+SUPERSEDED in v3.0 HERMES-13, the adapter now returns ``dict | None``
+and raises ``ChatlyticsLookupError`` with an ``_error`` machine code;
+see the v3.0 CHANGELOG entry "BREAKING — get_chat_info return shape";
 ``send_image`` / ``send_image_file`` cross-reference; tool-layer
 ``chatlytics_send_image`` docstring) and verified by code review.
 """
