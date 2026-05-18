@@ -3,9 +3,9 @@ gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: — Breaking-change harmonization + first public release
 status: in_progress
-stopped_at: HERMES-20 done — chatlytics-claude-code 1.2.0 bundle alignment landed in sibling repo (4 commits). Version 1.1.0 → 1.2.0 across 3 sites; chatlytics_send drift bug fixed (resolveChatId); looksLikeJid verified vs Python Phase 14; esbuild bundle regenerated; npm pack --dry-run OK. Code review SHIP, 0 findings. Awaiting Phase 21 (npm publish).
-last_updated: "2026-05-18T13:00:00.000Z"
-last_activity: 2026-05-18 — Phase 20 implemented + reviewed. Cross-repo bundle alignment in chatlytics-claude-code (sibling repo). 4 sibling commits (9a6a41a, b29818e, 7eafe94, dadc82a); 3 Python repo commits (CONTEXT, PLAN, SUMMARY+REVIEW). Phase 21 scope guard preserved. Phases 13-20 complete.
+stopped_at: HERMES-21 PART A done — npm manifest prepared for first public publish of @chatlytics/claude-code 1.2.0. Sibling repo flipped private:false + renamed scoped + files: allowlist (8 entries) + publishConfig.access:public + engines.node:>=18. npm pack dry-run OK (9 files, 147.7 kB). npm publish --dry-run --access=public OK (+ @chatlytics/claude-code@1.2.0). npm view -> 404 (name available). whoami -> omernesh. 1 sibling commit (270b23e), 3 Python commits (CONTEXT, PLAN, SUMMARY+REVIEW+NPM-READY). Code review 0/0/0/0/1 INFO (postinstall waste, deferred). AWAITING OPERATOR GO/NO-GO for PART B (real npm publish + tag v1.2.0 + push tag + push main in sibling repo).
+last_updated: "2026-05-18T14:00:00.000Z"
+last_activity: 2026-05-18 — Phase 21 PART A implemented + reviewed + dry-run validated. Manifest prep only — no real publish, no tag, no push (PART B owns those). Phases 13-20 complete; 21 part-A complete; 21 part-B pending operator.
 progress:
   total_phases: 9
   completed_phases: 8
