@@ -3,7 +3,11 @@
 Covers Phase 10 acceptance criteria:
 
 - ``__init__`` validation of ``webhook_path`` (8 tests; 03-LOW-01 + PR-MED-01)
-- Tool schema validation of ``chatId`` / ``messageId`` (6 tests; 05-LOW-02 + PR-MED-01)
+- Tool schema validation of ``chatId`` / ``messageId`` (6 tests; 05-LOW-02 + PR-MED-01;
+  v3.0 HERMES-14 tightened ``chatId`` to JID-only -- see ``TestJidValidation``
+  in ``test_tool_schemas.py`` for the canonical accept-set tests; the two
+  v2.1 permissive-accept assertions in this file are now flipped to
+  strict-reject assertions with a ``# v3.0 schema tightening`` comment)
 - ``chatlytics_login`` MCP-aligned semantics (5 tests; 05-LOW-03 + PR-LOW-03)
 
 Total: 19 tests. All other Phase 10 deliverables are docstring-only
@@ -185,20 +189,33 @@ def test_media_chat_id_accepts_jid_format() -> None:
     )
 
 
-def test_media_chat_id_accepts_phone_number() -> None:
-    """05-LOW-02: bare phone number passes (Chatlytics resolves these)."""
+def test_media_chat_id_rejects_phone_number() -> None:
+    """v3.0 schema tightening -- was bare phone in v2.1, now rejected.
+
+    HERMES-14 (BREAKING): bare phone numbers no longer pass the chatId
+    validator. Callers must pre-resolve via ``chatlytics_search`` to
+    obtain a JID first. See CHANGELOG entry "BREAKING -- strict JID
+    regex on chatId schemas".
+    """
     validator = jsonschema.Draft202012Validator(SEND_IMAGE_SCHEMA)
-    validator.validate(
-        {"chatId": "+1234567890", "mediaUrl": "https://example.com/a.png"}
-    )
+    with pytest.raises(jsonschema.ValidationError):
+        validator.validate(
+            {"chatId": "+1234567890", "mediaUrl": "https://example.com/a.png"}
+        )
 
 
-def test_media_chat_id_accepts_group_name() -> None:
-    """05-LOW-02: display-name strings pass (permissive accept-set)."""
+def test_media_chat_id_rejects_group_name() -> None:
+    """v3.0 schema tightening -- was display name in v2.1, now rejected.
+
+    HERMES-14 (BREAKING): display-name strings no longer pass the
+    chatId validator. Use ``chatlytics_search`` first to resolve a
+    name to its JID.
+    """
     validator = jsonschema.Draft202012Validator(SEND_IMAGE_SCHEMA)
-    validator.validate(
-        {"chatId": "My Group Name", "mediaUrl": "https://example.com/a.png"}
-    )
+    with pytest.raises(jsonschema.ValidationError):
+        validator.validate(
+            {"chatId": "My Group Name", "mediaUrl": "https://example.com/a.png"}
+        )
 
 
 def test_messaging_chat_id_rejects_empty_string() -> None:
