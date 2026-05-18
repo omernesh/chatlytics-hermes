@@ -1,12 +1,49 @@
 # chatlytics-hermes
 
-Chatlytics WhatsApp platform plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
+> **The most comprehensive WhatsApp integration for Hermes Agent.**
 
-`chatlytics-hermes` connects Hermes to the Chatlytics WhatsApp gateway as a
-first-class platform plugin. It registers a `BasePlatformAdapter` subclass,
-21 Hermes tools (text + media + directory + sessions), an aiohttp inbound
-webhook server, and a cron-delivery hook -- all auto-discovered by Hermes
-through the `hermes_agent.plugins` entry-point group.
+Production-grade messaging through the [Chatlytics](https://chatlytics.ai)
+gateway -- text, all six media types (image, voice, video, document, animation,
+sticker), reactions, groups, channels, contacts, polls, labels, presence,
+profile. **21 Hermes tools, 100% of Hermes 0.14's upstream
+`BasePlatformAdapter` contract, end-to-end async.**
+
+[![PyPI](https://img.shields.io/pypi/v/chatlytics-hermes.svg)](https://pypi.org/project/chatlytics-hermes/) [![Python](https://img.shields.io/pypi/pyversions/chatlytics-hermes.svg)](https://pypi.org/project/chatlytics-hermes/) [![License](https://img.shields.io/pypi/l/chatlytics-hermes.svg)](LICENSE)
+
+A first-class platform plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
+One `pip install` hands your agent a fully-stocked WhatsApp toolbox -- a
+`BasePlatformAdapter` subclass implementing all five required methods plus all
+six media variants, 21 Hermes tools auto-registered through
+`ctx.register_tool()`, an aiohttp inbound webhook server living *inside*
+`connect()` (no Flask, no leaked threads), and a cron-delivery hook for
+scheduled sends. Auto-discovered through the `hermes_agent.plugins`
+entry-point group.
+
+## Why chatlytics-hermes?
+
+- **Full surface, not a stub** -- every Chatlytics REST action exposed as a
+  Hermes tool. No "we ship 5 read tools, write your own for the rest" -- 21
+  tools covering send (text + 6 media), read, search, directory, sessions,
+  presence, profile, actions enumeration, health, dispatch.
+- **Upstream contract end-to-end** -- implements every method on Hermes 0.14's
+  `BasePlatformAdapter` (`connect/disconnect/send/send_typing/get_chat_info`
+  plus media variants plus inbound `MessageEvent` dispatch via
+  `MessageType.{TEXT,IMAGE,AUDIO,VIDEO,DOCUMENT,STICKER,...}`). No fork, no
+  vendor -- the plugin tracks the canonical contract.
+- **Production-grade safety** -- default-deny `CHATLYTICS_UPLOAD_ALLOWED_ROOTS`
+  allowlist on every file-bearing tool (no `filePath=/etc/passwd`
+  prompt-injection), strict JID validation at the schema layer (no ambiguous
+  chat-id strings ever reach the gateway), machine-readable `_error` sentinels
+  on every failure mode (`transport_error`, `auth_error`, `server_error`,
+  `validation_error`, `unknown_error`).
+- **Async-native** -- `httpx` for all outbound calls (matches Hermes runtime
+  conventions), aiohttp inbound *inside* `connect()` so plugin reload doesn't
+  leak threads, `_keep_typing()` 30s heartbeat for the WhatsApp 24h window,
+  retry-with-exponential-backoff baked into the gateway client.
+- **First public release (v3.0.0)** -- `pip install chatlytics-hermes` and
+  your agent has WhatsApp.
+
+---
 
 ## Status
 
