@@ -1,10 +1,12 @@
 name: chatlytics
 label: Chatlytics WhatsApp
 kind: platform
-version: "3.0.1"
+version: "4.0.0"
 description: >
   Chatlytics WhatsApp gateway adapter for Hermes Agent. Connects Hermes to
   Chatlytics's REST API for inbound webhooks and outbound messages/media.
+  v4.0 aligns with the chatlytics Multi-Bot Platform milestone — each
+  Hermes profile maps 1:1 to a chatlytics bot via CHATLYTICS_BOT_TOKEN.
 author: Chatlytics
 
 # ``requires_env`` entries are surfaced in ``hermes config`` UI via the
@@ -14,12 +16,16 @@ requires_env:
     description: "Chatlytics gateway base URL (e.g. https://gateway.chatlytics.ai)"
     prompt: "Chatlytics base URL"
     password: false
-  - name: CHATLYTICS_API_KEY
-    description: "API key for Chatlytics REST authentication (Bearer token)"
-    prompt: "Chatlytics API key"
+  - name: CHATLYTICS_BOT_TOKEN
+    description: "Per-bot bearer token (sk_bot_...) issued by `chatlytics bots create`. Preferred over CHATLYTICS_API_KEY in plugin v4.0+."
+    prompt: "Chatlytics bot token (sk_bot_...)"
     password: true
 
 optional_env:
+  - name: CHATLYTICS_API_KEY
+    description: "DEPRECATED in plugin v4.0 — use CHATLYTICS_BOT_TOKEN. Operator/admin bearer (legacy v3.37 contract). Retained as one-minor-cycle fallback for migration."
+    prompt: "Chatlytics API key (legacy)"
+    password: true
   - name: CHATLYTICS_ACCOUNT_ID
     description: "Default session/account ID for outbound sends"
     prompt: "Default account/session ID (optional)"

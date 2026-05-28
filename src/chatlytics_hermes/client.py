@@ -18,7 +18,9 @@ import httpx
 logger = logging.getLogger("chatlytics_hermes.client")
 
 DEFAULT_TIMEOUT_SECONDS: float = 30.0
-USER_AGENT: str = "chatlytics-hermes/2.0.0"
+# HERMES-V2 (Phase 336): User-Agent tracks the package version (4.0.0 ships
+# with the bot_token plugin). Previously stuck at 2.0.0 since v2 release.
+USER_AGENT: str = "chatlytics-hermes/4.0.0"
 
 
 class ChatlyticsClient:

@@ -1,5 +1,80 @@
 # Changelog
 
+## [4.0.0] - 2026-05-28
+
+v4.0 plugin release — aligns with chatlytics v4.0 **Multi-Bot Platform**.
+Plugin now accepts per-bot bearer tokens (`CHATLYTICS_BOT_TOKEN`) as the
+preferred auth mechanism. Legacy `CHATLYTICS_API_KEY` continues to work
+as a fallback for one minor cycle so existing deployments migrate without
+flag-day pressure.
+
+### Added
+
+- **`CHATLYTICS_BOT_TOKEN`** env var + `extra.bot_token` PlatformConfig
+  field as the preferred auth credential (`sk_bot_<43-char-base64url>`
+  per-bot bearer issued by `chatlytics bots create`). Resolution
+  precedence (highest first): env `CHATLYTICS_BOT_TOKEN` →
+  `extra.bot_token` → env `CHATLYTICS_API_KEY` (legacy) → `extra.api_key`.
+- **`ChatlyticsAdapter.is_bot_token`** property — boolean predicate that
+  reports `True` when the resolved auth token is a bot bearer (either
+  because `bot_token` was the explicit source, or the resolved token
+  carries the canonical `sk_bot_` prefix).
+- **Fingerprint logging on `connect()`** — the adapter logs which
+  auth-identity branch (`bot (fp=<8-char-sha256>)` vs
+  `operator (legacy api_key, fp=...)`) the gateway connected with.
+  Token plaintext NEVER appears in logs (INV-02 token-discipline
+  parity with the chatlytics-side `tokenFingerprint` helper).
+- **5 new tests** (`tests/test_bot_token.py`) covering the precedence
+  matrix, env-vs-extra override semantics, the `api_key` back-compat
+  fallback path with a Bearer-header assertion, and the
+  `ChatlyticsConnectError` path when neither token is set.
+
+### Changed
+
+- **`USER_AGENT`** in `client.py` bumped from `chatlytics-hermes/2.0.0`
+  to `chatlytics-hermes/4.0.0`. (Had been stuck at the v2.0 release
+  string through v3.0.x — caught + corrected in this release.)
+- **`plugin.yaml`** lists `CHATLYTICS_BOT_TOKEN` in `requires_env`;
+  `CHATLYTICS_API_KEY` moved to `optional_env` with a `DEPRECATED in
+  plugin v4.0` description prefix.
+- **`ChatlyticsAdapter.connect()`** raises `ChatlyticsConnectError`
+  with a clear message naming both env vars when no token is
+  resolvable. The check happens at connect time (not __init__)
+  so partial env loads during gateway registration don't crash
+  adapter instantiation.
+- **`tests/test_register.py`** version-pin assertions updated to
+  `4.0.0` and required-env set updated to the new shape.
+
+### Preserved
+
+- **125/125 tests passing** (120 pre-existing + 5 new bot_token tests).
+- **21 Hermes tools** — tool surface unchanged.
+- **All v3.0.0 BREAKING changes** (HERMES-13 `get_chat_info` shape,
+  HERMES-14 strict JID regex, HERMES-15 unified `send_*(resource=...)`)
+  unchanged.
+- **HI-01 default-deny upload allowlist** (`CHATLYTICS_UPLOAD_ALLOWED_ROOTS`)
+  unchanged.
+- **`BasePlatformAdapter` contract coverage** unchanged.
+
+### Migration from 3.x
+
+Existing `CHATLYTICS_API_KEY`-only deployments continue to work without
+change — the plugin transparently falls back. To migrate to the
+preferred bot-token path:
+
+1. Provision a chatlytics v4.0 bot: `chatlytics bots create --display-name "<bot>"`.
+2. Capture the `sk_bot_...` token (returned plaintext exactly ONCE on
+   create — see chatlytics CLAUDE.md INV-02).
+3. Set `CHATLYTICS_BOT_TOKEN=sk_bot_...` in the Hermes profile's `.env`
+   (or `extra.bot_token` in the profile's `config.yaml`).
+4. Restart the Hermes gateway. On connect, the adapter logs
+   `"chatlytics adapter authenticated as bot (fp=<8char>)"` confirming
+   the switch.
+5. Once verified, remove `CHATLYTICS_API_KEY` from the profile's env.
+
+The `CHATLYTICS_API_KEY` fallback is retained for one minor cycle
+(through plugin v4.1) and slated for removal in plugin v5.0.
+
 ## [3.0.1] - 2026-05-18
 
 Cosmetic release — no functional changes, no test changes, no API surface

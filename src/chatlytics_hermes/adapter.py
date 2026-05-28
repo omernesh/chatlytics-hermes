@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import mimetypes
 import os
@@ -65,6 +66,32 @@ from aiohttp import web
 
 from .client import ChatlyticsClient, USER_AGENT
 from .inbound import make_health_handler, make_webhook_handler
+
+
+# HERMES-V2 (Phase 336): chatlytics v4.0 introduces per-bot bearer tokens
+# (``sk_bot_<43-char-base64url>``). The plugin prefers ``CHATLYTICS_BOT_TOKEN``
+# over the legacy admin/operator ``CHATLYTICS_API_KEY``. Both share the same
+# Bearer header transport — only the token shape differs, so the chatlytics
+# gateway can distinguish (``resolveBotFromBearer`` vs ``requirePublicApiAuth``)
+# without the plugin needing to know which auth path the gateway picked.
+#
+# Detection prefix is documented at chatlytics.ai/CLAUDE.md (API Keys table,
+# CHATLYTICS_BOT_TOKEN row) — sk_bot_ prefix is the canonical shape.
+_BOT_TOKEN_PREFIX: str = "sk_bot_"
+
+
+def _token_fingerprint(token: str, length: int = 8) -> str:
+    """8-char SHA256 fingerprint of an auth token for safe log lines.
+
+    INV-02 (chatlytics v4.0 invariant — token plaintext discipline): bot
+    tokens MUST NEVER appear in logs. This helper produces the same 8-char
+    fingerprint shape that the chatlytics-side ``tokenFingerprint`` helper
+    emits, so an operator grepping logs across plugin + gateway sees
+    matching fingerprints for the same token.
+    """
+    if not token:
+        return "<empty>"
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:length]
 
 
 # Chatlytics ``mediaType`` field uses platform-specific tokens that do
@@ -349,7 +376,25 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
         # Connection settings (env vars override config.yaml ``extra`` block).
         self.base_url: str = os.getenv("CHATLYTICS_BASE_URL") or extra.get("base_url", "")
+        # HERMES-V2 (Phase 336): bot_token is the PREFERRED auth mechanism in
+        # chatlytics v4.0. Falls back to api_key (legacy) when bot_token is
+        # absent. Resolution precedence (highest first):
+        #   1. CHATLYTICS_BOT_TOKEN env var
+        #   2. extra.bot_token   (config.yaml chatlytics.extra block)
+        #   3. CHATLYTICS_API_KEY env var (legacy)
+        #   4. extra.api_key     (legacy config.yaml fallback)
+        # The empty-string sentinel from the first three falsy results lets
+        # the next branch take over; final empty string defers the error to
+        # connect() time so registration phase doesn't crash on partial env.
+        self.bot_token: str = (
+            os.getenv("CHATLYTICS_BOT_TOKEN") or extra.get("bot_token", "") or ""
+        )
         self.api_key: str = os.getenv("CHATLYTICS_API_KEY") or extra.get("api_key", "")
+        # _auth_token: the actual Bearer the client uses. Both shapes flow
+        # through the SAME header; the chatlytics gateway distinguishes by
+        # token shape (sk_bot_ prefix → resolveBotFromBearer; otherwise →
+        # requirePublicApiAuth). Plugin stays agnostic to the gateway path.
+        self._auth_token: str = self.bot_token or self.api_key
         self.account_id: Optional[str] = (
             os.getenv("CHATLYTICS_ACCOUNT_ID") or extra.get("account_id")
         )
@@ -431,6 +476,27 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         """
         return self._client
 
+    @property
+    def is_bot_token(self) -> bool:
+        """True when the adapter authenticates as a chatlytics v4.0 bot.
+
+        HERMES-V2 (Phase 336): operators inspecting an adapter instance
+        in REPL / debugger / log lines need a fast predicate to confirm
+        which auth path the plugin took. True iff EITHER:
+
+        - ``self.bot_token`` is non-empty (explicit bot-token branch),
+          OR
+        - the resolved ``self._auth_token`` carries the canonical
+          ``sk_bot_`` prefix (defensive — covers the case where an
+          operator pasted a bot token into the legacy ``api_key`` slot
+          and we still want to acknowledge it as a bot token).
+        """
+        if self.bot_token:
+            return True
+        return bool(self._auth_token) and self._auth_token.startswith(
+            _BOT_TOKEN_PREFIX
+        )
+
     # --- Lifecycle (HERMES-02) ---------------------------------------------
 
     async def connect(self) -> bool:
@@ -446,10 +512,39 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
            :class:`ChatlyticsConnectError` and tears down the httpx
            client so the next connect() retries from a clean slate.
         """
+        # HERMES-V2 (Phase 336): assert we have SOME auth token before
+        # attempting transport. Deferred from __init__ so registration-time
+        # env loading races don't crash adapter instantiation; failing here
+        # gives the operator a single clear error at gateway start.
+        if not self._auth_token:
+            raise ChatlyticsConnectError(
+                "ChatlyticsAdapter requires either CHATLYTICS_BOT_TOKEN "
+                "(preferred, chatlytics v4.0+) or CHATLYTICS_API_KEY "
+                "(legacy). Neither is set in env or PlatformConfig.extra; "
+                "the adapter has no Bearer credential to send."
+            )
+
         if self._client is None:
+            # ChatlyticsClient takes the resolved _auth_token regardless of
+            # which branch (bot vs operator) populated it; the chatlytics
+            # gateway distinguishes by token-shape on the receive side.
             self._client = ChatlyticsClient(
                 base_url=self.base_url,
-                api_key=self.api_key,
+                api_key=self._auth_token,
+            )
+
+        # HERMES-V2 (Phase 336): log which auth identity the plugin uses
+        # so operators can confirm bot vs legacy at gateway start. Token
+        # plaintext NEVER appears — only the 8-char SHA256 fingerprint.
+        if self.is_bot_token:
+            logger.info(
+                "chatlytics adapter authenticated as bot (fp=%s)",
+                _token_fingerprint(self._auth_token, 8),
+            )
+        else:
+            logger.info(
+                "chatlytics adapter authenticated as operator (legacy api_key, fp=%s)",
+                _token_fingerprint(self._auth_token, 8),
             )
 
         logger.info(

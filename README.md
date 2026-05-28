@@ -47,11 +47,36 @@ entry-point group.
 
 ## Status
 
-**Stable v3.0.0 release.** Requires `hermes-agent>=0.14,<0.15`.
+**Stable v4.0.0 release.** Requires `hermes-agent>=0.14,<0.15`.
 
 `hermes-agent` v0.14 is not yet on PyPI; install it from the GitHub tag
 `v2026.5.16` (see [Install](#install) below). When v0.14 ships to PyPI the
 install line simplifies to a plain `pip install hermes-agent>=0.14`.
+
+## What's new in v4.0
+
+**Multi-Bot Platform alignment.** v4.0 lands the plugin-side half of the
+chatlytics v4.0 Multi-Bot Platform milestone. Each Hermes profile now maps
+1:1 to a chatlytics bot via a per-bot bearer token (`CHATLYTICS_BOT_TOKEN`,
+`sk_bot_...` shape).
+
+- **Preferred auth:** `CHATLYTICS_BOT_TOKEN` (per-bot bearer issued by
+  `chatlytics bots create`). The chatlytics gateway resolves it through
+  `resolveBotFromBearer` — identifies the BOT, not the operator. Per-bot
+  `permission_scope` (tool allowlist + rate limit) is enforced server-side.
+- **Back-compat:** `CHATLYTICS_API_KEY` continues to work as a one-minor-
+  cycle fallback. Existing v3.x deployments need NO config change to keep
+  running on plugin v4.0.
+- **Resolution precedence** (highest first): env `CHATLYTICS_BOT_TOKEN` →
+  `extra.bot_token` → env `CHATLYTICS_API_KEY` → `extra.api_key`.
+- **Operator visibility:** the adapter logs
+  `chatlytics adapter authenticated as bot (fp=<8-char>)` on connect so
+  operators can confirm which auth path the plugin took. Token plaintext
+  NEVER appears in logs.
+
+See [CHANGELOG.md](CHANGELOG.md) `## [4.0.0]` for the full migration
+checklist (5 numbered steps). One-minor-cycle deprecation: `api_key`
+fallback slated for removal in plugin v5.0.
 
 ## Migration from 2.x
 

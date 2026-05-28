@@ -108,31 +108,39 @@ def test_register_declares_hermes_04_hooks() -> None:
 
 
 def test_plugin_yaml_is_valid() -> None:
-    """Acceptance criterion 3: ``plugin.yaml`` is valid YAML with the right shape."""
+    """Acceptance criterion 3: ``plugin.yaml`` is valid YAML with the right shape.
+
+    HERMES-V2 (Phase 336): in plugin v4.0 the required-env set changed —
+    ``CHATLYTICS_BOT_TOKEN`` (per-bot bearer) is the new required field;
+    ``CHATLYTICS_API_KEY`` moved to optional_env as a deprecated fallback.
+    """
     manifest = yaml.safe_load((REPO_ROOT / "plugin.yaml").read_text(encoding="utf-8"))
 
     assert manifest["name"] == "chatlytics"
     assert manifest["kind"] == "platform"
-    assert manifest["version"] == "3.0.1"
+    assert manifest["version"] == "4.0.0"
 
     required = {entry["name"] for entry in manifest["requires_env"]}
-    assert required == {"CHATLYTICS_BASE_URL", "CHATLYTICS_API_KEY"}
+    assert required == {"CHATLYTICS_BASE_URL", "CHATLYTICS_BOT_TOKEN"}
 
     # Optional env should include the webhook + cron knobs that later
     # phases consume.  Asserting the set keeps the manifest honest.
+    # HERMES-V2: CHATLYTICS_API_KEY is now optional (deprecated fallback).
     optional = {entry["name"] for entry in manifest["optional_env"]}
     assert {
+        "CHATLYTICS_API_KEY",
         "CHATLYTICS_ACCOUNT_ID",
         "CHATLYTICS_WEBHOOK_PORT",
         "CHATLYTICS_WEBHOOK_SECRET",
         "CHATLYTICS_HOME_CHANNEL",
     } <= optional
 
-    # API key + webhook secret must be marked as password fields so the
+    # Bot token + api key + webhook secret must be marked as password fields so the
     # ``hermes config`` wizard masks them on entry.
     by_name = {entry["name"]: entry for entry in (
         manifest["requires_env"] + manifest["optional_env"]
     )}
+    assert by_name["CHATLYTICS_BOT_TOKEN"]["password"] is True
     assert by_name["CHATLYTICS_API_KEY"]["password"] is True
     assert by_name["CHATLYTICS_WEBHOOK_SECRET"]["password"] is True
 
@@ -145,7 +153,7 @@ def test_pyproject_declares_hermes_entry_point() -> None:
     assert entry_points["chatlytics"] == "chatlytics_hermes:register"
 
     project = data["project"]
-    assert project["version"] == "3.0.1"
+    assert project["version"] == "4.0.0"  # HERMES-V2 Phase 336 — v4.0 release.
     assert project["name"] == "chatlytics-hermes"
 
     deps = project["dependencies"]
