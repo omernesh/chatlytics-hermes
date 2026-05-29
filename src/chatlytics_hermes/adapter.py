@@ -79,6 +79,15 @@ from .inbound import make_health_handler, make_webhook_handler, normalize_payloa
 # CHATLYTICS_BOT_TOKEN row) — sk_bot_ prefix is the canonical shape.
 _BOT_TOKEN_PREFIX: str = "sk_bot_"
 
+# v4.1 longpoll hold: the chatlytics server HOLDS GET /api/v1/bot/updates for
+# up to this many ms before returning an empty {envelopes:[],cursor} batch.
+# The longpoll GET's httpx read timeout MUST comfortably exceed this hold or
+# every empty poll trips a ReadTimeout (which httpx stringifies to "()", the
+# `longpoll GET transport error ()` symptom). The client-level default
+# (30s, only ~5s margin) was too tight; the poll uses an explicit per-request
+# httpx.Timeout with read = hold + 15s instead. See _poll_loop.
+_LONGPOLL_TIMEOUT_MS: int = 25000
+
 
 def _token_fingerprint(token: str, length: int = 8) -> str:
     """8-char SHA256 fingerprint of an auth token for safe log lines.
@@ -579,7 +588,15 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             try:
                 resp = await client.get(
                     "/api/v1/bot/updates",
-                    params={"cursor": cursor, "timeout_ms": 25000},
+                    params={"cursor": cursor, "timeout_ms": _LONGPOLL_TIMEOUT_MS},
+                    # Read timeout MUST exceed the server hold (timeout_ms) or
+                    # every empty poll times out. read = hold + 15s buffer.
+                    timeout=httpx.Timeout(
+                        connect=10.0,
+                        read=(_LONGPOLL_TIMEOUT_MS / 1000) + 15.0,
+                        write=10.0,
+                        pool=10.0,
+                    ),
                 )
             except asyncio.CancelledError:
                 raise

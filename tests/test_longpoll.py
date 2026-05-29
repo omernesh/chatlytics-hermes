@@ -57,7 +57,7 @@ class FakeClient:
         self.post_calls: List[Dict[str, Any]] = []
         self.base_url = BASE_URL
 
-    async def get(self, path: str, *, params: Dict[str, Any] | None = None) -> httpx.Response:
+    async def get(self, path: str, *, params: Dict[str, Any] | None = None, timeout: Any = None) -> httpx.Response:
         self.get_calls.append({"path": path, "params": params or {}})
         if self._get_responses:
             status, body = self._get_responses.pop(0)
@@ -70,7 +70,7 @@ class FakeClient:
             self._adapter._running = False
         return httpx.Response(status, json=body, request=httpx.Request("GET", BASE_URL + path))
 
-    async def post(self, path: str, *, json: Dict[str, Any] | None = None) -> httpx.Response:
+    async def post(self, path: str, *, json: Dict[str, Any] | None = None, timeout: Any = None) -> httpx.Response:
         self.post_calls.append({"path": path, "json": json or {}})
         return httpx.Response(
             200,
@@ -240,7 +240,7 @@ class _LiveClient:
         self.base_url = BASE_URL
         self.acks: List[Dict[str, Any]] = []
 
-    async def get(self, path: str, *, params: Dict[str, Any] | None = None) -> httpx.Response:
+    async def get(self, path: str, *, params: Dict[str, Any] | None = None, timeout: Any = None) -> httpx.Response:
         # /health (connect) then bot/updates polls.
         if path == "/health":
             return httpx.Response(200, json={}, request=httpx.Request("GET", BASE_URL))
@@ -267,7 +267,7 @@ class _LiveClient:
             body = {"envelopes": [], "cursor": CURSOR_1}
         return httpx.Response(200, json=body, request=httpx.Request("GET", BASE_URL + path))
 
-    async def post(self, path: str, *, json: Dict[str, Any] | None = None) -> httpx.Response:
+    async def post(self, path: str, *, json: Dict[str, Any] | None = None, timeout: Any = None) -> httpx.Response:
         self.acks.append(json or {})
         return httpx.Response(200, json={"acked": 1}, request=httpx.Request("POST", BASE_URL + path))
 

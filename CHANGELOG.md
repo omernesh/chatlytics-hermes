@@ -1,5 +1,23 @@
 # Changelog
 
+## [4.1.1] - 2026-05-29
+
+### Fixed
+
+- **Longpoll `transport error ()` after chatlytics restart.** The longpoll
+  GET inherited the client-level `DEFAULT_TIMEOUT_SECONDS=30.0`, leaving only
+  ~5s of margin over the server's 25s long-poll hold (`timeout_ms=25000`).
+  Every empty poll that the server held the full 25s then occasionally tripped
+  an httpx `ReadTimeout` — which stringifies to `()`, producing the
+  `longpoll GET transport error (); backing off` log spam and stalling inbound
+  pickup. `_poll_loop` now passes an explicit per-request
+  `httpx.Timeout(connect=10, read=40, write=10, pool=10)` (read = hold + 15s)
+  to the GET, and `ChatlyticsClient.get()`/`.post()` gained an optional
+  `timeout` param (defaulting to `httpx.USE_CLIENT_DEFAULT`, so all other
+  callers are unchanged). The hold is now a named constant
+  `_LONGPOLL_TIMEOUT_MS` shared by the `timeout_ms` query param and the read
+  window. The ack POST stays on the 30s default (fast call).
+
 ## [4.1.0] - 2026-05-29
 
 v4.1 adds a **longpoll inbound consumer** so the plugin can PULL inbound

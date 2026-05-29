@@ -78,18 +78,28 @@ class ChatlyticsClient:
         path: str,
         *,
         params: Optional[Dict[str, Any]] = None,
+        timeout: Any = httpx.USE_CLIENT_DEFAULT,
     ) -> httpx.Response:
-        """GET ``{base_url}{path}`` with optional query params."""
-        return await self._client.get(path, params=params)
+        """GET ``{base_url}{path}`` with optional query params.
+
+        ``timeout`` defaults to ``httpx.USE_CLIENT_DEFAULT`` so existing
+        callers keep the client-level :data:`DEFAULT_TIMEOUT_SECONDS`. The
+        v4.1 longpoll consumer passes an explicit ``httpx.Timeout`` whose
+        read window MUST exceed the server's long-poll hold (``timeout_ms``)
+        — otherwise every empty poll trips a ReadTimeout. See
+        ``adapter._poll_loop``.
+        """
+        return await self._client.get(path, params=params, timeout=timeout)
 
     async def post(
         self,
         path: str,
         *,
         json: Optional[Dict[str, Any]] = None,
+        timeout: Any = httpx.USE_CLIENT_DEFAULT,
     ) -> httpx.Response:
         """POST ``{base_url}{path}`` with a JSON body."""
-        return await self._client.post(path, json=json)
+        return await self._client.post(path, json=json, timeout=timeout)
 
     async def post_multipart(
         self,
