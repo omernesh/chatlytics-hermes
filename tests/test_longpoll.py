@@ -17,6 +17,7 @@ Test strategy:
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict, List
 
 import httpx
@@ -226,3 +227,84 @@ async def test_empty_batch_does_not_ack() -> None:
 
     assert events == []
     assert fake.post_calls == [], "empty batch must not ack"
+
+
+class _LiveClient:
+    """FakeClient that keeps serving empty batches (does NOT stop the loop),
+    so we can exercise the full connect()->poll->disconnect() lifecycle and
+    assert disconnect() cancels the long-running task."""
+
+    def __init__(self, adapter: ChatlyticsAdapter) -> None:
+        self._adapter = adapter
+        self.n = 0
+        self.base_url = BASE_URL
+        self.acks: List[Dict[str, Any]] = []
+
+    async def get(self, path: str, *, params: Dict[str, Any] | None = None) -> httpx.Response:
+        # /health (connect) then bot/updates polls.
+        if path == "/health":
+            return httpx.Response(200, json={}, request=httpx.Request("GET", BASE_URL))
+        self.n += 1
+        if self.n == 1:
+            body = {
+                "envelopes": [
+                    {
+                        "session_id": SESSION_ID,
+                        "chat_type": "dm",
+                        "entity_jid": "972544329000@c.us",
+                        "sender_jid": "972544329000@c.us",
+                        "text": "ping",
+                        "ts": 1,
+                    }
+                ],
+                "cursor": CURSOR_1,
+            }
+        else:
+            # Simulate the server's long-poll block on an empty queue so the
+            # loop yields (a zero-delay empty batch would busy-spin and starve
+            # the test coroutine).
+            await asyncio.sleep(0.02)
+            body = {"envelopes": [], "cursor": CURSOR_1}
+        return httpx.Response(200, json=body, request=httpx.Request("GET", BASE_URL + path))
+
+    async def post(self, path: str, *, json: Dict[str, Any] | None = None) -> httpx.Response:
+        self.acks.append(json or {})
+        return httpx.Response(200, json={"acked": 1}, request=httpx.Request("POST", BASE_URL + path))
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def test_connect_starts_poll_task_no_webhook_and_disconnect_cancels() -> None:
+    """Full lifecycle: connect() in longpoll mode must (a) NOT start the
+    aiohttp webhook server, (b) spawn the poll task, dispatch + ack, and
+    (c) disconnect() must cancel the task cleanly."""
+    adapter = _make_adapter()
+    events, sessions = _install_recorders(adapter)
+
+    # Pre-seed the client so connect() reuses it (skips ChatlyticsClient
+    # construction) and its /health + bot/updates are served by _LiveClient.
+    live = _LiveClient(adapter)
+    adapter._client = live  # type: ignore[assignment]
+
+    ok = await adapter.connect()
+    assert ok is True
+    # (a) webhook server NOT started in longpoll mode.
+    assert adapter._runner is None
+    assert adapter._site is None
+    # (b) poll task spawned.
+    assert adapter._poll_task is not None
+    assert not adapter._poll_task.done()
+
+    # Let the loop run a few iterations (dispatch batch 1, then empties).
+    await asyncio.sleep(0.1)
+
+    assert len(events) == 1
+    assert events[0].text == "ping"
+    assert (("972544329000@c.us"), SESSION_ID) in sessions
+    assert live.acks and live.acks[0].get("cursor") == CURSOR_1
+
+    # (c) disconnect() cancels the task + clears state.
+    await adapter.disconnect()
+    assert adapter._poll_task is None
+    assert adapter._running is False
