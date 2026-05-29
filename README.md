@@ -194,7 +194,42 @@ block (`hermes config edit`).
 | `CHATLYTICS_WEBHOOK_PORT`     | no       | Local port for the aiohttp inbound webhook listener (default: `8765`)             |
 | `CHATLYTICS_WEBHOOK_SECRET`   | no       | HMAC-SHA256 shared secret for `X-Chatlytics-Signature` verification               |
 | `CHATLYTICS_HOME_CHANNEL`     | no       | Default chat_id for cron / notification delivery                                  |
+| `CHATLYTICS_BOT_TOKEN`        | no\*     | Per-bot bearer (`sk_bot_...`); preferred over `CHATLYTICS_API_KEY` under v4.0+     |
+| `CHATLYTICS_SESSION`          | no\*     | Default WAHA session name (e.g. `3cf11776_logan`) used for outbound `/api/v1/send` when no inbound-derived session is known. Required in webhook mode; longpoll envelopes carry the session per-message |
+| `CHATLYTICS_INBOUND_MODE`     | no       | `webhook` (default — aiohttp PUSH server) or `longpoll` (v4.1 PULL via `GET /api/v1/bot/updates`) |
 | `CHATLYTICS_UPLOAD_ALLOWED_ROOTS` | no   | OS-pathsep-separated absolute paths that media tools may read from disk (default-deny when unset; see Security below) |
+
+\* Either `CHATLYTICS_BOT_TOKEN` (preferred) or `CHATLYTICS_API_KEY` must be set.
+
+### Longpoll inbound (v4.1)
+
+By default the plugin runs an aiohttp **webhook server** that chatlytics
+POSTs inbound messages to. When the Hermes host is behind NAT or otherwise
+has no publicly reachable webhook URL, set:
+
+```bash
+export CHATLYTICS_INBOUND_MODE=longpoll
+export CHATLYTICS_BOT_TOKEN=sk_bot_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+export CHATLYTICS_BASE_URL=https://app.chatlytics.ai
+```
+
+In `longpoll` mode the plugin does **not** start the webhook server.
+Instead it PULLs inbound messages by long-polling
+`GET /api/v1/bot/updates?cursor=<opaque>&timeout_ms=25000` and acks each
+processed batch via `POST /api/v1/bot/updates/ack {cursor}`. The cursor is a
+per-bot opaque offset returned by each GET; the consumer acks only after
+dispatching every envelope in a batch, so unprocessed envelopes re-deliver on
+restart.
+
+**The bot's `webhook_url` must be `null`** on the chatlytics side — otherwise
+chatlytics will try to POST AND queue, double-delivering. Set the bot to
+queue-only (no webhook) when using longpoll.
+
+Required keys for longpoll: `CHATLYTICS_BOT_TOKEN` (the bot identity whose
+queue is drained) and `CHATLYTICS_BASE_URL`. Replies still go out via
+`/api/v1/send`, which requires the WAHA `session` — under longpoll this is
+threaded automatically from each inbound envelope's `session_id`, so
+`CHATLYTICS_SESSION` is optional (but a useful fallback).
 
 ### Security: filePath upload allowlist (`CHATLYTICS_UPLOAD_ALLOWED_ROOTS`)
 

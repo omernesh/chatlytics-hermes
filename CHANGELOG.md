@@ -1,5 +1,63 @@
 # Changelog
 
+## [4.1.0] - 2026-05-29
+
+v4.1 adds a **longpoll inbound consumer** so the plugin can PULL inbound
+messages from chatlytics v4.0 instead of receiving webhook POSTs. This
+restores inbound for deployments behind NAT / without a reachable webhook
+URL (the bot's `webhook_url` is set to `null`; chatlytics queues envelopes
+per-bot and the plugin drains them via long-poll).
+
+### Added
+
+- **Longpoll inbound consumer** (`CHATLYTICS_INBOUND_MODE=longpoll`).
+  `ChatlyticsAdapter._poll_loop()` long-polls
+  `GET /api/v1/bot/updates?cursor=<opaque>&timeout_ms=25000` and acks
+  processed batches via `POST /api/v1/bot/updates/ack {cursor}`. The GET
+  does NOT advance the per-bot read pointer — the consumer acks AFTER
+  processing every non-empty batch, so an in-flight crash re-delivers
+  unprocessed envelopes. Error discipline: exponential backoff (1s→30s)
+  on transport/non-200, cursor reset on `400 invalid_cursor`, 30s backoff
+  on `401 bot_token_required`; the loop never dies silently and exits
+  cleanly on `disconnect()`.
+- **`CHATLYTICS_INBOUND_MODE`** env var / `extra.inbound_mode` config key:
+  `webhook` (default — existing aiohttp PUSH server, unchanged) or
+  `longpoll` (v4.1 PULL transport). In `longpoll` mode `connect()` skips
+  the webhook-server startup and spawns the poll task; `disconnect()`
+  cancels it.
+- **`ChatlyticsAdapter._dispatch_envelope()`** — translates an
+  `InboundEnvelope` (`{bot_token, session_id, chat_type, entity_jid,
+  sender_jid, text, dispatch, ts}`) into a webhook-shaped body, threads
+  the WAHA session via `register_chat_session(entity_jid, session_id)`,
+  and dispatches through the existing `normalize_payload` →
+  `handle_message` path. `chat_type: "newsletter"` maps to Hermes
+  `"channel"`.
+- **4 new tests** (`tests/test_longpoll.py`) covering GET-with-cursor,
+  envelope→MessageEvent translation + `handle_message` dispatch, ack with
+  the returned cursor, `register_chat_session` population, the
+  newsletter→channel mapping, `400 invalid_cursor` reset+recovery, and the
+  no-ack-on-empty-batch contract.
+
+### Changed
+
+- **Carried-forward Hermes-compat fixes** from hpg6's running tree so the
+  plugin loads under the installed Hermes and tool dispatch works:
+  - Entry point is the **bare module** `chatlytics = "chatlytics_hermes"`
+    (NOT `chatlytics_hermes:register`) — the colon form made Hermes'
+    `PluginManager` fail to import the plugin.
+  - `_make_tool_handler._bound(args=None, **kwargs)` now merges the
+    positional `args` dict that `tools.registry.dispatch` passes as
+    `handler(args, **kwargs)` (fixes `TypeError: takes 0 positional
+    arguments but 1 was given`).
+- **Carried-forward P-19 session threading** (also from hpg6): `/api/v1/send`
+  now includes the WAHA `session` (resolved per-chat from inbound, falling
+  back to `CHATLYTICS_SESSION` / `extra.session`); without it chatlytics
+  returns `400 "chatId and session are required"`. Added
+  `register_chat_session` / `_resolve_session_for_chat`, the inbound webhook
+  now records the inbound `session`, and `send()` fails loudly with an
+  operator-actionable error when no session can be resolved. `session` is
+  now a reserved send-body key.
+
 ## [4.0.0] - 2026-05-28
 
 v4.0 plugin release — aligns with chatlytics v4.0 **Multi-Bot Platform**.

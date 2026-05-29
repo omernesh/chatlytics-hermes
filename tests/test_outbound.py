@@ -41,6 +41,11 @@ def adapter() -> ChatlyticsAdapter:
                 "base_url": BASE_URL,
                 "api_key": API_KEY,
                 "account_id": "acct-1",
+                # P-19 (v4.1 carry-forward): /api/v1/send now requires a WAHA
+                # session. Provide one so the outbound tests exercise the
+                # success path; the session is asserted out-of-band where
+                # relevant.
+                "session": "3cf11776_logan",
             }
         )
     )

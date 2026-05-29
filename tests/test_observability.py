@@ -44,6 +44,8 @@ def _make_adapter() -> ChatlyticsAdapter:
                 "api_key": API_KEY,
                 "webhook_host": "127.0.0.1",
                 "webhook_port": 0,
+                # P-19 (v4.1 carry-forward): /api/v1/send requires a WAHA session.
+                "session": "3cf11776_logan",
             }
         )
     )

@@ -65,7 +65,7 @@ import httpx
 from aiohttp import web
 
 from .client import ChatlyticsClient, USER_AGENT
-from .inbound import make_health_handler, make_webhook_handler
+from .inbound import make_health_handler, make_webhook_handler, normalize_payload
 
 
 # HERMES-V2 (Phase 336): chatlytics v4.0 introduces per-bot bearer tokens
@@ -173,7 +173,7 @@ _CONTROL_CHARS: str = "".join(chr(i) for i in range(32)) + "\x7f"
 # a future contributor who adds a new top-level body field updates the
 # reserved-key check in lockstep instead of silently regressing the
 # 02-LOW-01 WARNING contract.
-_RESERVED_BODY_KEYS: frozenset = frozenset({"chatId", "text", "accountId", "replyTo"})
+_RESERVED_BODY_KEYS: frozenset = frozenset({"chatId", "text", "accountId", "replyTo", "session"})
 
 
 def _validate_webhook_path(path: Any) -> None:
@@ -398,6 +398,39 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         self.account_id: Optional[str] = (
             os.getenv("CHATLYTICS_ACCOUNT_ID") or extra.get("account_id")
         )
+        # P-19 fix (carried forward from hpg6's running tree): Chatlytics
+        # gateway's /api/v1/send REQUIRES `session` (the WAHA session name,
+        # e.g. "3cf11776_logan"). Without it the server returns 400
+        # "chatId and session are required" and every reply fails.
+        # Resolution order at send() time:
+        #   1. per-chat session recorded on inbound (webhook handler OR
+        #      longpoll consumer) via register_chat_session() — preferred,
+        #      works multi-tenant. The v4.1 longpoll InboundEnvelope ALWAYS
+        #      carries session_id, so longpoll deployments populate this map
+        #      on every inbound message.
+        #   2. self.session_name (env var / extra fallback for single-tenant
+        #      operator config; required for webhook deployments where the
+        #      chatlytics-server hermes transform does not forward `session`)
+        self.session_name: Optional[str] = (
+            os.getenv("CHATLYTICS_SESSION") or extra.get("session")
+        )
+        # Per-chat session map populated by inbound (webhook / longpoll).
+        # Bounded growth: each chat_id is a WhatsApp JID (under ~50 chars),
+        # collection naturally tracks active conversations only.
+        self._chat_session_map: Dict[str, str] = {}
+
+        # v4.1 longpoll consumer: asyncio.Task handle for the inbound poll
+        # loop, started in connect() when inbound_mode == "longpoll" and
+        # cancelled in disconnect(). None when in webhook mode (default).
+        self._poll_task: Optional[asyncio.Task] = None
+        # Inbound transport mode: "webhook" (default — PRESERVES the
+        # existing aiohttp webhook-server behavior for all deployments) or
+        # "longpoll" (v4.1 — PULL inbound via GET /api/v1/bot/updates).
+        self.inbound_mode: str = (
+            os.getenv("CHATLYTICS_INBOUND_MODE")
+            or extra.get("inbound_mode")
+            or "webhook"
+        ).strip().lower()
 
         # Webhook server settings (HERMES-03).
         self.webhook_host: str = (
@@ -475,6 +508,195 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         connected.
         """
         return self._client
+
+    # --- Session threading (P-19, carried forward) ------------------------
+
+    def register_chat_session(self, chat_id: str, session: str) -> None:
+        """Record the WAHA session name observed for ``chat_id`` on inbound.
+
+        Called by the inbound webhook handler (when a payload carries a
+        top-level ``session``) AND by the v4.1 longpoll consumer (every
+        InboundEnvelope carries ``session_id``). The mapping is read back in
+        :meth:`_resolve_session_for_chat` so the outbound ``/api/v1/send``
+        body includes the same WAHA session the message originated on
+        (required by the Chatlytics gateway since v3.x — without it the
+        server returns 400 "chatId and session are required").
+        """
+        if not chat_id or not session:
+            return
+        self._chat_session_map[chat_id] = session
+
+    def _resolve_session_for_chat(self, chat_id: str) -> Optional[str]:
+        """Return the best-known WAHA session name for ``chat_id``.
+
+        Order:
+            1. per-chat map populated by inbound (webhook / longpoll)
+            2. ``self.session_name`` (env var / extra config fallback)
+
+        Returns ``None`` if neither is available — the caller surfaces a
+        clear error so misconfigured adapters fail loudly at send() time
+        instead of silently dropping replies.
+        """
+        mapped = self._chat_session_map.get(chat_id)
+        if mapped:
+            return mapped
+        return self.session_name
+
+    # --- Longpoll inbound consumer (v4.1) ---------------------------------
+
+    async def _poll_loop(self) -> None:
+        """PULL inbound messages from chatlytics via long-poll.
+
+        Replaces the webhook PUSH transport when ``inbound_mode ==
+        "longpoll"``. Implements the chatlytics v4.0 bot-updates contract:
+
+        - ``GET  /api/v1/bot/updates?cursor=<opaque>&timeout_ms=25000``
+          long-polls (server clamps timeout <= 60000), returning
+          ``{envelopes: InboundEnvelope[], cursor: str}``.
+        - ``POST /api/v1/bot/updates/ack {cursor}`` advances the per-bot
+          read pointer. The GET does NOT advance it — envelopes re-deliver
+          until acked, so we ack AFTER processing every non-empty batch.
+
+        Error discipline (never let the loop die silently):
+          - httpx transport error / non-200: WARNING + exponential backoff
+            (1s -> cap 30s), then retry.
+          - 400 invalid_cursor: reset cursor to "" and continue.
+          - 401 bot_token_required: ERROR (token bad/revoked) + 30s backoff.
+          - asyncio.CancelledError: exit cleanly (disconnect()).
+        """
+        cursor: str = ""
+        backoff: float = 1.0
+        backoff_max: float = 30.0
+        logger.info(
+            "chatlytics inbound: longpoll loop started (polling /api/v1/bot/updates)"
+        )
+        while self._running:
+            client = self._client
+            if client is None:
+                # connect() always sets _client before starting the task,
+                # but guard defensively against a teardown race.
+                return
+            try:
+                resp = await client.get(
+                    "/api/v1/bot/updates",
+                    params={"cursor": cursor, "timeout_ms": 25000},
+                )
+            except asyncio.CancelledError:
+                raise
+            except httpx.RequestError as exc:
+                logger.warning(
+                    "longpoll GET transport error (%s); backing off %.1fs",
+                    exc,
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, backoff_max)
+                continue
+
+            if resp.status_code == 400:
+                # Bad/expired cursor — reset and re-poll from the tail.
+                logger.warning(
+                    "longpoll GET returned 400 (invalid_cursor); resetting cursor"
+                )
+                cursor = ""
+                continue
+            if resp.status_code == 401:
+                logger.error(
+                    "longpoll GET returned 401 (bot_token_required); the bot "
+                    "token is missing/invalid/revoked. Backing off 30s."
+                )
+                await asyncio.sleep(backoff_max)
+                continue
+            if resp.status_code != 200:
+                logger.warning(
+                    "longpoll GET returned HTTP %d; backing off %.1fs",
+                    resp.status_code,
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, backoff_max)
+                continue
+
+            # Successful poll — reset backoff.
+            backoff = 1.0
+            try:
+                data = resp.json()
+            except Exception:  # noqa: BLE001 -- JSONDecodeError + httpx variants
+                logger.warning("longpoll GET returned non-JSON body; skipping")
+                continue
+            if not isinstance(data, dict):
+                logger.warning("longpoll GET body was not a JSON object; skipping")
+                continue
+
+            envelopes = data.get("envelopes") or []
+            next_cursor = data.get("cursor", cursor)
+
+            if not envelopes:
+                # Timeout / empty batch: advance cursor to the returned
+                # value and re-poll. No ack needed for an empty batch.
+                cursor = next_cursor if isinstance(next_cursor, str) else cursor
+                continue
+
+            for env in envelopes:
+                try:
+                    await self._dispatch_envelope(env)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 -- one bad envelope must not
+                    # kill the loop or block the ack for the rest of the batch.
+                    logger.exception(
+                        "longpoll: failed to dispatch one envelope; continuing"
+                    )
+
+            # Advance + persist the read pointer. Ack AFTER processing so an
+            # in-flight crash re-delivers unprocessed envelopes.
+            if isinstance(next_cursor, str):
+                cursor = next_cursor
+            try:
+                await client.post(
+                    "/api/v1/bot/updates/ack", json={"cursor": cursor}
+                )
+            except asyncio.CancelledError:
+                raise
+            except httpx.RequestError as exc:
+                # Ack failed — envelopes will re-deliver on the next GET.
+                # Don't advance past them: keep cursor as-is and retry.
+                logger.warning(
+                    "longpoll ack POST transport error (%s); envelopes will "
+                    "re-deliver on next poll",
+                    exc,
+                )
+
+    async def _dispatch_envelope(self, env: Dict[str, Any]) -> None:
+        """Translate one InboundEnvelope -> MessageEvent and dispatch it.
+
+        InboundEnvelope shape (chatlytics v4.0 bot-updates contract)::
+
+            { bot_token, session_id, chat_type: "dm"|"group"|"newsletter",
+              entity_jid, sender_jid, text, dispatch:{reason,god_mode}, ts }
+
+        We reuse the existing :func:`inbound.normalize_payload` by building
+        the webhook-shaped ``body`` it already understands, then thread the
+        WAHA session via :meth:`register_chat_session` (every envelope
+        carries ``session_id``) so the outbound reply resolves the correct
+        session.
+        """
+        body = {
+            "chatId": env["entity_jid"],          # required by normalize_payload
+            "text": env.get("text", ""),
+            "senderId": env.get("sender_jid"),
+            "chatType": (
+                "channel"
+                if env.get("chat_type") == "newsletter"
+                else env.get("chat_type") or "dm"
+            ),
+            "session": env.get("session_id"),
+        }
+        # Thread the WAHA session BEFORE dispatch so the reply path resolves
+        # it. InboundEnvelope always carries session_id under longpoll.
+        self.register_chat_session(body["chatId"], body["session"])
+        event = normalize_payload(body, self.platform)
+        await self.handle_message(event)
 
     @property
     def is_bot_token(self) -> bool:
@@ -570,6 +792,21 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 f"{response.status_code}: {response.text[:200]}"
             )
 
+        # --- Inbound transport selection (v4.1) -----------------------
+        # longpoll mode (chatlytics v4.0 bot-updates): do NOT start the
+        # aiohttp webhook server; PULL inbound via GET /api/v1/bot/updates
+        # instead. webhook mode (default) keeps the existing PUSH server
+        # untouched so non-longpoll deployments are unaffected.
+        if self.inbound_mode == "longpoll":
+            self._running = True
+            # Idempotency: don't spawn a second poll task on re-connect.
+            if self._poll_task is None or self._poll_task.done():
+                self._poll_task = asyncio.create_task(self._poll_loop())
+            logger.info(
+                "chatlytics inbound: longpoll mode (polling /api/v1/bot/updates)"
+            )
+            return True
+
         # --- Inbound webhook server (HERMES-03) -----------------------
         # Idempotency guard: if a previous connect() already started the
         # aiohttp runner and a caller invokes connect() again without
@@ -629,6 +866,19 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         in-flight request handlers can issue further outbound calls
         through ``self._client``), then close the shared httpx client.
         """
+        # Stop accepting new inbound work before tearing down transports so
+        # the longpoll loop sees ``_running == False`` and exits its while.
+        self._running = False
+
+        # v4.1 longpoll: cancel the poll task first so no in-flight GET/ack
+        # uses ``self._client`` after we close it below.
+        if self._poll_task is not None:
+            logger.info("Stopping Chatlytics longpoll consumer")
+            self._poll_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._poll_task
+            self._poll_task = None
+
         if self._runner is not None:
             logger.info("Stopping Chatlytics webhook server")
             try:
@@ -642,8 +892,6 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             logger.info("Disconnecting from Chatlytics gateway")
             await self._client.aclose()
             self._client = None
-
-        self._running = False
 
     # --- Outbound (HERMES-02) ---------------------------------------------
 
@@ -671,6 +919,28 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             "chatId": chat_id,
             "text": content,
         }
+        # P-19 fix (carried forward): Chatlytics gateway's /api/v1/send
+        # REQUIRES `session` (the WAHA session name). Without it the server
+        # returns 400 "chatId and session are required" and the reply
+        # silently dies. Resolution: per-chat map populated by inbound
+        # (longpoll envelopes ALWAYS carry session_id; webhook payloads carry
+        # it when chatlytics forwards it) falling back to CHATLYTICS_SESSION.
+        session_name = self._resolve_session_for_chat(chat_id)
+        if session_name:
+            body["session"] = session_name
+        else:
+            # Fail loudly with an operator-actionable error instead of
+            # letting chatlytics return its generic 400.
+            return SendResult(
+                success=False,
+                error=(
+                    "Chatlytics adapter missing WAHA session for chat "
+                    f"{chat_id!r}: set CHATLYTICS_SESSION env var "
+                    "(e.g. 3cf11776_logan) or pass session= in the "
+                    "platform extra block. Inbound-derived session "
+                    "mapping is empty for this chat."
+                ),
+            )
         if self.account_id:
             body["accountId"] = self.account_id
         if reply_to:
@@ -1670,7 +1940,16 @@ def _make_tool_handler(ctx: Any, name: str, handler: Any) -> Any:
             adapter_inst = entry.get("adapter")
         return adapter_inst
 
-    async def _bound(**kwargs: Any) -> Dict[str, Any]:
+    async def _bound(args: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dict[str, Any]:
+        # HERMES-compat fix #2 (carried forward from hpg6's running tree):
+        # Hermes' tools.registry.dispatch calls ``entry.handler(args, **kwargs)``
+        # where ``args`` is the JSON args dict from the tool call. Merge it
+        # into kwargs so bare async handlers see the named params they
+        # expect. Fixes TypeError: _bound_chatlytics_*() takes 0
+        # positional arguments but 1 was given.
+        if args:
+            for _k, _v in args.items():
+                kwargs.setdefault(_k, _v)
         adapter_inst = _lookup_adapter()
         client = getattr(adapter_inst, "client", None) if adapter_inst else None
         if client is None:

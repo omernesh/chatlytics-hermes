@@ -204,6 +204,25 @@ def make_webhook_handler(adapter: Any) -> Callable[[web.Request], Any]:
             logger.warning("Rejecting webhook: %s", exc)
             return web.json_response({"error": str(exc)}, status=400)
 
+        # P-19 fix (carried forward): thread the WAHA `session` from the
+        # inbound webhook to the outbound /api/v1/send. The Chatlytics
+        # gateway requires `session` in the send body; without it every
+        # reply 400s with "chatId and session are required". We read it
+        # from the top-level payload (or raw_message.* aliases) and record
+        # it via register_chat_session so send() can resolve it.
+        try:
+            inbound_session = (
+                payload.get("session")
+                or payload.get("sessionName")
+                or payload.get("waha_session")
+            )
+            if isinstance(inbound_session, str) and inbound_session:
+                register = getattr(adapter, "register_chat_session", None)
+                if callable(register):
+                    register(event.source.chat_id, inbound_session)
+        except Exception:  # noqa: BLE001 -- never let session bookkeeping break dispatch
+            logger.debug("inbound session bookkeeping raised; continuing")
+
         try:
             await adapter.handle_message(event)
         except Exception:  # noqa: BLE001 -- never let dispatch errors crash the server

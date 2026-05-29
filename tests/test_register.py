@@ -150,10 +150,13 @@ def test_pyproject_declares_hermes_entry_point() -> None:
     data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
     entry_points = data["project"]["entry-points"]["hermes_agent.plugins"]
-    assert entry_points["chatlytics"] == "chatlytics_hermes:register"
+    # v4.1: bare-module entry point (Hermes-compat fix #1 carried forward
+    # from hpg6) — NOT the "chatlytics_hermes:register" colon form, which
+    # made Hermes' PluginManager fail to load the plugin.
+    assert entry_points["chatlytics"] == "chatlytics_hermes"
 
     project = data["project"]
-    assert project["version"] == "4.0.0"  # HERMES-V2 Phase 336 — v4.0 release.
+    assert project["version"] == "4.1.0"  # v4.1 — longpoll inbound consumer.
     assert project["name"] == "chatlytics-hermes"
 
     deps = project["dependencies"]

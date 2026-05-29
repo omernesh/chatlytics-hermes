@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chatlytics-hermes"
-version = "4.0.0"
+version = "4.1.0"
 description = "Production-grade WhatsApp for Hermes Agent — full upstream contract, 21 tools, every media type, per-bot bearer auth (chatlytics v4.0 Multi-Bot Platform)"
 license = {text = "MIT"}
 readme = "README.md"
@@ -33,7 +33,12 @@ dev = [
 ]
 
 [project.entry-points."hermes_agent.plugins"]
-chatlytics = "chatlytics_hermes:register"
+# Hermes' PluginManager imports the bare module and calls its module-level
+# register(ctx). Must be the bare module path, NOT "chatlytics_hermes:register"
+# (the colon form makes Hermes try to import an attribute named ``register``
+# as a submodule and the plugin silently fails to load). Carried forward from
+# hpg6's running tree (HERMES-compat fix #1).
+chatlytics = "chatlytics_hermes"
 
 [project.urls]
 Homepage = "https://github.com/omernesh/chatlytics-hermes"
