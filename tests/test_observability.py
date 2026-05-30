@@ -18,6 +18,7 @@ v2.0 audit lows:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any, Dict
 
@@ -218,8 +219,9 @@ async def test_make_tool_handler_logs_get_platform_failure_at_debug(
         result = await wrapped()
 
     # The handler should fall through to the "not connected" branch
-    # because no adapter is resolvable.
-    assert result["success"] is False
+    # because no adapter is resolvable. _bound now serializes its result to
+    # a JSON string (DeepSeek strict-content requirement), so parse first.
+    assert json.loads(result)["success"] is False
 
     debugs = [
         r for r in caplog.records
