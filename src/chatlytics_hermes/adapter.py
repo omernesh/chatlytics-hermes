@@ -55,6 +55,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import json
 import logging
 import mimetypes
 import os
@@ -1957,7 +1958,7 @@ def _make_tool_handler(ctx: Any, name: str, handler: Any) -> Any:
             adapter_inst = entry.get("adapter")
         return adapter_inst
 
-    async def _bound(args: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dict[str, Any]:
+    async def _bound(args: Optional[Dict[str, Any]] = None, **kwargs: Any) -> str:
         # HERMES-compat fix #2 (carried forward from hpg6's running tree):
         # Hermes' tools.registry.dispatch calls ``entry.handler(args, **kwargs)``
         # where ``args`` is the JSON args dict from the tool call. Merge it
@@ -1970,16 +1971,34 @@ def _make_tool_handler(ctx: Any, name: str, handler: Any) -> Any:
         adapter_inst = _lookup_adapter()
         client = getattr(adapter_inst, "client", None) if adapter_inst else None
         if client is None:
-            return {
+            result: Any = {
                 "success": False,
                 "error": (
                     f"Chatlytics tool '{name}' invoked but the adapter is "
                     "not connected; ensure 'hermes gateway start' has run."
                 ),
             }
-        if needs_adapter:
-            return await handler(client, adapter=adapter_inst, **kwargs)
-        return await handler(client, **kwargs)
+        elif needs_adapter:
+            result = await handler(client, adapter=adapter_inst, **kwargs)
+        else:
+            result = await handler(client, **kwargs)
+
+        # DeepSeek (and other strict OpenAI-compatible providers) reject a
+        # role:tool message whose ``content`` is a raw object, erroring
+        # ``messages[N]: content should be a string or a list``. OpenAI
+        # tolerates a dict; DeepSeek does not. Hermes' tool_executor passes
+        # our return value straight into the tool-result message content
+        # (and its own _detect_tool_failure does safe_json_loads() on it,
+        # i.e. it already EXPECTS a JSON string), so serialize the canonical
+        # dict here. Strings pass through untouched; dict/list/other get
+        # json.dumps'd so content is always a valid type.
+        if isinstance(result, str):
+            return result
+        try:
+            return json.dumps(result, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            # Never hand back a non-string and re-trigger the 400.
+            return str(result)
 
     _bound.__name__ = f"_bound_{name}"
     _bound.__qualname__ = f"_bound_{name}"
@@ -2049,4 +2068,10 @@ def register(ctx: Any) -> None:
                 toolset="chatlytics",
                 schema=tool_schema,
                 handler=_make_tool_handler(ctx, tool_name, tool_handler),
+                # Every TOOLS handler (and the _bound closure wrapping it) is
+                # `async def`. Without is_async=True the Hermes tools.registry
+                # treats the handler as sync, never awaits it, and
+                # tool_executor.py does len(coroutine) -> "TypeError: object
+                # of type coroutine has no len()" on the first tool call.
+                is_async=True,
             )
