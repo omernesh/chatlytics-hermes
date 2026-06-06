@@ -17,6 +17,36 @@ from __future__ import annotations
 
 import pytest
 
+# Env vars the adapter resolves via os.getenv() — see ChatlyticsAdapter
+# _auth_token precedence and _standalone_send.
+_CHATLYTICS_ENV_VARS = (
+    "CHATLYTICS_BOT_TOKEN",
+    "CHATLYTICS_API_KEY",
+    "CHATLYTICS_BASE_URL",
+    "CHATLYTICS_HOME_CHANNEL",
+    "CHATLYTICS_ACCOUNT_ID",
+    "CHATLYTICS_SESSION",
+    "CHATLYTICS_WEBHOOK_PORT",
+    "CHATLYTICS_WEBHOOK_SECRET",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_chatlytics_env(monkeypatch):
+    """Hermetic env: clear ambient ``CHATLYTICS_*`` before every test.
+
+    Closes review LOW-01 (test env isolation). Without this, a developer
+    running the suite with a real operator credential exported for the live
+    MCP (``CHATLYTICS_API_KEY`` / ``CHATLYTICS_BOT_TOKEN``) leaks it into the
+    adapter's ``os.getenv``-based ``_auth_token`` resolution — shadowing a
+    fixture's ``extra.api_key`` and failing the Bearer-header assertions in
+    test_outbound / test_media with the live key instead of the test key.
+    Tests that need a credential ``monkeypatch.setenv`` it themselves after
+    this autouse fixture has run.
+    """
+    for var in _CHATLYTICS_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _register_chatlytics_platform():
