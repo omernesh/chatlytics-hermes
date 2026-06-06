@@ -1,5 +1,35 @@
 # Changelog
 
+## [4.1.2] - 2026-06-06
+
+Token-only onboarding. The minimal setup is now a single secret —
+`CHATLYTICS_BOT_TOKEN`. The gateway URL defaults to
+`https://node.chatlytics.ai`, so `CHATLYTICS_BASE_URL` is optional.
+
+### Changed
+
+- **`base_url` now defaults to `https://node.chatlytics.ai`** and is
+  optional. Resolution: env `CHATLYTICS_BASE_URL` → config `extra.base_url`
+  → DNS default. Applies to the adapter (`ChatlyticsAdapter.base_url`), the
+  standalone cron send path (`_standalone_send`), and `ChatlyticsClient`
+  (constructor `base_url` now defaults instead of raising on omission — only
+  an explicitly-passed empty string still raises).
+- **`CHATLYTICS_BASE_URL` removed from `required_env`** (adapter
+  `register()`) and moved from `requires_env` to `optional_env` in
+  `plugin.yaml`. `CHATLYTICS_BOT_TOKEN` is now the sole required field; the
+  one-of auth requirement (BOT_TOKEN or API_KEY) stays enforced at
+  `connect()` time.
+- **`USER_AGENT`** bumped to `chatlytics-hermes/4.1.2`.
+
+### Fixed
+
+- **Dependency-pin downgrade landmine (critical).** `hermes-agent` pin
+  widened from `>=0.14,<0.15` to `>=0.14,<1.0`. The old `<0.15` upper bound
+  EXCLUDED the live 0.15.x host, so `pip install`-ing the adapter silently
+  **downgraded** Hermes. The adapter imports and runs on 0.15.x; the
+  `<0.15`-vs-`<1.0` regression is now guarded by a test in
+  `tests/test_register.py`.
+
 ## [4.1.1] - 2026-05-29
 
 ### Fixed

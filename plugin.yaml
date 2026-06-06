@@ -1,27 +1,27 @@
 name: chatlytics
 label: Chatlytics WhatsApp
 kind: platform
-version: "4.0.0"
+version: "4.1.2"
 description: >
   Chatlytics WhatsApp gateway adapter for Hermes Agent. Connects Hermes to
   Chatlytics's REST API for inbound webhooks and outbound messages/media.
-  v4.0 aligns with the chatlytics Multi-Bot Platform milestone — each
-  Hermes profile maps 1:1 to a chatlytics bot via CHATLYTICS_BOT_TOKEN.
+  v4.1.2 enables token-only onboarding — base_url defaults to
+  https://node.chatlytics.ai, so only CHATLYTICS_BOT_TOKEN is required.
 author: Chatlytics
 
 # ``requires_env`` entries are surfaced in ``hermes config`` UI via the
 # platform-plugin env var injector in ``hermes_cli/config.py``.
 requires_env:
-  - name: CHATLYTICS_BASE_URL
-    description: "Chatlytics gateway base URL (e.g. https://gateway.chatlytics.ai)"
-    prompt: "Chatlytics base URL"
-    password: false
   - name: CHATLYTICS_BOT_TOKEN
-    description: "Per-bot bearer token (sk_bot_...) issued by `chatlytics bots create`. Preferred over CHATLYTICS_API_KEY in plugin v4.0+."
+    description: "Per-bot bearer token (sk_bot_...) issued by `chatlytics bots create`. Preferred over CHATLYTICS_API_KEY in plugin v4.0+. The only required setting under v4.1 token-only onboarding."
     prompt: "Chatlytics bot token (sk_bot_...)"
     password: true
 
 optional_env:
+  - name: CHATLYTICS_BASE_URL
+    description: "Chatlytics gateway base URL. Optional in v4.1 — defaults to https://node.chatlytics.ai. Override only to self-host or target a non-default node."
+    prompt: "Chatlytics base URL (optional)"
+    password: false
   - name: CHATLYTICS_API_KEY
     description: "DEPRECATED in plugin v4.0 — use CHATLYTICS_BOT_TOKEN. Operator/admin bearer (legacy v3.37 contract). Retained as one-minor-cycle fallback for migration."
     prompt: "Chatlytics API key (legacy)"

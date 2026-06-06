@@ -18,9 +18,9 @@ import httpx
 logger = logging.getLogger("chatlytics_hermes.client")
 
 DEFAULT_TIMEOUT_SECONDS: float = 30.0
-# HERMES-V2 (Phase 336): User-Agent tracks the package version (4.0.0 ships
-# with the bot_token plugin). Previously stuck at 2.0.0 since v2 release.
-USER_AGENT: str = "chatlytics-hermes/4.0.0"
+# HERMES-V2 (Phase 336): User-Agent tracks the package version (4.1.2 ships
+# DNS-default base_url + optional URL). Previously stuck at 2.0.0 since v2 release.
+USER_AGENT: str = "chatlytics-hermes/4.1.2"
 
 
 class ChatlyticsClient:
@@ -28,12 +28,17 @@ class ChatlyticsClient:
 
     def __init__(
         self,
-        base_url: str,
-        api_key: str,
+        base_url: str = "https://node.chatlytics.ai",
+        api_key: str = "",
         *,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         user_agent: str = USER_AGENT,
     ) -> None:
+        # v4.1.0: base_url defaults to the public DNS name for token-only
+        # onboarding. An omitted/None URL falls back to the default; only an
+        # explicitly-passed empty string still raises.
+        if base_url is None:
+            base_url = "https://node.chatlytics.ai"
         if not base_url:
             raise ValueError("ChatlyticsClient requires a non-empty base_url")
         if not api_key:

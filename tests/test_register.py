@@ -61,7 +61,10 @@ def test_register_adds_chatlytics_platform() -> None:
     assert entry["name"] == "chatlytics"
     assert entry["label"] == "Chatlytics WhatsApp"
     assert callable(entry["adapter_factory"])
-    assert entry["required_env"] == ["CHATLYTICS_BASE_URL", "CHATLYTICS_API_KEY"]
+    # v4.1.0: base_url is optional (DNS default) and the auth token is a
+    # "one-of" (BOT_TOKEN or API_KEY) enforced at connect() time, so
+    # required_env is empty. See adapter._auth_token guard.
+    assert entry["required_env"] == []
     assert entry["install_hint"].startswith("pip install")
     assert "platform_hint" in entry
     hint = entry["platform_hint"]
@@ -113,21 +116,27 @@ def test_plugin_yaml_is_valid() -> None:
     HERMES-V2 (Phase 336): in plugin v4.0 the required-env set changed —
     ``CHATLYTICS_BOT_TOKEN`` (per-bot bearer) is the new required field;
     ``CHATLYTICS_API_KEY`` moved to optional_env as a deprecated fallback.
+
+    v4.1.2: ``CHATLYTICS_BASE_URL`` moved to optional_env (defaults to
+    https://node.chatlytics.ai) — ``CHATLYTICS_BOT_TOKEN`` is now the SOLE
+    required field (token-only onboarding).
     """
     manifest = yaml.safe_load((REPO_ROOT / "plugin.yaml").read_text(encoding="utf-8"))
 
     assert manifest["name"] == "chatlytics"
     assert manifest["kind"] == "platform"
-    assert manifest["version"] == "4.0.0"
+    assert manifest["version"] == "4.1.2"
 
     required = {entry["name"] for entry in manifest["requires_env"]}
-    assert required == {"CHATLYTICS_BASE_URL", "CHATLYTICS_BOT_TOKEN"}
+    assert required == {"CHATLYTICS_BOT_TOKEN"}
 
     # Optional env should include the webhook + cron knobs that later
     # phases consume.  Asserting the set keeps the manifest honest.
     # HERMES-V2: CHATLYTICS_API_KEY is now optional (deprecated fallback).
+    # v4.1.0: CHATLYTICS_BASE_URL is now optional (DNS default).
     optional = {entry["name"] for entry in manifest["optional_env"]}
     assert {
+        "CHATLYTICS_BASE_URL",
         "CHATLYTICS_API_KEY",
         "CHATLYTICS_ACCOUNT_ID",
         "CHATLYTICS_WEBHOOK_PORT",
@@ -156,13 +165,22 @@ def test_pyproject_declares_hermes_entry_point() -> None:
     assert entry_points["chatlytics"] == "chatlytics_hermes"
 
     project = data["project"]
-    assert project["version"] == "4.1.0"  # v4.1 — longpoll inbound consumer.
+    assert project["version"] == "4.1.2"  # v4.1.2 — token-only onboarding.
     assert project["name"] == "chatlytics-hermes"
 
     deps = project["dependencies"]
-    assert any(dep.startswith("hermes-agent>=0.14") for dep in deps), (
-        "hermes-agent must be pinned to >=0.14,<0.15 per ROADMAP"
+    hermes_dep = next(dep for dep in deps if dep.startswith("hermes-agent"))
+    assert hermes_dep.startswith("hermes-agent>=0.14"), (
+        "hermes-agent must be pinned to >=0.14"
     )
+    # v4.1.0 pin-downgrade fix: the upper bound MUST NOT exclude the live
+    # 0.15.x host. The old `<0.15` bound silently downgraded Hermes on
+    # install — guard against any regression to a sub-1.0 ceiling.
+    assert "<0.15" not in hermes_dep, (
+        "hermes-agent upper bound must not be <0.15 (excludes the live "
+        "0.15.x host and downgrades it on install)"
+    )
+    assert "<1.0" in hermes_dep
     assert any(dep.startswith("httpx>=0.27") for dep in deps)
     assert any(dep.startswith("aiohttp>=3.9") for dep in deps)
     assert all(not dep.startswith("flask") for dep in deps), (

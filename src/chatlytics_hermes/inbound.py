@@ -65,7 +65,7 @@ def _derive_message_type(payload: Dict[str, Any]) -> "MessageType":
     """
     if MessageType is None:
         raise RuntimeError(
-            "hermes-agent>=0.14,<0.15 is required for inbound normalization"
+            "hermes-agent>=0.14,<1.0 is required for inbound normalization"
         )
     media_type = (payload.get("mediaType") or "").strip().lower()
     member_name = _MEDIA_TYPE_MAP.get(media_type)
@@ -99,7 +99,7 @@ def normalize_payload(
     """
     if not _HERMES_AVAILABLE:
         raise RuntimeError(
-            "hermes-agent>=0.14,<0.15 is required for inbound normalization"
+            "hermes-agent>=0.14,<1.0 is required for inbound normalization"
         )
 
     chat_id = str(body.get("chatId") or "")

@@ -375,9 +375,9 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
     def __init__(self, config: "PlatformConfig", **kwargs: Any) -> None:
         if not _HERMES_AVAILABLE:
             raise RuntimeError(
-                "hermes-agent>=0.14,<0.15 must be installed to instantiate "
+                "hermes-agent>=0.14,<1.0 must be installed to instantiate "
                 "ChatlyticsAdapter. Install with: "
-                "pip install 'hermes-agent>=0.14,<0.15'"
+                "pip install 'hermes-agent>=0.14,<1.0'"
             )
 
         super().__init__(config=config, platform=Platform("chatlytics"))
@@ -385,7 +385,15 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         extra: Dict[str, Any] = getattr(config, "extra", {}) or {}
 
         # Connection settings (env vars override config.yaml ``extra`` block).
-        self.base_url: str = os.getenv("CHATLYTICS_BASE_URL") or extra.get("base_url", "")
+        # v4.1.0: base_url defaults to the public DNS name so token-only
+        # onboarding works with no URL set. Env var > config.yaml extra >
+        # DNS default. An explicit empty value in either source still falls
+        # through to the default.
+        self.base_url: str = (
+            os.getenv("CHATLYTICS_BASE_URL")
+            or extra.get("base_url")
+            or "https://node.chatlytics.ai"
+        )
         # HERMES-V2 (Phase 336): bot_token is the PREFERRED auth mechanism in
         # chatlytics v4.0. Falls back to api_key (legacy) when bot_token is
         # absent. Resolution precedence (highest first):
@@ -1836,15 +1844,16 @@ async def _standalone_send(text: str, **kwargs: Any) -> Dict[str, Any]:
     cron call shape (e.g. ``thread_id``, ``media_files``); none are
     currently meaningful for the basic Chatlytics text-send path.
     """
-    base_url = (os.getenv("CHATLYTICS_BASE_URL") or "").strip()
+    # v4.1.0: base_url defaults to the public DNS name (token-only onboarding).
+    base_url = (os.getenv("CHATLYTICS_BASE_URL") or "").strip() or "https://node.chatlytics.ai"
     api_key = (os.getenv("CHATLYTICS_API_KEY") or "").strip()
     home_channel = (os.getenv("CHATLYTICS_HOME_CHANNEL") or "").strip()
 
-    if not (base_url and api_key and home_channel):
+    if not (api_key and home_channel):
         return {
             "error": (
-                "Chatlytics standalone send: CHATLYTICS_BASE_URL, "
-                "CHATLYTICS_API_KEY, and CHATLYTICS_HOME_CHANNEL must all be set"
+                "Chatlytics standalone send: CHATLYTICS_API_KEY and "
+                "CHATLYTICS_HOME_CHANNEL must both be set"
             ),
         }
 
@@ -2026,7 +2035,12 @@ def register(ctx: Any) -> None:
         # all declared in pyproject; by the time register() runs, the
         # import path has succeeded so returning True is honest.
         check_fn=lambda: True,
-        required_env=["CHATLYTICS_BASE_URL", "CHATLYTICS_API_KEY"],
+        # v4.1.0: base_url is optional (defaults to https://node.chatlytics.ai),
+        # so it is no longer in required_env. An auth token IS still required,
+        # but it can be CHATLYTICS_BOT_TOKEN (preferred) OR CHATLYTICS_API_KEY
+        # (legacy) -- a "one-of" that required_env can't express -- so the
+        # token check is enforced at connect() time (see _auth_token guard).
+        required_env=[],
         install_hint=(
             "pip install -e git+https://github.com/omernesh/chatlytics-hermes.git"
         ),

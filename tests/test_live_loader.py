@@ -147,9 +147,11 @@ async def test_loader_registers_chatlytics_platform() -> None:
     assert call["name"] == "chatlytics"
     assert callable(call["adapter_factory"])
     assert callable(call["check_fn"]) and call["check_fn"]() is True
+    # v4.1.0: base_url is optional (DNS default) and the auth token is a
+    # one-of (BOT_TOKEN or API_KEY) checked at connect() time, so
+    # required_env is now empty.
     required = call.get("required_env") or []
-    assert "CHATLYTICS_BASE_URL" in required
-    assert "CHATLYTICS_API_KEY" in required
+    assert required == []
     assert call.get("cron_deliver_env_var") == "CHATLYTICS_HOME_CHANNEL"
     assert callable(call.get("standalone_sender_fn"))
 

@@ -47,11 +47,42 @@ entry-point group.
 
 ## Status
 
-**Stable v4.0.0 release.** Requires `hermes-agent>=0.14,<0.15`.
+**Stable v4.1.2 release.** Requires `hermes-agent>=0.14,<1.0` (verified on
+0.14.x and 0.15.x — installing the adapter no longer downgrades a 0.15 host).
 
 `hermes-agent` v0.14 is not yet on PyPI; install it from the GitHub tag
-`v2026.5.16` (see [Install](#install) below). When v0.14 ships to PyPI the
+`v2026.5.16` (see [Install](#install) below). When it ships to PyPI the
 install line simplifies to a plain `pip install hermes-agent>=0.14`.
+
+## What's new in v4.1.2
+
+**Token-only onboarding.** The minimal setup is now a single secret. Set
+`CHATLYTICS_BOT_TOKEN` (your `sk_bot_...` bearer) and nothing else — the
+gateway URL defaults to `https://node.chatlytics.ai`.
+
+- **`base_url` is now optional** and defaults to `https://node.chatlytics.ai`.
+  Override it only if you self-host or point at a non-default node. Removed
+  from `required_env`; resolution is env `CHATLYTICS_BASE_URL` → config
+  `extra.base_url` → DNS default.
+- **Auth is still required** — `CHATLYTICS_BOT_TOKEN` (preferred) or
+  `CHATLYTICS_API_KEY` (legacy fallback). Enforced at `connect()` time with a
+  single clear error if neither is set.
+- **Dependency-pin fix (critical):** the `hermes-agent` requirement widened
+  from `>=0.14,<0.15` to `>=0.14,<1.0`. The old upper bound excluded the live
+  0.15.x host, so installing the adapter would silently **downgrade** Hermes.
+  v4.1.2 runs cleanly on 0.15.x.
+
+> The v4.1 **longpoll inbound** transport (PULL via `GET /api/v1/bot/updates`)
+> is documented under [Configuration → Longpoll inbound](#longpoll-inbound-v41).
+
+### Minimal setup
+
+```bash
+export CHATLYTICS_BOT_TOKEN="sk_bot_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+hermes gateway start
+```
+
+That's it — `base_url` defaults to `https://node.chatlytics.ai`.
 
 ## What's new in v4.0
 
@@ -184,12 +215,17 @@ pip install -e ".[dev]"
 Configure the plugin via environment variables (preferred) or a YAML config
 block (`hermes config edit`).
 
+The only required setting is an auth token. Set `CHATLYTICS_BOT_TOKEN`
+(preferred) and every other variable has a sane default — `base_url` resolves
+to `https://node.chatlytics.ai`.
+
 ### Environment variables
 
 | Variable                      | Required | Description                                                                       |
 | ----------------------------- | -------- | --------------------------------------------------------------------------------- |
-| `CHATLYTICS_BASE_URL`         | yes      | Chatlytics gateway base URL (e.g. `https://gateway.chatlytics.ai`)                |
-| `CHATLYTICS_API_KEY`          | yes      | Bearer token for REST authentication                                              |
+| `CHATLYTICS_BOT_TOKEN`        | yes\*    | Per-bot bearer (`sk_bot_...`). **Preferred auth.** \*One of BOT_TOKEN or API_KEY is required. |
+| `CHATLYTICS_API_KEY`          | yes\*    | Legacy operator bearer. Fallback when `CHATLYTICS_BOT_TOKEN` is unset.            |
+| `CHATLYTICS_BASE_URL`         | no       | Chatlytics gateway base URL. Defaults to `https://node.chatlytics.ai`. Override only to self-host or target a non-default node. |
 | `CHATLYTICS_ACCOUNT_ID`       | no       | Default session/account ID for outbound sends                                     |
 | `CHATLYTICS_WEBHOOK_PORT`     | no       | Local port for the aiohttp inbound webhook listener (default: `8765`)             |
 | `CHATLYTICS_WEBHOOK_SECRET`   | no       | HMAC-SHA256 shared secret for `X-Chatlytics-Signature` verification               |
@@ -272,8 +308,10 @@ platforms:
   chatlytics:
     enabled: true
     extra:
-      base_url: https://gateway.chatlytics.ai
-      api_key: ${CHATLYTICS_API_KEY}
+      # bot_token is the preferred auth; base_url is optional and defaults
+      # to https://node.chatlytics.ai when omitted.
+      bot_token: ${CHATLYTICS_BOT_TOKEN}
+      # base_url: https://node.chatlytics.ai   # optional override
       account_id: 3cf11776_logan
       webhook_port: 8765
       home_channel: "120363100000000000@g.us"
