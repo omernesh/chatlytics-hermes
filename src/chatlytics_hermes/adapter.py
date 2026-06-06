@@ -1846,19 +1846,29 @@ async def _standalone_send(text: str, **kwargs: Any) -> Dict[str, Any]:
     """
     # v4.1.0: base_url defaults to the public DNS name (token-only onboarding).
     base_url = (os.getenv("CHATLYTICS_BASE_URL") or "").strip() or "https://node.chatlytics.ai"
-    api_key = (os.getenv("CHATLYTICS_API_KEY") or "").strip()
+    # v4.1.3 (MD-01 close): prefer the per-bot CHATLYTICS_BOT_TOKEN (sk_bot_*)
+    # over the legacy operator CHATLYTICS_API_KEY — mirrors ChatlyticsAdapter's
+    # _auth_token precedence (HERMES-V2 / Phase 336). Without this, token-only
+    # cron deployments silently no-sent: the gateway's /api/v1/send rejects an
+    # absent/empty Bearer, and the env-config guard below tripped on a missing
+    # api_key even when a valid bot token was present.
+    auth_token = (
+        (os.getenv("CHATLYTICS_BOT_TOKEN") or "").strip()
+        or (os.getenv("CHATLYTICS_API_KEY") or "").strip()
+    )
     home_channel = (os.getenv("CHATLYTICS_HOME_CHANNEL") or "").strip()
 
-    if not (api_key and home_channel):
+    if not (auth_token and home_channel):
         return {
             "error": (
-                "Chatlytics standalone send: CHATLYTICS_API_KEY and "
-                "CHATLYTICS_HOME_CHANNEL must both be set"
+                "Chatlytics standalone send: a credential "
+                "(CHATLYTICS_BOT_TOKEN preferred, or legacy CHATLYTICS_API_KEY) "
+                "and CHATLYTICS_HOME_CHANNEL must both be set"
             ),
         }
 
     headers = {
-        "Authorization": f"Bearer {api_key}",
+        "Authorization": f"Bearer {auth_token}",
         "User-Agent": USER_AGENT,
         "Accept": "application/json",
     }

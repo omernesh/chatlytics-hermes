@@ -1,5 +1,20 @@
 # Changelog
 
+## [4.1.3] - 2026-06-06
+
+### Fixed
+
+- **Cron sender (`_standalone_send`) now prefers `CHATLYTICS_BOT_TOKEN`** over
+  the legacy `CHATLYTICS_API_KEY`, mirroring `ChatlyticsAdapter`'s `_auth_token`
+  precedence (HERMES-V2 / Phase 336). Closes the v4.1.2 MD-01 review finding:
+  a token-only cron deployment (`sk_bot_*` set, `api_key` absent) previously
+  no-sent silently — the env-config guard tripped on the missing `api_key` even
+  with a valid bot token present, and the gateway's `/api/v1/send` rejects an
+  empty Bearer. The credential guard + error message now name `BOT_TOKEN` first.
+- Added `test_standalone_send_prefers_bot_token_over_api_key` and
+  `test_standalone_send_bot_token_only`; isolated existing cron tests from a
+  stray `CHATLYTICS_BOT_TOKEN` in the ambient env.
+
 ## [4.1.2] - 2026-06-06
 
 Token-only onboarding. The minimal setup is now a single secret —

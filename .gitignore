@@ -14,3 +14,7 @@ venv/
 
 # Pytest cache
 .pytest_cache/
+
+# internal tooling (never publish)
+.claude/
+.qmd-memory/
