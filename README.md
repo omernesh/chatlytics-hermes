@@ -210,6 +210,25 @@ pip install "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git
 pip install -e ".[dev]"
 ```
 
+### Install as a Hermes directory plugin (recommended — survives updates)
+
+A `pip install` lands the plugin in the gateway venv's `site-packages`, which a
+hermes-agent update wipes (`setup-hermes.sh` runs `rm -rf venv`). To install it
+durably, use the Hermes directory-plugin channel instead:
+
+```bash
+hermes plugins install omernesh/chatlytics-hermes   # clones the repo root → $HERMES_HOME/plugins/chatlytics/
+hermes plugins enable chatlytics
+```
+
+Then set `CHATLYTICS_BOT_TOKEN` (optionally `CHATLYTICS_BASE_URL`, default
+`https://node.chatlytics.ai`) and restart the gateway.
+
+Directory plugins live under `$HERMES_HOME/plugins/`, not the venv, so this
+install **survives hermes-agent updates** — unlike `pip install`. Each
+per-profile gateway has its own `$HERMES_HOME/plugins/`, so install and enable
+the plugin once per profile.
+
 ## Configuration
 
 Configure the plugin via environment variables (preferred) or a YAML config

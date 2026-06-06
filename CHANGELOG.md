@@ -1,5 +1,23 @@
 # Changelog
 
+## [4.1.4] - 2026-06-06
+
+### Changed
+
+- **Ship as a Hermes user _directory plugin_.** Added a repo-root `__init__.py`
+  shim so the repository root is loadable directly via
+  `hermes plugins install omernesh/chatlytics-hermes` (clones the repo root into
+  `$HERMES_HOME/plugins/chatlytics/`). Hermes imports the root `__init__.py` as
+  `hermes_plugins.chatlytics` and calls `register(ctx)`; the shim prepends the
+  bundled `src/` to `sys.path` and re-exports `register` + `__version__` from
+  `chatlytics_hermes`. Because directory plugins live under
+  `$HERMES_HOME/plugins/` (not the venv `site-packages`), the plugin now
+  **survives hermes-agent updates** — `setup-hermes.sh`'s `rm -rf venv` no
+  longer wipes it. The pip entry-point install is retained for back-compat.
+  Pinned `[tool.setuptools]` `packages` / `package-dir` explicitly so the new
+  root `__init__.py` does not trip setuptools flat-layout auto-discovery.
+  No runtime / behavior change.
+
 ## [4.1.3] - 2026-06-06
 
 ### Fixed

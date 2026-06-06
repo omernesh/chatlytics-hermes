@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chatlytics-hermes"
-version = "4.1.3"
+version = "4.1.4"
 description = "Production-grade WhatsApp for Hermes Agent — full upstream contract, 21 tools, every media type, per-bot bearer auth (chatlytics v4.0 Multi-Bot Platform)"
 license = {text = "MIT"}
 readme = "README.md"
@@ -44,8 +44,14 @@ chatlytics = "chatlytics_hermes"
 Homepage = "https://github.com/omernesh/chatlytics-hermes"
 Repository = "https://github.com/omernesh/chatlytics-hermes"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools]
+# Pin the package explicitly so the root ``__init__.py`` (the Hermes
+# directory-plugin shim — see repo-root ``__init__.py``) does NOT trip
+# setuptools flat-layout auto-discovery ("Multiple top-level packages
+# discovered" / treating the repo root as a flat-layout package). Only the
+# bundled ``chatlytics_hermes`` package under ``src/`` is built/installed.
+package-dir = {"" = "src"}
+packages = ["chatlytics_hermes"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
