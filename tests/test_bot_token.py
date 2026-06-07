@@ -145,13 +145,19 @@ async def test_api_key_fallback_when_no_bot_token(
         await adapter.disconnect()
 
 
-# --- Test 5: connect() fails cleanly when neither token is present ------
+# --- Test 5: connect() loads degraded when neither token is present ----
+# v4.1.5 (telegram-style onboarding) BEHAVIOR CHANGE: connect() previously
+# RAISED ChatlyticsConnectError when no token was set. It now TOLERATES a
+# missing token — loads in a degraded "no-credential" state (sets
+# _no_credential, warns, returns True) so the platform registers and tools
+# can prompt the user for a token on first use. The hard-fail contract is
+# intentionally gone; data tools surface NO_TOKEN_PROMPT instead.
 
 @pytest.mark.asyncio
-async def test_connect_fails_when_neither_token_present(
+async def test_connect_loads_degraded_when_neither_token_present(
     clean_env: pytest.MonkeyPatch,
 ) -> None:
-    """No auth at all — adapter instantiates, connect() raises clearly."""
+    """No auth at all — adapter instantiates and connect() loads degraded."""
     # Both env vars cleared by the clean_env fixture; extra has no token.
     adapter = ChatlyticsAdapter(
         FakePlatformConfig(extra={"base_url": BASE_URL})
@@ -159,12 +165,13 @@ async def test_connect_fails_when_neither_token_present(
 
     assert adapter._auth_token == ""
     assert adapter.is_bot_token is False
+    assert adapter._no_credential is False  # not set until connect()
 
-    with pytest.raises(ChatlyticsConnectError) as exc_info:
-        await adapter.connect()
+    # v4.1.5: connect() does NOT raise; it loads degraded.
+    result = await adapter.connect()
+    assert result is True
+    assert adapter._no_credential is True
+    assert adapter._client is None  # no authed client built
+    assert adapter.is_connected is True  # loaded-but-degraded, no crash
 
-    # Error message must name BOTH env vars so an operator knows their
-    # rollback option without grepping source.
-    msg = str(exc_info.value)
-    assert "CHATLYTICS_BOT_TOKEN" in msg
-    assert "CHATLYTICS_API_KEY" in msg
+    await adapter.disconnect()

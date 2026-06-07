@@ -43,12 +43,50 @@ from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 import httpx
 
-from .adapter import _coerce_success_payload
+from .adapter import NO_TOKEN_PROMPT, _coerce_success_payload
 from .client import ChatlyticsClient
 
 logger = logging.getLogger("chatlytics_hermes.tools")
 
 Handler = Callable[..., Awaitable[Dict[str, Any]]]
+
+
+# v4.1.5 (telegram-style onboarding): tools that MUST NOT be no-token-guarded.
+# These status/health tools should still report the degraded state rather than
+# return a get-a-token prompt — an operator running chatlytics_health on a
+# token-less gateway wants the health truth, not the onboarding nudge. Every
+# OTHER tool in TOOLS is a DATA tool that hits the authed API and is guarded.
+_NO_TOKEN_EXEMPT_TOOLS: frozenset = frozenset(
+    {"chatlytics_health", "chatlytics_login"}
+)
+
+
+def _no_token_failure() -> Dict[str, Any]:
+    """Canonical no-credential failure dict carrying NO_TOKEN_PROMPT.
+
+    v4.1.5 (telegram-style onboarding): returned by every agent-callable
+    DATA tool when the adapter loaded in the degraded no-credential state
+    (no CHATLYTICS_BOT_TOKEN). Matches the standard tool failure shape
+    (``{"success": False, "error": ...}``) so callers/relays treat it like
+    any other non-success return — the ``error`` string is the relayable
+    get-a-token guidance (Web UI + CLI routes).
+    """
+    return {"success": False, "error": NO_TOKEN_PROMPT}
+
+
+def _adapter_lacks_credential(adapter: Any) -> bool:
+    """True when ``adapter`` loaded WITHOUT a bot token (degraded state).
+
+    v4.1.5: the per-tool guard short-circuits on this so data tools never
+    issue an unauthenticated API call. Checks both the explicit
+    ``_no_credential`` flag (set by ``connect()``) and a falsy
+    ``_auth_token`` (defensive — covers a never-connected adapter).
+    """
+    if adapter is None:
+        return False
+    if getattr(adapter, "_no_credential", False):
+        return True
+    return not getattr(adapter, "_auth_token", "")
 
 
 # ---------------------------------------------------------------------------
@@ -776,6 +814,9 @@ async def chatlytics_send_image(
     """
     if adapter is None:
         return {"success": False, "error": "Media tools require a live adapter; ensure register() ran."}
+    # v4.1.5 (telegram-style onboarding): no-credential degraded state.
+    if _adapter_lacks_credential(adapter):
+        return _no_token_failure()
     resource = _resolve_resource(mediaUrl=mediaUrl, filePath=filePath)
     if not resource:
         return {"success": False, "error": "Either mediaUrl or filePath is required."}
@@ -794,6 +835,9 @@ async def chatlytics_send_voice(
 ) -> Dict[str, Any]:
     if adapter is None:
         return {"success": False, "error": "Media tools require a live adapter; ensure register() ran."}
+    # v4.1.5 (telegram-style onboarding): no-credential degraded state.
+    if _adapter_lacks_credential(adapter):
+        return _no_token_failure()
     resource = _resolve_resource(mediaUrl=mediaUrl, filePath=filePath)
     if not resource:
         return {"success": False, "error": "Either mediaUrl or filePath is required."}
@@ -812,6 +856,9 @@ async def chatlytics_send_video(
 ) -> Dict[str, Any]:
     if adapter is None:
         return {"success": False, "error": "Media tools require a live adapter; ensure register() ran."}
+    # v4.1.5 (telegram-style onboarding): no-credential degraded state.
+    if _adapter_lacks_credential(adapter):
+        return _no_token_failure()
     resource = _resolve_resource(mediaUrl=mediaUrl, filePath=filePath)
     if not resource:
         return {"success": False, "error": "Either mediaUrl or filePath is required."}
@@ -831,6 +878,9 @@ async def chatlytics_send_file(
 ) -> Dict[str, Any]:
     if adapter is None:
         return {"success": False, "error": "Media tools require a live adapter; ensure register() ran."}
+    # v4.1.5 (telegram-style onboarding): no-credential degraded state.
+    if _adapter_lacks_credential(adapter):
+        return _no_token_failure()
     resource = _resolve_resource(mediaUrl=mediaUrl, filePath=filePath)
     if not resource:
         return {"success": False, "error": "Either mediaUrl or filePath is required."}
@@ -851,6 +901,9 @@ async def chatlytics_send_animation(
 ) -> Dict[str, Any]:
     if adapter is None:
         return {"success": False, "error": "Media tools require a live adapter; ensure register() ran."}
+    # v4.1.5 (telegram-style onboarding): no-credential degraded state.
+    if _adapter_lacks_credential(adapter):
+        return _no_token_failure()
     resource = _resolve_resource(mediaUrl=mediaUrl, filePath=filePath)
     if not resource:
         return {"success": False, "error": "Either mediaUrl or filePath is required."}
@@ -1042,6 +1095,9 @@ async def chatlytics_get_chat_info(
             "error": "chatlytics_get_chat_info requires a live adapter",
             "_error": "unknown_error",
         }
+    # v4.1.5 (telegram-style onboarding): no-credential degraded state.
+    if _adapter_lacks_credential(adapter):
+        return _no_token_failure()
     try:
         chat = await adapter.get_chat_info(chatId)
     except ChatlyticsLookupError as exc:

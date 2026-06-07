@@ -80,6 +80,19 @@ from .inbound import make_health_handler, make_webhook_handler, normalize_payloa
 # CHATLYTICS_BOT_TOKEN row) — sk_bot_ prefix is the canonical shape.
 _BOT_TOKEN_PREFIX: str = "sk_bot_"
 
+# v4.1.5 (telegram-style onboarding): when NO bot token is configured the
+# adapter loads in a degraded "no-credential" state instead of hard-failing
+# at gateway boot. Every agent-callable DATA tool returns this relayable
+# get-a-token prompt so the user is guided to provision a token on first use.
+# DO NOT mention BotDaddy — that onboarding route is not live yet.
+NO_TOKEN_PROMPT = (
+    "⚠️ Chatlytics needs a bot token before it can send or read WhatsApp.\n\n"
+    "No CHATLYTICS_BOT_TOKEN is configured yet. Get one (it looks like `sk_bot_…`) either way:\n"
+    "  • Web UI — sign in at https://app.chatlytics.ai → Bots → Create Bot, then copy the token (shown only once).\n"
+    "  • CLI — `chatlytics bots create --session <your-session-id> --name <bot-name>` (needs an admin API key).\n\n"
+    "Then set CHATLYTICS_BOT_TOKEN in your gateway profile config/.env (or run `hermes config`) and restart the gateway."
+)
+
 # v4.1 longpoll hold: the chatlytics server HOLDS GET /api/v1/bot/updates for
 # up to this many ms before returning an empty {envelopes:[],cursor} batch.
 # The longpoll GET's httpx read timeout MUST comfortably exceed this hold or
@@ -413,6 +426,13 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # token shape (sk_bot_ prefix → resolveBotFromBearer; otherwise →
         # requirePublicApiAuth). Plugin stays agnostic to the gateway path.
         self._auth_token: str = self.bot_token or self.api_key
+        # v4.1.5 (telegram-style onboarding): degraded "no-credential" state.
+        # Set True by connect() when no auth token is configured. When True the
+        # adapter has loaded (platform registered, tools callable) but has NO
+        # authed client — every data tool short-circuits with NO_TOKEN_PROMPT
+        # instead of hitting the gateway. False on every token'd deployment, so
+        # the existing path is byte-for-byte unchanged when a token IS present.
+        self._no_credential: bool = False
         self.account_id: Optional[str] = (
             os.getenv("CHATLYTICS_ACCOUNT_ID") or extra.get("account_id")
         )
@@ -760,17 +780,32 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
            :class:`ChatlyticsConnectError` and tears down the httpx
            client so the next connect() retries from a clean slate.
         """
-        # HERMES-V2 (Phase 336): assert we have SOME auth token before
-        # attempting transport. Deferred from __init__ so registration-time
-        # env loading races don't crash adapter instantiation; failing here
-        # gives the operator a single clear error at gateway start.
+        # v4.1.5 (telegram-style onboarding): TOLERATE a missing auth token.
+        # Previously (HERMES-V2 / Phase 336) connect() hard-raised
+        # ChatlyticsConnectError when no token was set, which failed the whole
+        # gateway boot. Now we load in a degraded "no-credential" state: the
+        # platform registers and tools can run, but every data tool prompts the
+        # user to provision a token on first use (see NO_TOKEN_PROMPT + the
+        # tools.py per-tool guard + the send() guard below). When a token IS
+        # present this branch is skipped and the existing connect() path runs
+        # byte-for-byte unchanged.
         if not self._auth_token:
-            raise ChatlyticsConnectError(
-                "ChatlyticsAdapter requires either CHATLYTICS_BOT_TOKEN "
-                "(preferred, chatlytics v4.0+) or CHATLYTICS_API_KEY "
-                "(legacy). Neither is set in env or PlatformConfig.extra; "
-                "the adapter has no Bearer credential to send."
+            self._no_credential = True
+            # Do NOT build/validate the authed client or start any inbound
+            # transport — there is no credential to authenticate with. Mark the
+            # adapter as "loaded" so is_connected reflects loaded-but-degraded
+            # (it does NOT crash) and the platform stays registered.
+            self._running = True
+            logger.warning(
+                "chatlytics loaded WITHOUT a bot token — agent tools will "
+                "prompt the user for one on first use; set CHATLYTICS_BOT_TOKEN "
+                "to enable sending"
             )
+            return True
+
+        # A token IS present: clear any prior degraded flag (defensive against
+        # a reconnect after the operator set the token) and proceed normally.
+        self._no_credential = False
 
         if self._client is None:
             # ChatlyticsClient takes the resolved _auth_token regardless of
@@ -935,6 +970,14 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         the error in ``error`` and the raw status + body in
         ``raw_response``.
         """
+        # v4.1.5 (telegram-style onboarding): degraded no-credential state.
+        # Surface the relayable get-a-token prompt instead of the generic
+        # "Adapter not connected" message so the user learns HOW to fix it.
+        if self._no_credential or not self._auth_token:
+            return SendResult(
+                success=False,
+                error=NO_TOKEN_PROMPT,
+            )
         if self._client is None:
             return SendResult(
                 success=False,
@@ -1941,9 +1984,18 @@ def _make_tool_handler(ctx: Any, name: str, handler: Any) -> Any:
     # Imported lazily so registration order matches HERMES-01: importing
     # ``tools`` triggers schema construction; we keep that out of import
     # path until ``register()`` is actually called.
-    from .tools import handler_takes_adapter
+    from .tools import (
+        _NO_TOKEN_EXEMPT_TOOLS,
+        _adapter_lacks_credential,
+        _no_token_failure,
+        handler_takes_adapter,
+    )
 
     needs_adapter = handler_takes_adapter(handler)
+    # v4.1.5 (telegram-style onboarding): data tools get the no-token guard;
+    # status/health tools (chatlytics_health / chatlytics_login) are exempt so
+    # they still report the degraded state rather than the get-a-token prompt.
+    no_token_guarded = name not in _NO_TOKEN_EXEMPT_TOOLS
 
     def _lookup_adapter() -> Optional["ChatlyticsAdapter"]:
         # ``ctx.get_platform("chatlytics")`` is the v0.14 public accessor;
@@ -1988,9 +2040,17 @@ def _make_tool_handler(ctx: Any, name: str, handler: Any) -> Any:
             for _k, _v in args.items():
                 kwargs.setdefault(_k, _v)
         adapter_inst = _lookup_adapter()
+        # v4.1.5 (telegram-style onboarding): if the adapter loaded WITHOUT a
+        # bot token (degraded no-credential state), every DATA tool returns the
+        # relayable get-a-token prompt instead of a generic "not connected"
+        # error. Status tools (health/login) are exempt and fall through to the
+        # normal not-connected handling so they still report the degraded state.
+        if no_token_guarded and _adapter_lacks_credential(adapter_inst):
+            result: Any = _no_token_failure()
+            return json.dumps(result, ensure_ascii=False, default=str)
         client = getattr(adapter_inst, "client", None) if adapter_inst else None
         if client is None:
-            result: Any = {
+            result = {
                 "success": False,
                 "error": (
                     f"Chatlytics tool '{name}' invoked but the adapter is "

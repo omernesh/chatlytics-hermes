@@ -1,5 +1,14 @@
 # Changelog
 
+## [4.1.5] - 2026-06-07
+
+### Changed
+
+- **Onboarding: `connect()` now tolerates a missing `CHATLYTICS_BOT_TOKEN`**
+  (loads degraded + warns) instead of failing gateway boot; data tools return
+  a get-a-token prompt (Web UI + CLI routes) on no-token use. Token'd
+  deployments unchanged.
+
 ## [4.1.4] - 2026-06-06
 
 ### Changed
