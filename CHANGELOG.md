@@ -1,5 +1,79 @@
 # Changelog
 
+## [4.5.0] - 2026-06-11
+
+Native exec-approval + clarify hooks routed to the chatlytics owner-DM
+question flow (chatlytics v5.4 P8, gateway half), plus per-channel prompt
+injection. Dangerous-command approvals and agent clarify questions now go
+to the bot's paired OWNER DM (never the triggering chat); the owner
+replies `/approve <id>` / `/deny <id>` / `/answer <id> <text>` there and
+the resolution rides back as a `question_resolved` control envelope on the
+existing longpoll (`caps=control` advertisement unchanged — no new
+capability token).
+
+### Added
+
+- **`send_exec_approval` hook** (runner feature-detects it on the adapter
+  class): builds `"{description}:\n{command}"` (command capped at 1500
+  chars; server caps question text at 2000) and POSTs
+  `POST /api/v1/bot/questions {type:"approval", text, request_id,
+  chat_id}`. 201 → `SendResult(success=True, message_id=request_id)` and
+  the runner waits; resolution maps approved→`"once"` /
+  denied→`"deny"` into `tools.approval.resolve_gateway_approval`.
+  POST failure → `SendResult(success=False)`; the runner's typed-/approve
+  text fallback is documented as effectively dead under chatlytics (the
+  server-side slash floor intercepts `/approve`), so an unresolved
+  approval times out to DENY (fail-closed) — logged loudly.
+- **`send_clarify` override**: question + numbered choices ("Answer with
+  the option number or your own text.") POSTed the same way; the answer
+  arrives via owner-DM `/answer` → `tools.clarify_gateway.
+  resolve_gateway_clarify(clarify_id, answer)` — this path deliberately
+  does NOT `mark_awaiting_text`. POST failure delegates to the BASE
+  in-chat numbered-text fallback (which does `mark_awaiting_text`; plain
+  text is not slash-intercepted, so that degradation still works). An
+  owner DENIAL resolves the clarify with the empty string — the harness's
+  own no-response sentinel (`clear_session` contract) — unblocking the
+  agent thread immediately without injecting a fake answer.
+- **`question_resolved` control handling**: new control action (joins
+  `_CONTROL_ACTIONS`) popped against a bounded pending-question registry
+  (`request_id → {kind, session_key, clarify_id, future, chat_id,
+  created}`; cap 64, FIFO-evict with WARNING, 2 h stale-prune on insert).
+  Unknown/expired request_ids warn once then DEBUG. One retry, same
+  request_id, on 502 `owner_delivery_failed` (server rolls the row back).
+- **`ask_approval(text, chat_id, timeout_s=300)` / `ask_clarify(...)`**
+  awaitable adapter primitives for tooling: asyncio-future-backed;
+  `ask_approval` returns True ONLY on "approved" (denied/timeout/POST
+  failure → False, fail-closed); `ask_clarify` returns the answer string
+  on "answered", else None.
+- **Per-channel prompt injection**: MESSAGE envelopes (longpoll) and
+  webhook payloads may carry an additive `channel_prompt` field (source:
+  the server-side bot_module_config "channel-prompts" module); it is set
+  on `MessageEvent.channel_prompt` — the harness's native per-turn
+  ephemeral system-prompt channel (applied at API call time, never
+  persisted to transcript). Absent server value falls back to the local
+  config.yaml `channel_prompts` map via the harness's
+  `resolve_channel_prompt`. `retry_last` replays stay correct
+  automatically (the memoized envelope carries the field).
+
+### Unchanged
+
+- Longpoll caps advertisement stays `caps=control` — `question_resolved`
+  rides the existing control cap; the server refuses question POSTs from
+  gateways that didn't advertise it.
+- /new /stop /retry control handling, progress bubbles, media paths, and
+  the webhook/longpoll transports are untouched.
+
+### Tests
+
+- `tests/test_questions.py`: POST body shape + request_id charset, 502
+  retry-once (same request_id), failure SendResult, clarify
+  numbered-choices text + no `mark_awaiting_text` on the owner-DM path +
+  base-fallback delegation, `question_resolved` routing for
+  approval/clarify/future kinds, unknown request_id warn path,
+  ask_approval/ask_clarify resolution + timeout semantics, registry
+  FIFO bound, channel_prompt injection (envelope, absent, config
+  fallback), `_LONGPOLL_CAPS` contract guard.
+
 ## [4.4.0] - 2026-06-11
 
 Progress-bubble edit-in-place (chatlytics v5.4 P7, gateway half). When an

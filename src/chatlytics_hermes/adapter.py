@@ -61,6 +61,7 @@ import mimetypes
 import os
 import random
 import time
+import uuid
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -125,7 +126,13 @@ _LONGPOLL_CAPS: str = "control"
 # else is logged once and IGNORED (forward-compat — a newer server may emit
 # actions this plugin predates, and they must NEVER be dispatched as
 # message text to the agent).
-_CONTROL_ACTIONS: frozenset = frozenset({"new_conversation", "stop", "retry_last"})
+_CONTROL_ACTIONS: frozenset = frozenset(
+    # v4.5.0 (chatlytics v5.4 P8): ``question_resolved`` joined the set —
+    # the owner's /approve /deny /answer reply to an owner-DM question
+    # rides the SAME control cap (``caps=control``); no new capability
+    # token is advertised for it.
+    {"new_conversation", "stop", "retry_last", "question_resolved"}
+)
 
 # v4.3.0: bounded per-chat last-message memo for ``retry_last``. Keyed by
 # entity_jid, value = the last NORMAL message envelope dispatched for that
@@ -146,6 +153,25 @@ _UNKNOWN_CONTROL_WARN_CAP: int = 64
 # confusing, so the reply falls back to a plain send).
 _PROGRESS_BUBBLE_MAX: int = 100
 _PROGRESS_BUBBLE_TTL_S: float = 600.0
+
+# v4.5.0 (chatlytics v5.4 P8): pending owner-DM question registry bounds.
+# ``_pending_questions`` maps request_id -> {kind, session_key, clarify_id,
+# future, chat_id, created} for every question POSTed to
+# ``/api/v1/bot/questions`` that has not yet seen its ``question_resolved``
+# control envelope. FIFO-evicted past the cap (WARNING — an evicted
+# approval/clarify can no longer be resolved by the owner's reply and will
+# time out gateway-side, fail-closed). Entries older than the TTL are
+# pruned on insert — the server-side question TTL tops out at 86400 s but
+# the gateway-side approval/clarify waits time out far sooner (default
+# 600 s), so a 2 h-old registry entry is unresolvable dead weight.
+_PENDING_QUESTIONS_MAX: int = 64
+_PENDING_QUESTION_TTL_S: float = 7200.0
+
+# v4.5.0 (P8): cap on the ``command`` excerpt embedded in an approval
+# question's text. The chatlytics server caps the question ``text`` field
+# at 2000 chars; 1500 for the command leaves headroom for the description
+# prefix without ever tripping the server-side validation.
+_QUESTION_COMMAND_MAX_CHARS: int = 1500
 
 # v4.2.0 (P3 survivability): unmissable load-failure prefix. EVERY partial
 # load failure (missing token, unreachable base_url, register() raise) logs
@@ -619,6 +645,16 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # than _PROGRESS_BUBBLE_TTL_S are stale and ignored on pop. Exactly
         # ONE pending bubble per chat (turn) — see _send_progress_bubble.
         self._progress_bubbles: "OrderedDict[str, Tuple[str, float]]" = OrderedDict()
+
+        # v4.5.0 (chatlytics v5.4 P8): pending owner-DM questions. request_id
+        # -> {"kind": "approval"|"clarify"|"future", "session_key": str|None,
+        #     "clarify_id": str|None, "future": asyncio.Future|None,
+        #     "chat_id": str, "created": float (monotonic)}. Bounded FIFO
+        # (cap _PENDING_QUESTIONS_MAX, warn on evict) + stale pruning on
+        # insert (_PENDING_QUESTION_TTL_S). Resolved entries are popped by
+        # _control_question_resolved when the owner's /approve /deny /answer
+        # reply arrives as a question_resolved control envelope.
+        self._pending_questions: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 
         # Webhook server settings (HERMES-03).
         self.webhook_host: str = (
@@ -1204,6 +1240,33 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # it. InboundEnvelope always carries session_id under longpoll.
         self.register_chat_session(body["chatId"], body["session"])
         event = normalize_payload(body, self.platform)
+
+        # v4.5.0 (chatlytics v5.4 P8): per-channel prompt injection.
+        # ``MessageEvent.channel_prompt`` is the harness's NATIVE per-turn
+        # ephemeral system-prompt channel — the runner combines it into the
+        # per-turn system prompt at API call time and NEVER persists it to
+        # the transcript. The chatlytics server's bot_module_config
+        # "channel-prompts" module is the source of ``env["channel_prompt"]``
+        # (an additive MESSAGE-envelope field, absent when none configured);
+        # the local config.yaml ``channel_prompts`` map (resolved via the
+        # harness's resolve_channel_prompt) is the fallback. retry_last
+        # replays stay correct automatically: the memoized envelope carries
+        # the field, so a re-dispatch re-runs this exact block.
+        cp = env.get("channel_prompt")
+        if not (isinstance(cp, str) and cp.strip()):
+            try:
+                from gateway.platforms.base import resolve_channel_prompt
+
+                cp = resolve_channel_prompt(
+                    getattr(self.config, "extra", None) or {}, body["chatId"]
+                )
+            except Exception:  # noqa: BLE001 -- harness-drift tolerance
+                cp = None
+        # hasattr guard = harness-drift tolerance (older MessageEvent
+        # dataclasses without the field must not grow a stray attribute).
+        if isinstance(cp, str) and cp.strip() and hasattr(event, "channel_prompt"):
+            event.channel_prompt = cp.strip()
+
         await self.handle_message(event)
 
     # --- Control envelopes (v4.3.0 — chatlytics v5.4 P6) -------------------
@@ -1326,6 +1389,11 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             await self._control_stop(env)
         elif action == "retry_last":
             await self._control_retry_last(env)
+        elif action == "question_resolved":
+            # v4.5.0 (P8): owner replied /approve /deny /answer in their DM —
+            # resolve the matching pending question. MUST stay above the
+            # unknown-action fallthrough.
+            await self._control_question_resolved(env)
         else:
             self._warn_unknown_control(
                 f"action={action!r}",
@@ -1510,6 +1578,483 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # dict() copy so the re-dispatch (which re-records the memo) never
         # aliases the stored entry.
         await self._dispatch_envelope(dict(memo))
+
+    # --- Owner-DM questions (v4.5.0 — chatlytics v5.4 P8) -------------------
+    #
+    # The chatlytics server delivers approval / clarify questions to the
+    # bot's paired OWNER DM (never the triggering chat); the owner replies
+    # /approve <id> | /deny <id> | /answer <id> <text> there and the
+    # resolution arrives back as a ``question_resolved`` control envelope
+    # on the existing longpoll. Wire contract (chatlytics v5.4 P8, LOCKED):
+    #
+    #   POST /api/v1/bot/questions
+    #     { type: "approval"|"clarify", text: str (<=2000), request_id:
+    #       str 8..64 [A-Za-z0-9_-], chat_id: str, ttl_s?: int 60..86400 }
+    #     201 -> {request_id, short_id, status:"pending", expires_at}
+    #     409 gateway_not_control_capable / owner_unresolved /
+    #         duplicate_request_id; 429 too_many_pending_questions;
+    #     502 owner_delivery_failed (row rolled back — safe to retry once).
+    #
+    #   control envelope: { kind:"control", action:"question_resolved",
+    #     request_id, resolution:"approved"|"denied"|"answered",
+    #     answer?: str, ... entity_jid (owner DM), session_id, ts }
+    #
+    # No new longpoll capability token: question_resolved rides the
+    # existing ``caps=control`` advertisement (the server refuses question
+    # POSTs from gateways that didn't advertise it).
+
+    def _register_pending_question(
+        self, request_id: str, entry: Dict[str, Any]
+    ) -> None:
+        """Insert ``entry`` into the bounded pending-question registry.
+
+        Stale entries (older than :data:`_PENDING_QUESTION_TTL_S`) are
+        pruned on every insert; past :data:`_PENDING_QUESTIONS_MAX` the
+        oldest entry is FIFO-evicted with a WARNING — an evicted
+        approval/clarify can no longer be resolved by the owner's reply
+        and times out gateway-side (fail-closed deny / unanswered).
+        """
+        now = time.monotonic()
+        entry.setdefault("created", now)
+        stale = [
+            rid
+            for rid, e in self._pending_questions.items()
+            if now - e.get("created", now) > _PENDING_QUESTION_TTL_S
+        ]
+        for rid in stale:
+            self._pending_questions.pop(rid, None)
+            logger.debug(
+                "pending question %s older than %.0fs; pruned as stale",
+                rid,
+                _PENDING_QUESTION_TTL_S,
+            )
+        self._pending_questions[request_id] = entry
+        self._pending_questions.move_to_end(request_id)
+        while len(self._pending_questions) > _PENDING_QUESTIONS_MAX:
+            old_rid, old_entry = self._pending_questions.popitem(last=False)
+            logger.warning(
+                "pending-question registry full (cap %d); evicting oldest "
+                "request_id %s (kind=%s) — its owner reply can no longer "
+                "resolve it and the gateway-side wait will time out",
+                _PENDING_QUESTIONS_MAX,
+                old_rid,
+                old_entry.get("kind"),
+            )
+
+    async def _post_question(
+        self,
+        qtype: str,
+        text: str,
+        chat_id: str,
+        ttl_s: Optional[int] = None,
+    ) -> Optional[str]:
+        """POST one question to ``/api/v1/bot/questions``; return its request_id.
+
+        Generates ``request_id = uuid4().hex`` (32 lowercase hex chars —
+        satisfies the server's 8..64 ``[A-Za-z0-9_-]`` charset/length rule).
+        Returns the request_id on 201, ``None`` on ANY failure (the caller
+        decides the degradation — SendResult failure / base-class fallback /
+        fail-closed deny). Retries exactly ONCE, with the SAME request_id,
+        on 502 ``owner_delivery_failed`` (the server rolls the row back
+        before returning 502, so the same id cannot trip
+        ``duplicate_request_id``). Never raises.
+        """
+        if self._client is None or self._no_credential or not self._auth_token:
+            logger.warning(
+                "question POST skipped (type=%s): adapter not connected or "
+                "no credential",
+                qtype,
+            )
+            return None
+        request_id = uuid.uuid4().hex
+        body: Dict[str, Any] = {
+            "type": qtype,
+            "text": text,
+            "request_id": request_id,
+            "chat_id": chat_id,
+        }
+        if ttl_s is not None:
+            body["ttl_s"] = int(ttl_s)
+        for attempt in (0, 1):
+            try:
+                response = await self._client.post(
+                    "/api/v1/bot/questions", json=body
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 -- never raises contract
+                logger.warning(
+                    "question POST transport error (type=%s): %s", qtype, exc
+                )
+                return None
+            if response.status_code == 201:
+                return request_id
+            err: Optional[str] = None
+            try:
+                payload = response.json()
+                if isinstance(payload, dict):
+                    err = payload.get("error")
+            except Exception:  # noqa: BLE001 -- diagnostic only
+                err = None
+            if response.status_code == 502 and attempt == 0:
+                # owner_delivery_failed: the server rolled the question row
+                # back, so retrying with the SAME request_id is safe (and
+                # keeps the registry key stable for the caller).
+                logger.warning(
+                    "question POST got HTTP 502 (%s); retrying once with the "
+                    "same request_id",
+                    err or "owner_delivery_failed",
+                )
+                continue
+            # Treat ANY non-201 as failure (LOCKED wire contract).
+            logger.warning(
+                "question POST failed (type=%s): HTTP %d%s",
+                qtype,
+                response.status_code,
+                f" ({err})" if err else "",
+            )
+            return None
+        return None
+
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:  # type: ignore[name-defined]
+        """Route a dangerous-command approval to the chatlytics owner-DM flow.
+
+        The hermes runner feature-detects this method ON THE CLASS
+        (``getattr(type(adapter), "send_exec_approval", None)`` in
+        gateway/run.py) and calls it with exactly these kwargs when a
+        dangerous command is pending. Returning ``SendResult(success=True)``
+        makes the runner wait; the agent thread unblocks when
+        ``tools.approval.resolve_gateway_approval(session_key, choice)``
+        fires — which :meth:`_control_question_resolved` does when the
+        owner's /approve or /deny reply arrives.
+
+        On POST failure we return ``SendResult(success=False)`` so the
+        runner attempts its plain-text fallback — but note that under
+        chatlytics v5.4 P8 the typed ``/approve`` reply to that fallback is
+        intercepted SERVER-SIDE by the slash floor and never reaches the
+        runner, so an unresolved approval times out to deny (fail-closed).
+        The WARNING below documents this for operators.
+        """
+        cmd = command or ""
+        if len(cmd) > _QUESTION_COMMAND_MAX_CHARS:
+            cmd = cmd[:_QUESTION_COMMAND_MAX_CHARS] + "…"
+        text = f"{description}:\n{cmd}"
+        request_id = await self._post_question("approval", text, chat_id)
+        if request_id is None:
+            logger.warning(
+                "send_exec_approval: question POST failed for chat %s — the "
+                "runner will fall back to a typed-/approve text prompt, but "
+                "under chatlytics the slash floor intercepts /approve "
+                "server-side, so the fallback is effectively dead and an "
+                "unresolved approval times out to DENY (fail-closed)",
+                chat_id,
+            )
+            return SendResult(
+                success=False, error="chatlytics question POST failed"
+            )
+        self._register_pending_question(
+            request_id,
+            {
+                "kind": "approval",
+                "session_key": session_key,
+                "clarify_id": None,
+                "future": None,
+                "chat_id": chat_id,
+                "created": time.monotonic(),
+            },
+        )
+        logger.info(
+            "send_exec_approval: approval question %s routed to owner DM "
+            "(chat %s)",
+            request_id,
+            chat_id,
+        )
+        return SendResult(success=True, message_id=request_id)
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:  # type: ignore[name-defined]
+        """Route a clarify prompt to the chatlytics owner-DM question flow.
+
+        Success path: the answer arrives via the owner DM ``/answer`` →
+        ``question_resolved`` control envelope → ``resolve_gateway_clarify``
+        — NOT via the next message in the triggering chat, so this path
+        deliberately does NOT call ``mark_awaiting_text`` (doing so would
+        capture an unrelated next chat message as the answer).
+
+        Failure path: delegate to ``super().send_clarify(...)`` — the base
+        numbered-text fallback DOES ``mark_awaiting_text`` and resolves off
+        the next chat message. Plain text is not slash-intercepted by
+        chatlytics, so unlike the approval fallback this degradation
+        actually works.
+        """
+        lines = [question]
+        if choices:
+            lines.append("")
+            for i, choice in enumerate(choices, start=1):
+                lines.append(f"  {i}. {choice}")
+            lines.append("")
+            lines.append("Answer with the option number or your own text.")
+        text = "\n".join(lines)
+        request_id = await self._post_question("clarify", text, chat_id)
+        if request_id is None:
+            logger.warning(
+                "send_clarify: question POST failed for chat %s; falling "
+                "back to the base in-chat numbered-text prompt",
+                chat_id,
+            )
+            return await super().send_clarify(
+                chat_id, question, choices, clarify_id, session_key, metadata
+            )
+        self._register_pending_question(
+            request_id,
+            {
+                "kind": "clarify",
+                "session_key": session_key,
+                "clarify_id": clarify_id,
+                "future": None,
+                "chat_id": chat_id,
+                "created": time.monotonic(),
+            },
+        )
+        logger.info(
+            "send_clarify: clarify question %s routed to owner DM (chat %s)",
+            request_id,
+            chat_id,
+        )
+        return SendResult(success=True, message_id=request_id)
+
+    async def ask_approval(
+        self, text: str, chat_id: str, timeout_s: float = 300.0
+    ) -> bool:
+        """Awaitable adapter-level approval primitive (tooling / public API).
+
+        POSTs an approval question and awaits the owner's resolution as an
+        asyncio future. ``True`` ONLY on resolution ``"approved"``; denied,
+        timeout, and POST failure all return ``False`` (default DENY,
+        fail-closed).
+        """
+        request_id = await self._post_question("approval", text, chat_id)
+        if request_id is None:
+            return False
+        fut: "asyncio.Future[Tuple[Any, Any]]" = (
+            asyncio.get_running_loop().create_future()
+        )
+        self._register_pending_question(
+            request_id,
+            {
+                "kind": "future",
+                "session_key": None,
+                "clarify_id": None,
+                "future": fut,
+                "chat_id": chat_id,
+                "created": time.monotonic(),
+            },
+        )
+        try:
+            resolution, _answer = await asyncio.wait_for(fut, timeout_s)
+        except asyncio.TimeoutError:
+            # Pop the registry entry so a post-timeout resolution does not
+            # try to set_result on an abandoned future.
+            self._pending_questions.pop(request_id, None)
+            logger.info(
+                "ask_approval %s timed out after %.0fs — denying (fail-closed)",
+                request_id,
+                timeout_s,
+            )
+            return False
+        return resolution == "approved"
+
+    async def ask_clarify(
+        self, text: str, chat_id: str, timeout_s: float = 300.0
+    ) -> Optional[str]:
+        """Awaitable adapter-level clarify primitive (tooling / public API).
+
+        Returns the owner's answer string on resolution ``"answered"``;
+        denied, timeout, and POST failure all return ``None``.
+        """
+        request_id = await self._post_question("clarify", text, chat_id)
+        if request_id is None:
+            return None
+        fut: "asyncio.Future[Tuple[Any, Any]]" = (
+            asyncio.get_running_loop().create_future()
+        )
+        self._register_pending_question(
+            request_id,
+            {
+                "kind": "future",
+                "session_key": None,
+                "clarify_id": None,
+                "future": fut,
+                "chat_id": chat_id,
+                "created": time.monotonic(),
+            },
+        )
+        try:
+            resolution, answer = await asyncio.wait_for(fut, timeout_s)
+        except asyncio.TimeoutError:
+            self._pending_questions.pop(request_id, None)
+            logger.info(
+                "ask_clarify %s timed out after %.0fs — returning None",
+                request_id,
+                timeout_s,
+            )
+            return None
+        if resolution == "answered" and isinstance(answer, str):
+            return answer
+        return None
+
+    async def _control_question_resolved(self, env: Dict[str, Any]) -> None:
+        """Handle a ``question_resolved`` control envelope from the owner DM.
+
+        Pops the matching pending-question entry and unblocks whichever
+        wait primitive registered it:
+
+        - ``"future"``   — :meth:`ask_approval` / :meth:`ask_clarify`:
+          resolve the asyncio future with ``(resolution, answer)``.
+        - ``"approval"`` — the runner's exec-approval wait: map
+          approved→"once" / anything-else→"deny" into
+          ``tools.approval.resolve_gateway_approval(session_key, choice)``.
+        - ``"clarify"``  — the runner's clarify wait: answered→answer via
+          ``tools.clarify_gateway.resolve_gateway_clarify``; denied→resolve
+          with ``""`` (see inline comment).
+
+        Never raises — wrapped defensively like the other control handlers.
+        """
+        try:
+            request_id = env.get("request_id")
+            if not isinstance(request_id, str) or not request_id:
+                self._warn_unknown_control(
+                    "question_resolved:missing_request_id",
+                    "control question_resolved without a valid request_id — "
+                    "ignoring",
+                )
+                return
+            entry = self._pending_questions.pop(request_id, None)
+            if entry is None:
+                self._warn_unknown_control(
+                    f"question_resolved:unknown:{request_id}",
+                    "question_resolved for unknown/expired request_id %s — "
+                    "ignoring (already resolved, timed out, or evicted)",
+                    request_id,
+                )
+                return
+            resolution = env.get("resolution")
+            answer = env.get("answer")
+            kind = entry.get("kind")
+
+            if kind == "future":
+                fut = entry.get("future")
+                if fut is not None and not fut.done():
+                    fut.set_result((resolution, answer))
+                return
+
+            if kind == "approval":
+                # Owner DM has no "session"/"always" verb surface — map the
+                # binary approved/denied onto the one-shot choices.
+                choice = "once" if resolution == "approved" else "deny"
+                try:
+                    # Lazy import: tolerate harness drift (an older/newer
+                    # hermes-agent without tools.approval must not break
+                    # control routing for the other actions).
+                    from tools.approval import resolve_gateway_approval
+                except ImportError:
+                    logger.warning(
+                        "question_resolved %s: tools.approval unavailable in "
+                        "this hermes-agent — cannot resolve the pending "
+                        "approval (it will time out to deny)",
+                        request_id,
+                    )
+                    return
+                resolved_count = resolve_gateway_approval(
+                    entry.get("session_key") or "", choice
+                )
+                if resolved_count == 0:
+                    logger.warning(
+                        "question_resolved %s: resolution %r mapped to %r but "
+                        "resolved_count=0 — the gateway-side approval already "
+                        "timed out",
+                        request_id,
+                        resolution,
+                        choice,
+                    )
+                else:
+                    logger.info(
+                        "question_resolved %s: approval %s by owner "
+                        "(choice=%s, resolved_count=%d)",
+                        request_id,
+                        resolution,
+                        choice,
+                        resolved_count,
+                    )
+                return
+
+            if kind == "clarify":
+                clarify_id = entry.get("clarify_id") or ""
+                try:
+                    from tools.clarify_gateway import resolve_gateway_clarify
+                except ImportError:
+                    logger.warning(
+                        "question_resolved %s: tools.clarify_gateway "
+                        "unavailable in this hermes-agent — cannot resolve "
+                        "the pending clarify (it will time out on its own)",
+                        request_id,
+                    )
+                    return
+                if resolution == "answered" and isinstance(answer, str) and answer:
+                    ok = resolve_gateway_clarify(clarify_id, answer)
+                    logger.info(
+                        "question_resolved %s: clarify answered by owner "
+                        "(clarify_id=%s, delivered=%s)",
+                        request_id,
+                        clarify_id,
+                        ok,
+                    )
+                else:
+                    # Denied (or answered with an empty answer): resolve with
+                    # the empty string. This is the harness's OWN cancellation
+                    # sentinel — tools/clarify_gateway.py clear_session() sets
+                    # entry.response = "" with the documented contract "most
+                    # callers just treat any falsy result as 'user did not
+                    # respond'". Resolving (rather than letting it time out)
+                    # unblocks the agent thread immediately instead of pinning
+                    # it for the full clarify_timeout (default 600 s), and ""
+                    # is NOT a fake answer — it is the established
+                    # no-response signal.
+                    ok = resolve_gateway_clarify(clarify_id, "")
+                    logger.info(
+                        "question_resolved %s: clarify denied by owner — "
+                        "resolved clarify_id=%s with the empty-string "
+                        "no-response sentinel (delivered=%s)",
+                        request_id,
+                        clarify_id,
+                        ok,
+                    )
+                return
+
+            logger.warning(
+                "question_resolved %s: pending entry has unknown kind %r — "
+                "dropped",
+                request_id,
+                kind,
+            )
+        except Exception:  # noqa: BLE001 -- control handling must never raise
+            logger.exception(
+                "question_resolved handling raised; envelope dropped"
+            )
 
     @property
     def is_bot_token(self) -> bool:

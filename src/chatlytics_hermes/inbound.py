@@ -223,6 +223,29 @@ def make_webhook_handler(adapter: Any) -> Callable[[web.Request], Any]:
         except Exception:  # noqa: BLE001 -- never let session bookkeeping break dispatch
             logger.debug("inbound session bookkeeping raised; continuing")
 
+        # v4.5.0 (chatlytics v5.4 P8): per-channel prompt injection — same
+        # pattern as adapter._dispatch_envelope (keep the two in sync).
+        # ``MessageEvent.channel_prompt`` is the harness's native per-turn
+        # ephemeral system-prompt channel (applied at API call time, never
+        # persisted to the transcript). Webhook envelopes POST the full
+        # envelope dict, so the server's bot_module_config "channel-prompts"
+        # value rides ``payload["channel_prompt"]``; the local config.yaml
+        # ``channel_prompts`` map is the fallback.
+        try:
+            cp = payload.get("channel_prompt")
+            if not (isinstance(cp, str) and cp.strip()):
+                from gateway.platforms.base import resolve_channel_prompt
+
+                cp = resolve_channel_prompt(
+                    getattr(getattr(adapter, "config", None), "extra", None)
+                    or {},
+                    event.source.chat_id,
+                )
+            if isinstance(cp, str) and cp.strip() and hasattr(event, "channel_prompt"):
+                event.channel_prompt = cp.strip()
+        except Exception:  # noqa: BLE001 -- prompt injection must never break dispatch
+            logger.debug("channel_prompt injection raised; continuing")
+
         try:
             await adapter.handle_message(event)
         except Exception:  # noqa: BLE001 -- never let dispatch errors crash the server
