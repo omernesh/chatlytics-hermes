@@ -126,13 +126,22 @@ _LONGPOLL_CAPS: str = "control"
 # else is logged once and IGNORED (forward-compat — a newer server may emit
 # actions this plugin predates, and they must NEVER be dispatched as
 # message text to the agent).
-_CONTROL_ACTIONS: frozenset = frozenset(
+#
+# v4.5.1 (review-d3 X20): the action set is now DERIVED from this handler
+# map, and ``_handle_control_envelope`` dispatches through it — adding a new
+# control action means adding exactly one entry here (the frozenset and the
+# dispatch can no longer drift apart).
+_CONTROL_ACTION_HANDLERS: Dict[str, str] = {
+    "new_conversation": "_control_new_conversation",
+    "stop": "_control_stop",
+    "retry_last": "_control_retry_last",
     # v4.5.0 (chatlytics v5.4 P8): ``question_resolved`` joined the set —
     # the owner's /approve /deny /answer reply to an owner-DM question
     # rides the SAME control cap (``caps=control``); no new capability
     # token is advertised for it.
-    {"new_conversation", "stop", "retry_last", "question_resolved"}
-)
+    "question_resolved": "_control_question_resolved",
+}
+_CONTROL_ACTIONS: frozenset = frozenset(_CONTROL_ACTION_HANDLERS)
 
 # v4.3.0: bounded per-chat last-message memo for ``retry_last``. Keyed by
 # entity_jid, value = the last NORMAL message envelope dispatched for that
@@ -154,6 +163,10 @@ _UNKNOWN_CONTROL_WARN_CAP: int = 64
 _PROGRESS_BUBBLE_MAX: int = 100
 _PROGRESS_BUBBLE_TTL_S: float = 600.0
 
+# v4.5.1 (review-d3 X20): default threshold (seconds) before the ONE
+# "working…" progress bubble fires. Was a magic 8.0 inline in __init__.
+_STATUS_BUBBLE_AFTER_DEFAULT_S: float = 8.0
+
 # v4.5.0 (chatlytics v5.4 P8): pending owner-DM question registry bounds.
 # ``_pending_questions`` maps request_id -> {kind, session_key, clarify_id,
 # future, chat_id, created} for every question POSTed to
@@ -172,6 +185,35 @@ _PENDING_QUESTION_TTL_S: float = 7200.0
 # at 2000 chars; 1500 for the command leaves headroom for the description
 # prefix without ever tripping the server-side validation.
 _QUESTION_COMMAND_MAX_CHARS: int = 1500
+
+# v4.5.1 (review-d3 X15): question-POST outcome discriminants returned by
+# _post_question. CREATED also covers 409 ``duplicate_request_id`` (the
+# question already exists server-side and WILL resolve/expire normally —
+# keep waiting). UNKNOWN means the POST's fate is unknowable (transport
+# error / unexpected raise) — the question MAY have been delivered, so the
+# pending-registry entry is KEPT and the caller's wait timeout / registry
+# TTL cleans up. FAILED is a definitive server rejection — pop the entry.
+_QPOST_CREATED: str = "created"
+_QPOST_UNKNOWN: str = "unknown"
+_QPOST_FAILED: str = "failed"
+
+# v4.5.1 (review-d3 X15): the hermes runner's gateway-side approval/clarify
+# wait defaults to 600 s (gateway run.py exec-approval + clarify timeouts).
+# send_exec_approval / send_clarify pass ``ttl_s = wait + 60`` so the
+# server-side question outlives the gateway wait by a small margin instead
+# of defaulting to the server's much longer TTL (dead questions linger in
+# the owner DM long after the wait has fail-closed).
+_GATEWAY_QUESTION_WAIT_S: float = 600.0
+
+# Server-side ttl_s validation bounds (chatlytics v5.4 P8 wire contract:
+# ``ttl_s?: int 60..86400``). _question_ttl_s clamps into this range.
+_QUESTION_TTL_MIN_S: int = 60
+_QUESTION_TTL_MAX_S: int = 86400
+
+
+def _question_ttl_s(wait_s: float) -> int:
+    """ttl_s aligned to the caller's wait (wait + 60 s), server-clamped."""
+    return max(_QUESTION_TTL_MIN_S, min(_QUESTION_TTL_MAX_S, int(wait_s + 60.0)))
 
 # v4.2.0 (P3 survivability): unmissable load-failure prefix. EVERY partial
 # load failure (missing token, unreachable base_url, register() raise) logs
@@ -452,6 +494,35 @@ def _coerce_success_payload(
         return False, err
     return True, None
 
+
+def _envelope_to_body(
+    env: Dict[str, Any], *, text: Optional[str] = None
+) -> Dict[str, Any]:
+    """Translate one longpoll InboundEnvelope into a webhook-shaped body.
+
+    v4.5.1 (review-d3 X20): single implementation shared by
+    ``_dispatch_envelope`` (message dispatch) and ``_control_event``
+    (control-envelope SessionSource derivation) — previously two hand-kept
+    copies with a "keep in sync!" comment. The shape feeds
+    :func:`inbound.normalize_payload`, so the SessionSource (and therefore
+    the hermes session key) is identical on both paths by construction.
+
+    ``text`` overrides the envelope's text (control events pass a cosmetic
+    "/new" / "/stop" label; message dispatch uses the envelope's own text).
+    """
+    return {
+        "chatId": env["entity_jid"],          # required by normalize_payload
+        "text": env.get("text", "") if text is None else text,
+        "senderId": env.get("sender_jid"),
+        "chatType": (
+            "channel"
+            if env.get("chat_type") == "newsletter"
+            else env.get("chat_type") or "dm"
+        ),
+        "session": env.get("session_id"),
+    }
+
+
 try:
     from gateway.platforms.base import BasePlatformAdapter, SendResult
     from gateway.config import Platform, PlatformConfig
@@ -625,16 +696,18 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         self.status_edit_in_place: bool = _coerce_flag(_seip_raw, default=True)
         # Threshold (seconds) before the ONE "working…" bubble fires; <= 0
         # disables the bubble. Parsed defensively — a bad value falls back
-        # to the 8.0 s default instead of raising at gateway boot.
+        # to _STATUS_BUBBLE_AFTER_DEFAULT_S instead of raising at gateway boot.
         _bubble_after_raw: Any = os.getenv("CHATLYTICS_STATUS_BUBBLE_AFTER_S")
         if _bubble_after_raw is None:
             _bubble_after_raw = extra.get("status_bubble_after_s")
         try:
             self.status_bubble_after_s: float = (
-                float(_bubble_after_raw) if _bubble_after_raw is not None else 8.0
+                float(_bubble_after_raw)
+                if _bubble_after_raw is not None
+                else _STATUS_BUBBLE_AFTER_DEFAULT_S
             )
         except (TypeError, ValueError):
-            self.status_bubble_after_s = 8.0
+            self.status_bubble_after_s = _STATUS_BUBBLE_AFTER_DEFAULT_S
         self.status_bubble_text: str = str(
             os.getenv("CHATLYTICS_STATUS_BUBBLE_TEXT")
             or extra.get("status_bubble_text")
@@ -1011,12 +1084,27 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         failures: int = 0
         degraded: Optional[str] = None
 
-        def _note_degraded(reason: str, hint: str, *, level: int = logging.WARNING) -> float:
+        def _note_degraded(
+            reason: str,
+            hint: str,
+            *,
+            level: int = logging.WARNING,
+            reason_class: Optional[str] = None,
+        ) -> float:
             """Record one failure; log ONCE per healthy→degraded transition.
+
+            v4.5.1 (review-d3 H9): a degraded-reason CLASS change (e.g.
+            transport error → HTTP 401) also logs at ``level`` — that is
+            operator-relevant signal, not a repeat. ``reason_class`` is the
+            STABLE comparison key (defaults to ``reason``); transport
+            errors pass an exc-detail-free class so a flapping network that
+            alternates refused/reset/timeout details still logs exactly one
+            WARNING per degraded episode (the P3 no-log-flood contract).
 
             Returns the jittered backoff delay for this attempt.
             """
             nonlocal failures, degraded
+            cls_key = reason_class or reason
             delay = _backoff_delay(failures)
             failures += 1
             if degraded is None:
@@ -1028,6 +1116,17 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     hint,
                     delay,
                 )
+            elif degraded != cls_key:
+                logger.log(
+                    level,
+                    "longpoll degraded reason changed: %s -> %s — %s "
+                    "(attempt %d, backing off %.1fs)",
+                    degraded,
+                    reason,
+                    hint,
+                    failures,
+                    delay,
+                )
             else:
                 logger.debug(
                     "longpoll still degraded (%s); attempt %d, backing off %.1fs",
@@ -1035,7 +1134,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     failures,
                     delay,
                 )
-            degraded = reason
+            degraded = cls_key
             return delay
 
         def _note_healthy() -> None:
@@ -1050,133 +1149,191 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         logger.info(
             "chatlytics inbound: longpoll loop started (polling /api/v1/bot/updates)"
         )
+        # v4.5.1 (review-d3 X1): error classes already reported at ERROR by
+        # the catch-all below. The full traceback logs ONCE per distinct
+        # class (then DEBUG) so a hot unexpected error cannot flood the log
+        # while still being unmissable the first time.
+        unexpected_seen: set = set()
+
         while self._running:
             client = self._client
             if client is None:
                 # connect() always sets _client before starting the task,
                 # but guard defensively against a teardown race.
                 return
+            # v4.5.1 (review-d3 X1 CRITICAL): the ENTIRE iteration is wrapped
+            # so NO exception other than CancelledError can ever kill the
+            # poll task — a dead poll task is a silently dead bot (no done-
+            # callback fired pre-v4.5.1, reference held, never surfaced).
+            # Known transport / HTTP / shutdown signals are still handled by
+            # the inner branches; anything they miss lands in the catch-all
+            # at the bottom and takes the SAME bounded-backoff retry path.
             try:
-                resp = await client.get(
-                    "/api/v1/bot/updates",
-                    # v4.3.0: ``caps=control`` advertises control-envelope
-                    # support on EVERY poll (chatlytics v5.4 capability
-                    # negotiation — server-side, per-poll, no handshake).
-                    # This is the ONLY change to the longpoll request shape;
-                    # cursor/timeout semantics are untouched.
-                    params={
-                        "cursor": cursor,
-                        "timeout_ms": _LONGPOLL_TIMEOUT_MS,
-                        "caps": _LONGPOLL_CAPS,
-                    },
-                    # Read timeout MUST exceed the server hold (timeout_ms) or
-                    # every empty poll times out. read = hold + 15s buffer.
-                    timeout=httpx.Timeout(
-                        connect=10.0,
-                        read=(_LONGPOLL_TIMEOUT_MS / 1000) + 15.0,
-                        write=10.0,
-                        pool=10.0,
-                    ),
-                )
-            except asyncio.CancelledError:
-                raise
-            except httpx.RequestError as exc:
-                # Connection refused/reset/timeout: normal retry events
-                # (chatlytics restart, transient network). Backoff + retry.
-                delay = _note_degraded(
-                    f"transport error ({exc or type(exc).__name__})",
-                    map_connect_error(exc=exc),
-                )
-                await asyncio.sleep(delay)
-                continue
-
-            if resp.status_code == 400:
-                # Bad/expired cursor — reset and re-poll from the tail.
-                logger.warning(
-                    "longpoll GET returned 400 (invalid_cursor); resetting cursor"
-                )
-                cursor = ""
-                continue
-            if resp.status_code == 401:
-                delay = _note_degraded(
-                    "HTTP 401 (bot_token_required)",
-                    map_connect_error(status_code=401),
-                    level=logging.ERROR,
-                )
-                # Token problems don't self-heal fast — wait at the cap.
-                await asyncio.sleep(max(delay, _BACKOFF_LADDER[-1]))
-                continue
-            if resp.status_code != 200:
-                delay = _note_degraded(
-                    f"HTTP {resp.status_code}",
-                    map_connect_error(status_code=resp.status_code),
-                )
-                await asyncio.sleep(delay)
-                continue
-
-            # v4.2.0 (P3): chatlytics v5.4 longpoll graceful shutdown —
-            # parked longpolls get an EMPTY 200 + Connection: close when the
-            # server restarts. A normal empty batch is a JSON object
-            # ({"envelopes": [], ...}), so an empty BODY unambiguously means
-            # "server going down; reconnect later". Back off instead of
-            # busy-spinning into the connection-refused window.
-            if not (resp.content or b"").strip():
-                delay = _note_degraded(
-                    "server closed poll (graceful shutdown — chatlytics restarting)",
-                    "the plugin reconnects automatically with backoff",
-                )
-                await asyncio.sleep(delay)
-                continue
-
-            # Successful poll — reset backoff / degraded state.
-            _note_healthy()
-            try:
-                data = resp.json()
-            except Exception:  # noqa: BLE001 -- JSONDecodeError + httpx variants
-                logger.warning("longpoll GET returned non-JSON body; skipping")
-                continue
-            if not isinstance(data, dict):
-                logger.warning("longpoll GET body was not a JSON object; skipping")
-                continue
-
-            envelopes = data.get("envelopes") or []
-            next_cursor = data.get("cursor", cursor)
-
-            if not envelopes:
-                # Timeout / empty batch: advance cursor to the returned
-                # value and re-poll. No ack needed for an empty batch.
-                cursor = next_cursor if isinstance(next_cursor, str) else cursor
-                continue
-
-            for env in envelopes:
                 try:
-                    await self._dispatch_envelope(env)
+                    resp = await client.get(
+                        "/api/v1/bot/updates",
+                        # v4.3.0: ``caps=control`` advertises control-envelope
+                        # support on EVERY poll (chatlytics v5.4 capability
+                        # negotiation — server-side, per-poll, no handshake).
+                        # This is the ONLY change to the longpoll request shape;
+                        # cursor/timeout semantics are untouched.
+                        params={
+                            "cursor": cursor,
+                            "timeout_ms": _LONGPOLL_TIMEOUT_MS,
+                            "caps": _LONGPOLL_CAPS,
+                        },
+                        # Read timeout MUST exceed the server hold (timeout_ms) or
+                        # every empty poll times out. read = hold + 15s buffer.
+                        timeout=httpx.Timeout(
+                            connect=10.0,
+                            read=(_LONGPOLL_TIMEOUT_MS / 1000) + 15.0,
+                            write=10.0,
+                            pool=10.0,
+                        ),
+                    )
                 except asyncio.CancelledError:
                     raise
-                except Exception:  # noqa: BLE001 -- one bad envelope must not
-                    # kill the loop or block the ack for the rest of the batch.
-                    logger.exception(
-                        "longpoll: failed to dispatch one envelope; continuing"
+                except httpx.RequestError as exc:
+                    # Connection refused/reset/timeout: normal retry events
+                    # (chatlytics restart, transient network). Backoff + retry.
+                    delay = _note_degraded(
+                        f"transport error ({exc or type(exc).__name__})",
+                        map_connect_error(exc=exc),
+                        # H9: stable class — refused/reset/timeout detail
+                        # variations within one episode stay at DEBUG.
+                        reason_class="transport error",
                     )
+                    await asyncio.sleep(delay)
+                    continue
 
-            # Advance + persist the read pointer. Ack AFTER processing so an
-            # in-flight crash re-delivers unprocessed envelopes.
-            if isinstance(next_cursor, str):
-                cursor = next_cursor
-            try:
-                await client.post(
-                    "/api/v1/bot/updates/ack", json={"cursor": cursor}
-                )
+                if resp.status_code == 400:
+                    # Bad/expired cursor — reset and re-poll from the tail.
+                    logger.warning(
+                        "longpoll GET returned 400 (invalid_cursor); resetting cursor"
+                    )
+                    cursor = ""
+                    continue
+                if resp.status_code == 401:
+                    delay = _note_degraded(
+                        "HTTP 401 (bot_token_required)",
+                        map_connect_error(status_code=401),
+                        level=logging.ERROR,
+                    )
+                    # Token problems don't self-heal fast — wait at the cap.
+                    await asyncio.sleep(max(delay, _BACKOFF_LADDER[-1]))
+                    continue
+                if resp.status_code != 200:
+                    delay = _note_degraded(
+                        f"HTTP {resp.status_code}",
+                        map_connect_error(status_code=resp.status_code),
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                # v4.2.0 (P3): chatlytics v5.4 longpoll graceful shutdown —
+                # parked longpolls get an EMPTY 200 + Connection: close when the
+                # server restarts. A normal empty batch is a JSON object
+                # ({"envelopes": [], ...}), so an empty BODY unambiguously means
+                # "server going down; reconnect later". Back off instead of
+                # busy-spinning into the connection-refused window.
+                if not (resp.content or b"").strip():
+                    delay = _note_degraded(
+                        "server closed poll (graceful shutdown — chatlytics restarting)",
+                        "the plugin reconnects automatically with backoff",
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                # Successful poll — reset backoff / degraded state.
+                _note_healthy()
+                try:
+                    data = resp.json()
+                except Exception:  # noqa: BLE001 -- JSONDecodeError + httpx variants
+                    logger.warning("longpoll GET returned non-JSON body; skipping")
+                    continue
+                if not isinstance(data, dict):
+                    logger.warning("longpoll GET body was not a JSON object; skipping")
+                    continue
+
+                envelopes = data.get("envelopes") or []
+                next_cursor = data.get("cursor", cursor)
+
+                if not envelopes:
+                    # Timeout / empty batch: advance cursor to the returned
+                    # value and re-poll. No ack needed for an empty batch.
+                    cursor = next_cursor if isinstance(next_cursor, str) else cursor
+                    continue
+
+                for env in envelopes:
+                    try:
+                        await self._dispatch_envelope(env)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001 -- one bad envelope must not
+                        # kill the loop or block the ack for the rest of the batch.
+                        logger.exception(
+                            "longpoll: failed to dispatch one envelope; continuing"
+                        )
+
+                # Advance + persist the read pointer. Ack AFTER processing so an
+                # in-flight crash re-delivers unprocessed envelopes.
+                if isinstance(next_cursor, str):
+                    cursor = next_cursor
+                try:
+                    ack_resp = await client.post(
+                        "/api/v1/bot/updates/ack", json={"cursor": cursor}
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except httpx.RequestError as exc:
+                    # Ack failed — envelopes will re-deliver on the next GET.
+                    # Don't advance past them: keep cursor as-is and retry.
+                    logger.warning(
+                        "longpoll ack POST transport error (%s); envelopes will "
+                        "re-deliver on next poll",
+                        exc,
+                    )
+                else:
+                    # v4.5.1 (review-d3 H8): a non-200 ack was previously
+                    # IGNORED — the read pointer silently failed to advance
+                    # and envelopes re-delivered forever with no log trail.
+                    if ack_resp.status_code == 401:
+                        logger.error(
+                            "longpoll ack POST rejected with HTTP 401 — bot "
+                            "token rejected (rotated/revoked?); %s",
+                            map_connect_error(status_code=401),
+                        )
+                    elif ack_resp.status_code != 200:
+                        logger.warning(
+                            "longpoll ack POST returned HTTP %d; the read "
+                            "pointer did not advance and envelopes will "
+                            "re-deliver on the next poll",
+                            ack_resp.status_code,
+                        )
             except asyncio.CancelledError:
                 raise
-            except httpx.RequestError as exc:
-                # Ack failed — envelopes will re-deliver on the next GET.
-                # Don't advance past them: keep cursor as-is and retry.
-                logger.warning(
-                    "longpoll ack POST transport error (%s); envelopes will "
-                    "re-deliver on next poll",
-                    exc,
+            except Exception as exc:  # noqa: BLE001 -- X1: loop must NEVER die
+                cls = type(exc).__name__
+                if cls not in unexpected_seen:
+                    unexpected_seen.add(cls)
+                    logger.exception(
+                        "longpoll loop hit an unexpected %s — the loop "
+                        "continues with bounded backoff (traceback logged "
+                        "once per error class)",
+                        cls,
+                    )
+                else:
+                    logger.debug(
+                        "longpoll loop: repeat unexpected %s (%s); backing off",
+                        cls,
+                        exc,
+                    )
+                delay = _note_degraded(
+                    f"unexpected {cls}",
+                    "internal error — see the traceback logged above",
+                    level=logging.ERROR,
                 )
+                await asyncio.sleep(delay)
 
     async def _dispatch_envelope(self, env: Dict[str, Any]) -> None:
         """Translate one InboundEnvelope -> MessageEvent and dispatch it.
@@ -1225,17 +1382,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # exactly what /retry exists to re-run.
         self._remember_last_message(env)
 
-        body = {
-            "chatId": env["entity_jid"],          # required by normalize_payload
-            "text": env.get("text", ""),
-            "senderId": env.get("sender_jid"),
-            "chatType": (
-                "channel"
-                if env.get("chat_type") == "newsletter"
-                else env.get("chat_type") or "dm"
-            ),
-            "session": env.get("session_id"),
-        }
+        body = _envelope_to_body(env)
         # Thread the WAHA session BEFORE dispatch so the reply path resolves
         # it. InboundEnvelope always carries session_id under longpoll.
         self.register_chat_session(body["chatId"], body["session"])
@@ -1260,12 +1407,35 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 cp = resolve_channel_prompt(
                     getattr(self.config, "extra", None) or {}, body["chatId"]
                 )
-            except Exception:  # noqa: BLE001 -- harness-drift tolerance
+            except Exception as exc:  # noqa: BLE001 -- harness-drift tolerance
+                # v4.5.1 (review-d3 H7): version drift is operator-relevant —
+                # the local channel_prompts config silently never applies.
+                # WARNING once (warn-once dedup), DEBUG thereafter.
+                self._warn_unknown_control(
+                    "channel_prompt:resolver_unavailable",
+                    "channel-prompt config fallback unavailable: "
+                    "gateway.platforms.base.resolve_channel_prompt missing or "
+                    "raised (%s: %s) — hermes-agent version drift; local "
+                    "channel_prompts config will NOT apply",
+                    type(exc).__name__,
+                    exc,
+                )
                 cp = None
         # hasattr guard = harness-drift tolerance (older MessageEvent
         # dataclasses without the field must not grow a stray attribute).
-        if isinstance(cp, str) and cp.strip() and hasattr(event, "channel_prompt"):
-            event.channel_prompt = cp.strip()
+        if isinstance(cp, str) and cp.strip():
+            if hasattr(event, "channel_prompt"):
+                event.channel_prompt = cp.strip()
+            else:
+                # v4.5.1 (review-d3 H7): a configured prompt was DROPPED —
+                # name the missing attribute so the operator knows why.
+                self._warn_unknown_control(
+                    "channel_prompt:event_attr_missing",
+                    "MessageEvent has no channel_prompt attribute "
+                    "(hermes-agent too old for per-channel prompts) — the "
+                    "configured channel prompt was dropped for chat %s",
+                    body["chatId"],
+                )
 
         await self.handle_message(event)
 
@@ -1309,25 +1479,14 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
     def _control_event(self, env: Dict[str, Any], text: str) -> Any:
         """Build a MessageEvent (for its SessionSource) from a control envelope.
 
-        Mirrors the body construction in :meth:`_dispatch_envelope` (keep
-        the two in sync!) so the SessionSource — and therefore the session
-        key — derived for a control envelope is IDENTICAL to the one the
-        chat's normal messages produce. ``text`` is cosmetic (the event is
-        never dispatched to the agent; it only feeds harness APIs that
-        take an event/source).
+        Shares :func:`_envelope_to_body` with :meth:`_dispatch_envelope`
+        (v4.5.1 review-d3 X20 dedup — previously two hand-kept copies) so
+        the SessionSource — and therefore the session key — derived for a
+        control envelope is IDENTICAL to the one the chat's normal messages
+        produce. ``text`` is cosmetic (the event is never dispatched to the
+        agent; it only feeds harness APIs that take an event/source).
         """
-        body = {
-            "chatId": env["entity_jid"],
-            "text": text,
-            "senderId": env.get("sender_jid"),
-            "chatType": (
-                "channel"
-                if env.get("chat_type") == "newsletter"
-                else env.get("chat_type") or "dm"
-            ),
-            "session": env.get("session_id"),
-        }
-        return normalize_payload(body, self.platform)
+        return normalize_payload(_envelope_to_body(env, text=text), self.platform)
 
     def _control_session_key(self, source: Any) -> str:
         """Hermes session key for ``source`` — same derivation as inbound.
@@ -1382,19 +1541,14 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         if isinstance(session_id, str) and session_id:
             self.register_chat_session(chat_id, session_id)
 
+        # v4.5.1 (review-d3 X20): dispatch through _CONTROL_ACTION_HANDLERS
+        # (the same map _CONTROL_ACTIONS is derived from) so the supported
+        # action set and the routing can never drift apart.
         action = env.get("action")
-        if action == "new_conversation":
-            await self._control_new_conversation(env)
-        elif action == "stop":
-            await self._control_stop(env)
-        elif action == "retry_last":
-            await self._control_retry_last(env)
-        elif action == "question_resolved":
-            # v4.5.0 (P8): owner replied /approve /deny /answer in their DM —
-            # resolve the matching pending question. MUST stay above the
-            # unknown-action fallthrough.
-            await self._control_question_resolved(env)
-        else:
+        handler_name = (
+            _CONTROL_ACTION_HANDLERS.get(action) if isinstance(action, str) else None
+        )
+        if handler_name is None:
             self._warn_unknown_control(
                 f"action={action!r}",
                 "control envelope with unknown action %r for chat %s — "
@@ -1402,6 +1556,8 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 action,
                 chat_id,
             )
+            return
+        await getattr(self, handler_name)(env)
 
     async def _control_new_conversation(self, env: Dict[str, Any]) -> None:
         """``/new`` from WhatsApp: reset the chat's hermes conversation.
@@ -1450,8 +1606,22 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     "continuing with reset"
                 )
         else:
-            with contextlib.suppress(Exception):
+            # v4.5.1 (review-d3 H6): no silent suppress — a failed adapter-
+            # side interrupt is operator-relevant (the old turn may keep
+            # streaming into the "new" conversation).
+            try:
                 await self.interrupt_session_activity(session_key, source.chat_id)
+            except Exception as exc:  # noqa: BLE001 — best-effort; reset proceeds
+                logger.warning(
+                    "control new_conversation: adapter-side "
+                    "interrupt_session_activity raised for %s (%s: %s) — "
+                    "an in-flight turn may not have been interrupted; "
+                    "continuing with reset",
+                    session_key,
+                    type(exc).__name__,
+                    exc,
+                    exc_info=True,
+                )
             getattr(self, "_pending_messages", {}).pop(session_key, None)
 
         # Step 1b: full reset via the runner's /new handler.
@@ -1537,19 +1707,33 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # wind down; dropping the pending slot prevents a queued follow-up
         # from re-firing the turn we just tried to stop.
         had_active = session_key in (getattr(self, "_active_sessions", None) or {})
-        with contextlib.suppress(Exception):
+        # v4.5.1 (review-d3 H6): no silent suppress, and the summary line
+        # below only claims the interrupt was signalled when it actually was.
+        interrupt_signalled = False
+        try:
             await self.interrupt_session_activity(session_key, source.chat_id)
+            interrupt_signalled = True
+        except Exception as exc:  # noqa: BLE001 — best-effort fallback
+            logger.warning(
+                "control stop: adapter-side interrupt_session_activity "
+                "raised for %s (%s: %s)",
+                session_key,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
         dropped = (
             getattr(self, "_pending_messages", {}).pop(session_key, None)
             is not None
         )
         logger.warning(
             "control stop: gateway cancellation API unavailable for %s — "
-            "signalled adapter interrupt event (active handler: %s), "
+            "%s adapter interrupt event (active handler: %s), "
             "dropped pending queued message: %s; an agent turn already "
             "executing inside the runner could NOT be cancelled from the "
             "adapter",
             session_key,
+            "signalled" if interrupt_signalled else "FAILED to signal",
             had_active,
             dropped,
         )
@@ -1646,18 +1830,33 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         qtype: str,
         text: str,
         chat_id: str,
+        *,
+        request_id: str,
         ttl_s: Optional[int] = None,
-    ) -> Optional[str]:
-        """POST one question to ``/api/v1/bot/questions``; return its request_id.
+    ) -> str:
+        """POST one question to ``/api/v1/bot/questions``; return an outcome.
 
-        Generates ``request_id = uuid4().hex`` (32 lowercase hex chars —
-        satisfies the server's 8..64 ``[A-Za-z0-9_-]`` charset/length rule).
-        Returns the request_id on 201, ``None`` on ANY failure (the caller
-        decides the degradation — SendResult failure / base-class fallback /
-        fail-closed deny). Retries exactly ONCE, with the SAME request_id,
-        on 502 ``owner_delivery_failed`` (the server rolls the row back
-        before returning 502, so the same id cannot trip
-        ``duplicate_request_id``). Never raises.
+        v4.5.1 (review-d3 X15): the caller now generates ``request_id``
+        (uuid4().hex — satisfies the server's 8..64 ``[A-Za-z0-9_-]`` rule)
+        and registers its pending-question entry BEFORE calling this, so a
+        ``question_resolved`` envelope racing the POST response can never
+        orphan the resolution. Return value is one of:
+
+        - :data:`_QPOST_CREATED` — 201, OR 409 ``duplicate_request_id``
+          (the question already exists server-side — e.g. the 502 retry
+          raced a row that was NOT rolled back; it will resolve/expire
+          normally, so the caller keeps waiting).
+        - :data:`_QPOST_UNKNOWN` — transport error / unexpected raise. The
+          POST's fate is unknowable: it MAY have been delivered and the
+          owner MAY still resolve it, so the caller KEEPS its registry
+          entry (the wait timeout / registry TTL cleans up).
+        - :data:`_QPOST_FAILED` — definitive server rejection (any other
+          non-201) or no credential. The caller pops its entry.
+
+        Retries exactly ONCE, with the SAME request_id, on 502
+        ``owner_delivery_failed`` (the server rolls the row back before
+        returning 502, so the same id cannot trip ``duplicate_request_id``;
+        if it does anyway, the 409 branch above absorbs it). Never raises.
         """
         if self._client is None or self._no_credential or not self._auth_token:
             logger.warning(
@@ -1665,8 +1864,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 "no credential",
                 qtype,
             )
-            return None
-        request_id = uuid.uuid4().hex
+            return _QPOST_FAILED
         body: Dict[str, Any] = {
             "type": qtype,
             "text": text,
@@ -1682,13 +1880,29 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 )
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # noqa: BLE001 -- never raises contract
+            except httpx.RequestError as exc:
                 logger.warning(
-                    "question POST transport error (type=%s): %s", qtype, exc
+                    "question POST transport error (type=%s, request_id=%s): "
+                    "%s — outcome UNKNOWN (the question may have been "
+                    "delivered; keeping the pending entry so an owner reply "
+                    "can still resolve it)",
+                    qtype,
+                    request_id,
+                    exc,
                 )
-                return None
+                return _QPOST_UNKNOWN
+            except Exception:  # noqa: BLE001 -- never-raises contract
+                # v4.5.1 (review-d3 X15): full traceback — an unexpected
+                # raise here is a bug, not a network blip.
+                logger.exception(
+                    "question POST raised unexpectedly (type=%s, "
+                    "request_id=%s) — outcome UNKNOWN",
+                    qtype,
+                    request_id,
+                )
+                return _QPOST_UNKNOWN
             if response.status_code == 201:
-                return request_id
+                return _QPOST_CREATED
             err: Optional[str] = None
             try:
                 payload = response.json()
@@ -1696,6 +1910,17 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     err = payload.get("error")
             except Exception:  # noqa: BLE001 -- diagnostic only
                 err = None
+            if response.status_code == 409 and err == "duplicate_request_id":
+                # The question row already exists for this request_id — it
+                # WILL be resolved or expire normally. Keep waiting on it.
+                logger.warning(
+                    "question POST got 409 duplicate_request_id (type=%s, "
+                    "request_id=%s) — question already exists server-side; "
+                    "keeping the pending wait",
+                    qtype,
+                    request_id,
+                )
+                return _QPOST_CREATED
             if response.status_code == 502 and attempt == 0:
                 # owner_delivery_failed: the server rolled the question row
                 # back, so retrying with the SAME request_id is safe (and
@@ -1706,15 +1931,16 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     err or "owner_delivery_failed",
                 )
                 continue
-            # Treat ANY non-201 as failure (LOCKED wire contract).
+            # Treat ANY other non-201 as definitive failure (LOCKED wire
+            # contract).
             logger.warning(
                 "question POST failed (type=%s): HTTP %d%s",
                 qtype,
                 response.status_code,
                 f" ({err})" if err else "",
             )
-            return None
-        return None
+            return _QPOST_FAILED
+        return _QPOST_FAILED
 
     async def send_exec_approval(
         self,
@@ -1746,19 +1972,10 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         if len(cmd) > _QUESTION_COMMAND_MAX_CHARS:
             cmd = cmd[:_QUESTION_COMMAND_MAX_CHARS] + "…"
         text = f"{description}:\n{cmd}"
-        request_id = await self._post_question("approval", text, chat_id)
-        if request_id is None:
-            logger.warning(
-                "send_exec_approval: question POST failed for chat %s — the "
-                "runner will fall back to a typed-/approve text prompt, but "
-                "under chatlytics the slash floor intercepts /approve "
-                "server-side, so the fallback is effectively dead and an "
-                "unresolved approval times out to DENY (fail-closed)",
-                chat_id,
-            )
-            return SendResult(
-                success=False, error="chatlytics question POST failed"
-            )
+        # v4.5.1 (review-d3 X15): register BEFORE the POST so a
+        # question_resolved envelope racing the POST response can never
+        # orphan the owner's reply.
+        request_id = uuid.uuid4().hex
         self._register_pending_question(
             request_id,
             {
@@ -1770,6 +1987,37 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 "created": time.monotonic(),
             },
         )
+        outcome = await self._post_question(
+            "approval",
+            text,
+            chat_id,
+            request_id=request_id,
+            # ttl aligned to the runner's gateway-side approval wait (+60 s
+            # margin) instead of the server's much longer default.
+            ttl_s=_question_ttl_s(_GATEWAY_QUESTION_WAIT_S),
+        )
+        if outcome != _QPOST_CREATED:
+            if outcome == _QPOST_FAILED:
+                # Definitive rejection — the question does NOT exist
+                # server-side; the entry can never resolve. Pop it.
+                self._pending_questions.pop(request_id, None)
+            # _QPOST_UNKNOWN keeps the entry: the POST may have landed and
+            # the owner may still /approve — resolve_gateway_approval would
+            # then unblock the runner's wait. Registry TTL/cap cleans up.
+            # v4.5.1 (review-d3 X15): question LOSS on the exec-approval
+            # path is an ERROR — the operator's command silently dies.
+            logger.error(
+                "send_exec_approval: question POST %s for chat %s — the "
+                "runner will fall back to a typed-/approve text prompt, but "
+                "under chatlytics the slash floor intercepts /approve "
+                "server-side, so the fallback is effectively dead and an "
+                "unresolved approval times out to DENY (fail-closed)",
+                "failed" if outcome == _QPOST_FAILED else "outcome unknown",
+                chat_id,
+            )
+            return SendResult(
+                success=False, error="chatlytics question POST failed"
+            )
         logger.info(
             "send_exec_approval: approval question %s routed to owner DM "
             "(chat %s)",
@@ -1809,16 +2057,9 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             lines.append("")
             lines.append("Answer with the option number or your own text.")
         text = "\n".join(lines)
-        request_id = await self._post_question("clarify", text, chat_id)
-        if request_id is None:
-            logger.warning(
-                "send_clarify: question POST failed for chat %s; falling "
-                "back to the base in-chat numbered-text prompt",
-                chat_id,
-            )
-            return await super().send_clarify(
-                chat_id, question, choices, clarify_id, session_key, metadata
-            )
+        # v4.5.1 (review-d3 X15): register BEFORE the POST (orphan fix —
+        # see send_exec_approval).
+        request_id = uuid.uuid4().hex
         self._register_pending_question(
             request_id,
             {
@@ -1830,12 +2071,99 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 "created": time.monotonic(),
             },
         )
+        outcome = await self._post_question(
+            "clarify",
+            text,
+            chat_id,
+            request_id=request_id,
+            ttl_s=_question_ttl_s(_GATEWAY_QUESTION_WAIT_S),
+        )
+        if outcome != _QPOST_CREATED:
+            if outcome == _QPOST_FAILED:
+                # Definitive rejection — no server-side question; pop.
+                self._pending_questions.pop(request_id, None)
+            # _QPOST_UNKNOWN keeps the entry: if the POST actually landed,
+            # the owner's /answer still resolves via resolve_gateway_clarify
+            # (first resolution wins; the loser is a logged no-op).
+            logger.warning(
+                "send_clarify: question POST %s for chat %s; falling "
+                "back to the base in-chat numbered-text prompt",
+                "failed" if outcome == _QPOST_FAILED else "outcome unknown",
+                chat_id,
+            )
+            return await super().send_clarify(
+                chat_id, question, choices, clarify_id, session_key, metadata
+            )
         logger.info(
             "send_clarify: clarify question %s routed to owner DM (chat %s)",
             request_id,
             chat_id,
         )
         return SendResult(success=True, message_id=request_id)
+
+    async def _ask_question(
+        self, qtype: str, text: str, chat_id: str, timeout_s: float
+    ) -> Optional[Tuple[Any, Any]]:
+        """Shared core of :meth:`ask_approval` / :meth:`ask_clarify`.
+
+        v4.5.1 (review-d3 X15 + X20): POSTs one ``qtype`` question and
+        awaits the owner's resolution future. Returns ``(resolution,
+        answer)`` or ``None`` on definitive POST failure / timeout.
+
+        Robustness contract:
+
+        - The future is registered BEFORE the POST (keyed by request_id) so
+          a ``question_resolved`` envelope racing the POST response can
+          never orphan the resolution.
+        - On transport-error / unknown POST outcome the future is KEPT and
+          awaited anyway — the question may have been delivered and the
+          owner may still resolve it; the ``timeout_s`` wait cleans up.
+        - Only a definitive server rejection (:data:`_QPOST_FAILED`)
+          returns early.
+        - The registry entry is popped in ``finally`` — resolved entries
+          were already popped by ``_control_question_resolved`` (no-op),
+          and timeout AND cancellation both clean up deterministically.
+        """
+        request_id = uuid.uuid4().hex
+        fut: "asyncio.Future[Tuple[Any, Any]]" = (
+            asyncio.get_running_loop().create_future()
+        )
+        self._register_pending_question(
+            request_id,
+            {
+                "kind": "future",
+                "session_key": None,
+                "clarify_id": None,
+                "future": fut,
+                "chat_id": chat_id,
+                "created": time.monotonic(),
+            },
+        )
+        try:
+            outcome = await self._post_question(
+                qtype,
+                text,
+                chat_id,
+                request_id=request_id,
+                ttl_s=_question_ttl_s(timeout_s),
+            )
+            if outcome == _QPOST_FAILED:
+                return None
+            try:
+                return await asyncio.wait_for(fut, timeout_s)
+            except asyncio.TimeoutError:
+                logger.info(
+                    "ask_%s %s timed out after %.0fs",
+                    qtype,
+                    request_id,
+                    timeout_s,
+                )
+                return None
+        finally:
+            # Cancellation-safe cleanup (review-d3 X15): whether resolved
+            # (already popped — no-op), timed out, POST-failed, or the
+            # awaiting task was cancelled, the entry never lingers.
+            self._pending_questions.pop(request_id, None)
 
     async def ask_approval(
         self, text: str, chat_id: str, timeout_s: float = 300.0
@@ -1847,35 +2175,10 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         timeout, and POST failure all return ``False`` (default DENY,
         fail-closed).
         """
-        request_id = await self._post_question("approval", text, chat_id)
-        if request_id is None:
-            return False
-        fut: "asyncio.Future[Tuple[Any, Any]]" = (
-            asyncio.get_running_loop().create_future()
-        )
-        self._register_pending_question(
-            request_id,
-            {
-                "kind": "future",
-                "session_key": None,
-                "clarify_id": None,
-                "future": fut,
-                "chat_id": chat_id,
-                "created": time.monotonic(),
-            },
-        )
-        try:
-            resolution, _answer = await asyncio.wait_for(fut, timeout_s)
-        except asyncio.TimeoutError:
-            # Pop the registry entry so a post-timeout resolution does not
-            # try to set_result on an abandoned future.
-            self._pending_questions.pop(request_id, None)
-            logger.info(
-                "ask_approval %s timed out after %.0fs — denying (fail-closed)",
-                request_id,
-                timeout_s,
-            )
-            return False
+        result = await self._ask_question("approval", text, chat_id, timeout_s)
+        if result is None:
+            return False  # fail-closed DENY
+        resolution, _answer = result
         return resolution == "approved"
 
     async def ask_clarify(
@@ -1886,33 +2189,10 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         Returns the owner's answer string on resolution ``"answered"``;
         denied, timeout, and POST failure all return ``None``.
         """
-        request_id = await self._post_question("clarify", text, chat_id)
-        if request_id is None:
+        result = await self._ask_question("clarify", text, chat_id, timeout_s)
+        if result is None:
             return None
-        fut: "asyncio.Future[Tuple[Any, Any]]" = (
-            asyncio.get_running_loop().create_future()
-        )
-        self._register_pending_question(
-            request_id,
-            {
-                "kind": "future",
-                "session_key": None,
-                "clarify_id": None,
-                "future": fut,
-                "chat_id": chat_id,
-                "created": time.monotonic(),
-            },
-        )
-        try:
-            resolution, answer = await asyncio.wait_for(fut, timeout_s)
-        except asyncio.TimeoutError:
-            self._pending_questions.pop(request_id, None)
-            logger.info(
-                "ask_clarify %s timed out after %.0fs — returning None",
-                request_id,
-                timeout_s,
-            )
-            return None
+        resolution, answer = result
         if resolution == "answered" and isinstance(answer, str):
             return answer
         return None
@@ -2211,6 +2491,11 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             # Idempotency: don't spawn a second poll task on re-connect.
             if self._poll_task is None or self._poll_task.done():
                 self._poll_task = asyncio.create_task(self._poll_loop())
+                # v4.5.1 (review-d3 X1): belt + suspenders for the loop's
+                # never-exit contract — if the task ever completes without
+                # being cancelled, that is a dead inbound transport and MUST
+                # be unmissable in the log.
+                self._poll_task.add_done_callback(self._on_poll_task_done)
             logger.info(
                 "chatlytics inbound: longpoll mode (polling /api/v1/bot/updates)"
             )
@@ -2276,6 +2561,35 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
         self._running = True
         return True
+
+    def _on_poll_task_done(self, task: "asyncio.Task") -> None:
+        """Done-callback for the longpoll task (v4.5.1 — review-d3 X1).
+
+        ``_poll_loop`` is contractually exit-proof (every exception except
+        CancelledError is caught inside the loop), so this callback firing
+        for anything other than a cancellation means the contract was
+        somehow violated — inbound is DEAD until reconnect, which is the
+        exact "silent bot" failure mode X1 exists to make unmissable.
+        """
+        if task.cancelled():
+            return  # disconnect() — clean shutdown.
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                "chatlytics longpoll task EXITED with %r — inbound is DEAD "
+                "until the gateway reconnects (this should be impossible; "
+                "the loop's catch-all was bypassed)",
+                exc,
+                exc_info=exc,
+            )
+        elif self._running:
+            # Completed normally while we were still supposed to be running
+            # (the client-is-None teardown-race guard is the only normal
+            # return, and disconnect() flips _running first).
+            logger.error(
+                "chatlytics longpoll task EXITED (returned while running) — "
+                "inbound is DEAD until the gateway reconnects"
+            )
 
     async def _log_boot_identity(self) -> None:
         """Best-effort GET /api/v1/bot/me after a successful health check.
@@ -2446,6 +2760,13 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 # Never lose the reply over the edit decoration: retry ONCE
                 # as a plain send without edit_message_id. The bubble stays
                 # behind as an acceptable residual.
+                #
+                # At-least-once tradeoff (review-d3 X16/M1): the failed
+                # first attempt may have actually reached the server (e.g.
+                # the response was lost in transit after delivery), so this
+                # retry can DOUBLE-DELIVER the reply. Accepted deliberately:
+                # a duplicated reply is recoverable UX noise; a silently
+                # lost reply is a dead bot.
                 logger.debug(
                     "edit-tagged send transport error for chat %s (%s); "
                     "retrying once as plain send",
@@ -2453,6 +2774,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     exc,
                 )
                 body.pop("edit_message_id", None)
+                edit_message_id = None  # retried plain — no edit outcome to log
                 try:
                     response = await self._client.post("/api/v1/send", json=body)
                 except httpx.RequestError as exc2:
@@ -2468,27 +2790,63 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     retryable=True,
                 )
 
-        # Tolerate non-JSON bodies for diagnostic surface area.
+        # v4.5.1 (review-d3 X16/M1): edit-tagged send that came back NON-200
+        # also retries once as a plain send — previously only the transport-
+        # error path retried, so a server that 500s on the edit decoration
+        # lost the reply entirely. Same at-least-once double-deliver
+        # tradeoff as the transport-error retry above.
+        if edit_message_id and response.status_code != 200:
+            logger.warning(
+                "edit-tagged send returned HTTP %d for chat %s; retrying "
+                "once as plain send",
+                response.status_code,
+                chat_id,
+            )
+            body.pop("edit_message_id", None)
+            edit_message_id = None
+            try:
+                response = await self._client.post("/api/v1/send", json=body)
+            except httpx.RequestError as exc2:
+                return SendResult(
+                    success=False,
+                    error=f"Transport error: {exc2}",
+                    retryable=True,
+                )
+
+        # v4.5.1 (review-d3 X16/M6): a 200 with a NON-JSON body is a broken
+        # contract, not a success — /api/v1/send always answers JSON, so a
+        # raw HTML error page (proxy, captive portal, crashed middleware)
+        # must not be reported as "delivered".
         try:
             payload: Any = response.json()
         except Exception:  # noqa: BLE001 -- json.JSONDecodeError + httpx variants
-            # HERMES-09 (closes 02-LOW-01): operators tracing a
-            # malformed gateway response can now see why raw_text was
-            # used instead of the parsed payload.
-            logger.debug(
-                "send() response was not JSON; using raw_text fallback"
+            snippet = (response.text or "")[:120]
+            logger.warning(
+                "send() got HTTP %d with a non-JSON body for chat %s — "
+                "treating as failure (body[:120]=%r)",
+                response.status_code,
+                chat_id,
+                snippet,
             )
-            payload = {"raw_text": response.text}
+            return SendResult(
+                success=False,
+                error=f"non-JSON response (HTTP {response.status_code})",
+                raw_response={"raw_text": response.text},
+                retryable=response.status_code >= 500,
+            )
 
-        if (
-            response.status_code == 200
-            and isinstance(payload, dict)
-            and payload.get("success", True)
-        ):
+        # v4.5.1 (review-d3 X20): success derivation + message-id extraction
+        # now reuse the shared helpers (_coerce_success_payload /
+        # _extract_message_id) so send(), the media handlers, and the tool
+        # layer agree on the contract (and the messageId/message_id
+        # fallback ORDER no longer drifts between send() and the P7 bubble
+        # path).
+        success, error_msg = _coerce_success_payload(response.status_code, payload)
+        if success:
             # v4.4.0 (P7): surface the server's edit outcome at DEBUG. A 200
             # means the text was delivered either way (the server falls back
             # to a plain send internally on edit failure / unknown ownership).
-            if edit_message_id:
+            if edit_message_id and isinstance(payload, dict):
                 if payload.get("edited"):
                     logger.debug(
                         "send edited progress bubble %s in place for chat %s",
@@ -2504,17 +2862,10 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     )
             return SendResult(
                 success=True,
-                # P7: servers >= chatlytics v5.4 return top-level
-                # ``message_id`` (normalized WAHA id); older shapes used
-                # ``messageId``. Prefer the legacy key first so pre-P7
-                # behavior is unchanged, fall back to the new one.
-                message_id=payload.get("messageId") or payload.get("message_id"),
+                message_id=self._extract_message_id(payload),
                 raw_response=payload,
             )
 
-        error_msg = (
-            payload.get("error") if isinstance(payload, dict) else None
-        ) or f"HTTP {response.status_code}"
         return SendResult(
             success=False,
             error=error_msg,
@@ -2878,9 +3229,10 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         if success:
             return SendResult(
                 success=True,
-                message_id=(
-                    payload.get("messageId") if isinstance(payload, dict) else None
-                ),
+                # v4.5.1 (review-d3 X20): shared extractor — same
+                # message_id/messageId/waha-echo fallback order as send()
+                # and the P7 bubble path.
+                message_id=self._extract_message_id(payload),
                 raw_response=payload,
             )
 

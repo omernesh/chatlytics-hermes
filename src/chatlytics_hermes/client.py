@@ -18,9 +18,11 @@ import httpx
 logger = logging.getLogger("chatlytics_hermes.client")
 
 DEFAULT_TIMEOUT_SECONDS: float = 30.0
-# HERMES-V2 (Phase 336): User-Agent tracks the package version (4.1.2 ships
-# DNS-default base_url + optional URL). Previously stuck at 2.0.0 since v2 release.
-USER_AGENT: str = "chatlytics-hermes/4.5.0"
+# User-Agent tracks the package version — keep in lockstep with
+# pyproject.toml / plugin.yaml / __init__.__version__ on EVERY release
+# (adapter._PLUGIN_VERSION is parsed from this string). History: stuck at
+# 2.0.0 until HERMES-V2 (Phase 336) tied it to the release cycle.
+USER_AGENT: str = "chatlytics-hermes/4.5.1"
 
 
 class ChatlyticsClient:

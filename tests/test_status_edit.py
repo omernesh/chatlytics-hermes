@@ -383,6 +383,104 @@ async def test_plain_send_transport_failure_does_not_retry(
     await adapter.disconnect()
 
 
+# --- v4.5.1 (review-d3 X16): edit-tagged NON-200 also retries once plain ----
+
+
+async def test_edit_tagged_non_200_retries_once_plain(
+    mock_router: respx.MockRouter, caplog
+) -> None:
+    """A server that 500s on the edit decoration must not lose the reply:
+    ONE plain retry (same at-least-once tradeoff as the transport path)."""
+    adapter = make_adapter()
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    send_route = mock_router.post("/api/v1/send").mock(
+        side_effect=[
+            httpx.Response(500, json={"error": "edit blew up"}),
+            httpx.Response(200, json={"success": True, "messageId": "plain-ok"}),
+        ]
+    )
+    await adapter.connect()
+    adapter._store_progress_bubble(CHAT_ID, "bubble-11")
+
+    with caplog.at_level(logging.WARNING, logger="chatlytics_hermes.adapter"):
+        result = await adapter.send(CHAT_ID, "important reply")
+
+    assert result.success is True
+    assert result.message_id == "plain-ok"
+    bodies = send_bodies(send_route)
+    assert len(bodies) == 2
+    assert bodies[0]["edit_message_id"] == "bubble-11"
+    assert "edit_message_id" not in bodies[1], "retry must be a plain send"
+    assert any(
+        "retrying once as plain send" in r.getMessage() for r in caplog.records
+    )
+    await adapter.disconnect()
+
+
+async def test_edit_tagged_double_non_200_returns_failure(
+    mock_router: respx.MockRouter,
+) -> None:
+    adapter = make_adapter()
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    send_route = mock_router.post("/api/v1/send").mock(
+        return_value=httpx.Response(500, json={"error": "still broken"})
+    )
+    await adapter.connect()
+    adapter._store_progress_bubble(CHAT_ID, "bubble-12")
+
+    result = await adapter.send(CHAT_ID, "doomed reply")
+    assert result.success is False
+    assert result.retryable is True
+    assert len(send_route.calls) == 2, "exactly one retry"
+    await adapter.disconnect()
+
+
+async def test_plain_send_non_200_does_not_retry(
+    mock_router: respx.MockRouter,
+) -> None:
+    """No pending bubble → a non-200 fails immediately (no retry — only the
+    edit decoration earns the at-least-once retry)."""
+    adapter = make_adapter()
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    send_route = mock_router.post("/api/v1/send").mock(
+        return_value=httpx.Response(500, json={"error": "down"})
+    )
+    await adapter.connect()
+    result = await adapter.send(CHAT_ID, "plain")
+    assert result.success is False
+    assert len(send_route.calls) == 1
+    await adapter.disconnect()
+
+
+# --- v4.5.1 (review-d3 M6): 200 + non-JSON body is a failure ----------------
+
+
+async def test_send_200_with_non_json_body_is_failure(
+    mock_router: respx.MockRouter, caplog
+) -> None:
+    adapter = make_adapter()
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    mock_router.post("/api/v1/send").mock(
+        return_value=httpx.Response(
+            200, text="<html>proxy error page</html>",
+            headers={"content-type": "text/html"},
+        )
+    )
+    await adapter.connect()
+
+    with caplog.at_level(logging.WARNING, logger="chatlytics_hermes.adapter"):
+        result = await adapter.send(CHAT_ID, "hello")
+
+    assert result.success is False
+    assert "non-JSON" in (result.error or "")
+    assert result.retryable is False  # 200 — not a 5xx
+    assert any(
+        "non-JSON body" in r.getMessage() and "proxy error page" in r.getMessage()
+        for r in caplog.records
+    )
+    await adapter.disconnect()
+
+
 # --- Flag off: pure v4.3.0 behavior ----------------------------------------
 
 

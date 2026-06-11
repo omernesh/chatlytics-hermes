@@ -417,6 +417,188 @@ async def test_poll_loop_401_logs_error_once_and_backs_off_at_cap(
     assert "CHATLYTICS_BOT_TOKEN" in errors[0].getMessage()
 
 
+async def test_poll_loop_survives_unexpected_exception(
+    sleep_recorder, caplog
+) -> None:
+    """v4.5.1 (review-d3 X1): an UNEXPECTED exception (not httpx transport,
+    not HTTP-status) must NOT kill the loop — it logs ERROR with traceback
+    and takes the same bounded-backoff retry path."""
+    adapter = _make_adapter()
+    envelope = {
+        "session_id": "3cf11776_logan",
+        "chat_type": "dm",
+        "entity_jid": "972544329000@c.us",
+        "sender_jid": "972544329000@c.us",
+        "text": "still alive",
+        "ts": 3,
+    }
+    fake = ScriptedClient(
+        adapter,
+        script=[
+            ("raise", RuntimeError("totally unexpected")),
+            ("response", 200, {"envelopes": [envelope], "cursor": "c3"}),
+        ],
+    )
+    events: List[Any] = []
+
+    async def _recorder(event: Any) -> None:
+        events.append(event)
+
+    adapter.handle_message = _recorder  # type: ignore[assignment]
+    adapter._client = fake  # type: ignore[assignment]
+    adapter._running = True
+
+    with caplog.at_level(logging.DEBUG, logger="chatlytics_hermes.adapter"):
+        await adapter._poll_loop()  # must NOT raise
+
+    # Backed off once (ladder base) and kept polling.
+    assert len(sleep_recorder) == 1
+    assert _BACKOFF_LADDER[0] <= sleep_recorder[0] <= _BACKOFF_LADDER[0] * (
+        1.0 + _BACKOFF_JITTER_FRAC
+    )
+    # ERROR with traceback, naming the error class.
+    tracebacks = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.ERROR
+        and "unexpected RuntimeError" in r.getMessage()
+        and r.exc_info
+    ]
+    assert len(tracebacks) == 1
+    # The loop survived and dispatched the next batch.
+    assert [ev.text for ev in events] == ["still alive"]
+
+
+async def test_poll_loop_unexpected_exception_traceback_once_per_class(
+    sleep_recorder, caplog
+) -> None:
+    """A hot repeated unexpected error logs its traceback ONCE (then DEBUG)
+    — no log flood, but never a silent loop exit."""
+    adapter = _make_adapter()
+    fake = ScriptedClient(
+        adapter,
+        script=[
+            ("raise", RuntimeError("boom 1")),
+            ("raise", RuntimeError("boom 2")),
+            ("raise", RuntimeError("boom 3")),
+        ],
+    )
+    adapter._client = fake  # type: ignore[assignment]
+    adapter._running = True
+
+    with caplog.at_level(logging.DEBUG, logger="chatlytics_hermes.adapter"):
+        await adapter._poll_loop()
+
+    assert len(sleep_recorder) == 3, "every failure must take the backoff path"
+    tracebacks = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.ERROR
+        and "unexpected RuntimeError" in r.getMessage()
+        and r.exc_info
+    ]
+    assert len(tracebacks) == 1, "traceback logs once per distinct error class"
+
+
+async def test_poll_task_done_callback_logs_error_on_noncancelled_exit(
+    caplog,
+) -> None:
+    """v4.5.1 (review-d3 X1 belt+suspenders): if the poll task EVER completes
+    without being cancelled, the done-callback logs an unmissable ERROR."""
+    adapter = _make_adapter()
+    adapter._running = True
+
+    async def _boom() -> None:
+        raise RuntimeError("loop contract violated")
+
+    task = asyncio.get_running_loop().create_task(_boom())
+    try:
+        await task
+    except RuntimeError:
+        pass
+
+    with caplog.at_level(logging.ERROR, logger="chatlytics_hermes.adapter"):
+        adapter._on_poll_task_done(task)
+
+    assert any(
+        "longpoll task EXITED" in r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.ERROR
+    )
+
+
+async def test_poll_task_done_callback_silent_on_cancel_and_clean_shutdown(
+    caplog,
+) -> None:
+    adapter = _make_adapter()
+
+    # Cancellation (disconnect path) — silent.
+    async def _forever() -> None:
+        await asyncio.Event().wait()
+
+    task = asyncio.get_running_loop().create_task(_forever())
+    await asyncio.sleep(0)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    # Normal return while NOT running (teardown race) — silent.
+    async def _noop() -> None:
+        return None
+
+    adapter._running = False
+    done = asyncio.get_running_loop().create_task(_noop())
+    await done
+
+    with caplog.at_level(logging.ERROR, logger="chatlytics_hermes.adapter"):
+        adapter._on_poll_task_done(task)
+        adapter._on_poll_task_done(done)
+
+    assert not any(
+        "longpoll task EXITED" in r.getMessage() for r in caplog.records
+    )
+
+
+async def test_connect_wires_done_callback_that_surfaces_poll_death(
+    caplog, monkeypatch
+) -> None:
+    """End-to-end wiring check: connect() attaches the done-callback, so a
+    (contract-violating) poll-loop death surfaces as the EXITED ERROR."""
+    adapter = _make_adapter()
+
+    async def _dying_loop() -> None:
+        raise RuntimeError("escaped the catch-all somehow")
+
+    monkeypatch.setattr(adapter, "_poll_loop", _dying_loop)
+
+    class _HealthyClient:
+        base_url = BASE_URL
+
+        async def get(self, path: str, **kwargs: Any) -> httpx.Response:
+            return httpx.Response(
+                200, json={"name": "TestBot"}, request=httpx.Request("GET", BASE_URL + path)
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    adapter._client = _HealthyClient()  # type: ignore[assignment]
+
+    with caplog.at_level(logging.ERROR, logger="chatlytics_hermes.adapter"):
+        assert await adapter.connect() is True
+        # Let the task die and the done-callback fire.
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    assert any(
+        "longpoll task EXITED" in r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.ERROR
+    )
+
+
 # --- 4. Boot loud-failure + doctor ------------------------------------------
 
 

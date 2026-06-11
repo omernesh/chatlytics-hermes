@@ -515,6 +515,169 @@ async def test_ask_clarify_timeout_returns_none() -> None:
     assert adapter._pending_questions == {}
 
 
+# --- v4.5.1 (review-d3 X15) question robustness -----------------------------------
+
+
+class RecordingRegistryClient(FakeQuestionsClient):
+    """FakeQuestionsClient that snapshots the pending registry AT POST time."""
+
+    def __init__(self, adapter: ChatlyticsAdapter, responses=None) -> None:
+        super().__init__(responses)
+        self._adapter = adapter
+        self.registered_at_post: List[bool] = []
+
+    async def post(self, path: str, *, json=None, timeout=None):
+        rid = (json or {}).get("request_id")
+        self.registered_at_post.append(rid in self._adapter._pending_questions)
+        return await super().post(path, json=json, timeout=timeout)
+
+
+class RaisingQuestionsClient:
+    """Questions client whose POST always raises a transport error."""
+
+    def __init__(self) -> None:
+        self.post_calls: List[Dict[str, Any]] = []
+        self.base_url = BASE_URL
+
+    async def post(self, path: str, *, json=None, timeout=None):
+        self.post_calls.append({"path": path, "json": dict(json or {})})
+        raise httpx.ConnectError("connection refused")
+
+    async def aclose(self) -> None:  # pragma: no cover — parity
+        return None
+
+
+async def test_pending_entry_registered_before_post() -> None:
+    """The registry entry (and future) must exist BEFORE the POST goes out,
+    so a question_resolved envelope racing the POST response can never
+    orphan the resolution."""
+    adapter = _make_adapter()
+    fake = RecordingRegistryClient(adapter)
+    adapter._client = fake  # type: ignore[assignment]
+
+    await adapter.send_exec_approval(
+        chat_id=CHAT_ID, command="echo", session_key=SESSION_KEY
+    )
+    result = await adapter.ask_approval("deploy?", CHAT_ID, timeout_s=0.01)
+
+    assert result is False  # timed out — nothing resolved it
+    assert fake.registered_at_post == [True, True], (
+        "registry entry must be present at POST time for BOTH the "
+        "send_exec_approval and ask_approval paths"
+    )
+
+
+async def test_ask_approval_transport_error_keeps_waiting_for_resolution() -> None:
+    """Transport error = unknown outcome: the question MAY have been
+    delivered, so the future is KEPT and an owner approval still wins."""
+    adapter = _make_adapter()
+    adapter._client = RaisingQuestionsClient()  # type: ignore[assignment]
+
+    task = asyncio.create_task(
+        adapter.ask_approval("deploy?", CHAT_ID, timeout_s=5.0)
+    )
+    rid = await _wait_for_pending(adapter)
+    await adapter._handle_control_envelope(_resolved_envelope(rid, "approved"))
+
+    assert await task is True, (
+        "owner approval after a transport-errored POST must still resolve"
+    )
+    assert adapter._pending_questions == {}
+
+
+async def test_ask_approval_transport_error_times_out_to_deny() -> None:
+    adapter = _make_adapter()
+    adapter._client = RaisingQuestionsClient()  # type: ignore[assignment]
+
+    assert await adapter.ask_approval("deploy?", CHAT_ID, timeout_s=0.01) is False
+    assert adapter._pending_questions == {}, "timeout must clean the entry"
+
+
+async def test_send_exec_approval_transport_error_keeps_entry() -> None:
+    """Unknown POST outcome on the runner path keeps the registry entry so a
+    late owner /approve can still resolve the gateway-side wait."""
+    adapter = _make_adapter()
+    adapter._client = RaisingQuestionsClient()  # type: ignore[assignment]
+
+    result = await adapter.send_exec_approval(
+        chat_id=CHAT_ID, command="echo", session_key=SESSION_KEY
+    )
+
+    assert result.success is False
+    assert len(adapter._pending_questions) == 1, (
+        "transport-error (unknown outcome) must KEEP the pending entry"
+    )
+
+
+async def test_409_duplicate_request_id_treated_as_question_exists() -> None:
+    """409 duplicate_request_id means the question row already exists —
+    keep waiting (NOT a failure)."""
+    adapter, fake = _adapter_with_client(
+        responses=[(409, {"error": "duplicate_request_id"})]
+    )
+
+    task = asyncio.create_task(
+        adapter.ask_approval("deploy?", CHAT_ID, timeout_s=5.0)
+    )
+    rid = await _wait_for_pending(adapter)
+    await adapter._handle_control_envelope(_resolved_envelope(rid, "approved"))
+
+    assert await task is True
+    assert len(fake.post_calls) == 1, "no retry on duplicate_request_id"
+
+
+async def test_send_exec_approval_409_duplicate_is_success() -> None:
+    adapter, fake = _adapter_with_client(
+        responses=[(409, {"error": "duplicate_request_id"})]
+    )
+
+    result = await adapter.send_exec_approval(
+        chat_id=CHAT_ID, command="echo", session_key=SESSION_KEY
+    )
+
+    assert result.success is True
+    assert len(adapter._pending_questions) == 1
+
+
+async def test_question_posts_carry_ttl_aligned_to_wait() -> None:
+    """ttl_s rides every question POST, aligned to the caller's wait + 60 s
+    (clamped to the server's 60..86400 contract range)."""
+    adapter, fake = _adapter_with_client()
+
+    await adapter.send_exec_approval(
+        chat_id=CHAT_ID, command="echo", session_key=SESSION_KEY
+    )
+    await adapter.send_clarify(
+        chat_id=CHAT_ID,
+        question="q?",
+        choices=None,
+        clarify_id=CLARIFY_ID,
+        session_key=SESSION_KEY,
+    )
+    await adapter.ask_approval("deploy?", CHAT_ID, timeout_s=0.01)
+
+    ttls = [c["json"].get("ttl_s") for c in fake.post_calls]
+    # send_exec_approval / send_clarify: runner wait 600 s → 660.
+    assert ttls[0] == 660 and ttls[1] == 660
+    # ask_approval(timeout_s=0.01): clamped to the server minimum 60.
+    assert ttls[2] == 60
+
+
+async def test_ask_clarify_ttl_matches_explicit_timeout() -> None:
+    adapter, fake = _adapter_with_client()
+
+    task = asyncio.create_task(
+        adapter.ask_clarify("env?", CHAT_ID, timeout_s=300.0)
+    )
+    rid = await _wait_for_pending(adapter)
+    await adapter._handle_control_envelope(
+        _resolved_envelope(rid, "answered", answer="staging")
+    )
+
+    assert await task == "staging"
+    assert fake.post_calls[0]["json"]["ttl_s"] == 360  # 300 + 60
+
+
 # --- registry bound ---------------------------------------------------------------
 
 

@@ -1,5 +1,77 @@
 # Changelog
 
+## [4.5.1] - 2026-06-11
+
+Review-d3 fix pass: poll-loop resilience, question-flow robustness, and
+observability hardening across the v4.3.0–v4.5.0 surface. No wire-contract
+changes.
+
+### Fixed
+
+- **CRITICAL (X1) — poll loop can no longer die silently.** The longpoll
+  loop previously caught only `CancelledError` + `httpx.RequestError`; any
+  other exception killed the task with no done-callback and no log — a
+  silently dead bot. The ENTIRE loop iteration is now wrapped: unexpected
+  exceptions log `ERROR` with a full traceback (once per distinct error
+  class, DEBUG thereafter) and take the same bounded-backoff retry path;
+  the loop exits ONLY on `CancelledError`. Belt + suspenders: `connect()`
+  attaches a done-callback that logs an unmissable
+  `"chatlytics longpoll task EXITED"` ERROR if the task ever completes
+  non-cancelled.
+- **(H6) `/new` + `/stop` interrupt failures are no longer suppressed.**
+  The adapter-side `interrupt_session_activity` fallbacks swapped
+  `contextlib.suppress(Exception)` for try/except WARNING (with
+  traceback); the `/stop` summary line now says `"FAILED to signal"`
+  instead of falsely claiming the interrupt event was signalled.
+- **(H7) channel-prompt harness-drift fallbacks warn once.** A missing /
+  raising `resolve_channel_prompt` and a `MessageEvent` without the
+  `channel_prompt` attribute each log one WARNING naming the drift (then
+  DEBUG), on both the longpoll and webhook paths — previously silent.
+- **(H8) longpoll ack non-200 is logged.** 401 → ERROR with
+  rotate-the-token guidance; any other non-200 → WARNING (the read pointer
+  did not advance; envelopes re-deliver).
+- **(H9) degraded-reason CHANGE logs at the new reason's level** (e.g.
+  transport error → HTTP 401), not just the healthy→degraded edge.
+  Transport errors compare by a detail-free reason class so a flapping
+  network still logs exactly one WARNING per episode (P3 contract kept).
+- **(M1/M2 — X15) question-flow robustness.** Pending-question entries
+  (and ask-primitive futures) are registered BEFORE the POST keyed by
+  request_id, so a `question_resolved` envelope racing the POST response
+  can never orphan the owner's reply. Transport-error / unknown POST
+  outcome KEEPS the entry (the question may have been delivered; the
+  owner's reply still resolves it — wait timeout / registry TTL cleans
+  up). 409 `duplicate_request_id` now means "question exists — keep
+  waiting", not failure. Every question POST carries `ttl_s` aligned to
+  its wait (+60 s, server-clamped 60..86400). Awaiter cleanup moved to a
+  cancellation-safe `finally`. `_post_question` unexpected raises log a
+  full traceback; exec-approval question loss logs at ERROR.
+- **(M1/M6 — X16) edit-tagged send hardening.** A non-200 on an
+  edit-tagged send now retries once as a plain send (previously only
+  transport errors retried) — the at-least-once double-deliver tradeoff is
+  documented inline. A 200 with a non-JSON body is now a FAILURE (WARNING
+  with the first 120 chars), not a silent success.
+- **(M7) webhook dispatch-exception handling documented.** Kept the
+  200-ack + `log.exception` choice with an inline comment explaining WHY
+  (the chatlytics webhook-forwarder retries 5xx up to 3×; handler raises
+  are deterministic and may follow partial dispatch → a 500 would cause
+  duplicate agent turns).
+
+### Changed (internal hygiene — X20)
+
+- `_STATUS_BUBBLE_AFTER_DEFAULT_S` constant replaces the magic `8.0`.
+- `_CONTROL_ACTIONS` is now derived from the `_CONTROL_ACTION_HANDLERS`
+  map that `_handle_control_envelope` dispatches through (set and routing
+  can no longer drift).
+- `_envelope_to_body` extracted — `_dispatch_envelope` and
+  `_control_event` no longer carry hand-synced copies of the
+  envelope→body translation.
+- `send()` success derivation reuses `_coerce_success_payload` +
+  `_extract_message_id` (messageId/message_id fallback-order drift fixed;
+  `_make_send_result` unified on the same extractor).
+- `ask_approval` / `ask_clarify` deduplicated onto a shared
+  `_ask_question` core.
+- `client.py` stale version comment replaced with a keep-in-lockstep note.
+
 ## [4.5.0] - 2026-06-11
 
 Native exec-approval + clarify hooks routed to the chatlytics owner-DM

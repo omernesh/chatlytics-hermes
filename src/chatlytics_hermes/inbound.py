@@ -41,6 +41,20 @@ except ImportError:  # hermes-agent missing -- module still imports cleanly
 
 logger = logging.getLogger("chatlytics_hermes.inbound")
 
+# v4.5.1 (review-d3 H7): warn-once dedup keys for harness-version-drift
+# fallbacks (module-level — the drift is per-process, not per-adapter).
+# Bounded by construction: only fixed literal keys are ever added.
+_WARNED_ONCE: set = set()
+
+
+def _warn_once(key: str, msg: str, *args: Any) -> None:
+    """WARNING the first time ``key`` is seen; DEBUG thereafter."""
+    if key in _WARNED_ONCE:
+        logger.debug(msg, *args)
+        return
+    _WARNED_ONCE.add(key)
+    logger.warning(msg, *args)
+
 # Map Chatlytics-side ``mediaType`` strings -> Hermes ``MessageType``
 # members.  ``"image"`` is an alias for ``PHOTO`` because the Chatlytics
 # gateway speaks WhatsApp-flavored payloads ("image") while Hermes calls
@@ -234,21 +248,59 @@ def make_webhook_handler(adapter: Any) -> Callable[[web.Request], Any]:
         try:
             cp = payload.get("channel_prompt")
             if not (isinstance(cp, str) and cp.strip()):
-                from gateway.platforms.base import resolve_channel_prompt
+                try:
+                    from gateway.platforms.base import resolve_channel_prompt
 
-                cp = resolve_channel_prompt(
-                    getattr(getattr(adapter, "config", None), "extra", None)
-                    or {},
-                    event.source.chat_id,
-                )
-            if isinstance(cp, str) and cp.strip() and hasattr(event, "channel_prompt"):
-                event.channel_prompt = cp.strip()
+                    cp = resolve_channel_prompt(
+                        getattr(getattr(adapter, "config", None), "extra", None)
+                        or {},
+                        event.source.chat_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 -- harness drift
+                    # v4.5.1 (review-d3 H7): version drift is operator-
+                    # relevant — local channel_prompts config silently
+                    # never applies. WARNING once, DEBUG thereafter.
+                    _warn_once(
+                        "channel_prompt:resolver_unavailable",
+                        "channel-prompt config fallback unavailable: "
+                        "gateway.platforms.base.resolve_channel_prompt "
+                        "missing or raised (%s: %s) — hermes-agent version "
+                        "drift; local channel_prompts config will NOT apply",
+                        type(exc).__name__,
+                        exc,
+                    )
+                    cp = None
+            if isinstance(cp, str) and cp.strip():
+                if hasattr(event, "channel_prompt"):
+                    event.channel_prompt = cp.strip()
+                else:
+                    # v4.5.1 (review-d3 H7): configured prompt DROPPED —
+                    # name the missing attribute.
+                    _warn_once(
+                        "channel_prompt:event_attr_missing",
+                        "MessageEvent has no channel_prompt attribute "
+                        "(hermes-agent too old for per-channel prompts) — "
+                        "the configured channel prompt was dropped for "
+                        "chat %s",
+                        event.source.chat_id,
+                    )
         except Exception:  # noqa: BLE001 -- prompt injection must never break dispatch
             logger.debug("channel_prompt injection raised; continuing")
 
         try:
             await adapter.handle_message(event)
         except Exception:  # noqa: BLE001 -- never let dispatch errors crash the server
+            # v4.5.1 (review-d3 M7): deliberately ack 200 + log at ERROR
+            # rather than returning 500. The chatlytics server's
+            # webhook-forwarder (src/webhook-forwarder.ts) retries 5xx /
+            # 408 / network errors up to 3 more times before dead-lettering
+            # — but a handle_message raise here is almost always
+            # DETERMINISTIC (payload/harness bug), and worse, the raise may
+            # land AFTER the agent turn was partially dispatched, so a 500
+            # would make the server re-POST the same message and trigger
+            # duplicate agent turns. 200 + the unmissable traceback below
+            # is the lesser evil; non-deterministic transport-level
+            # failures never reach this handler in the first place.
             logger.exception("handle_message raised; webhook still acked")
 
         return web.json_response({"status": "accepted"}, status=200)
