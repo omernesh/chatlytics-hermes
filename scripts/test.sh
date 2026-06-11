@@ -1,48 +1,54 @@
 #!/usr/bin/env bash
-# Phase 168.6 (Fix 10, 2026-04-25): Reproducible pytest runner for the Hermes adapter.
+# Reproducible pytest runner for chatlytics-hermes.
 #
-# Local Python 3.14 hangs without output for reasons we couldn't isolate; this
-# wrapper runs pytest inside a python:3.13-slim Docker container so anyone on
-# any host can reproduce a known-good environment.
+# v4.2.0 (P3 survivability) rewrite: the previous version was carried over
+# from the monorepo era (mounted ../../.. , installed a nonexistent "[test]"
+# extra) AND — critically — its host fallback ran a plain
+# `pip install -e .` into the CURRENT environment. That exact pattern is how
+# the v4.1.1 `hermes-agent==0.14.0` pin once DOWNGRADED a production
+# hermes-agent 0.15.1 → 0.14.0. Rules baked in here:
 #
-# Usage from anywhere:
-#   bash integrations/hermes/scripts/test.sh
-#   bash integrations/hermes/scripts/test.sh -k inbound      # filter by name
-#   bash integrations/hermes/scripts/test.sh -x --tb=short   # any extra pytest args
+#   * Docker path: installs happen in a DISPOSABLE python:3.13-slim
+#     container — the resolver can do whatever it wants, the host is
+#     untouched.
+#   * Host path: NO pip install AT ALL. pyproject's
+#     `[tool.pytest.ini_options] pythonpath = ["src"]` makes the package
+#     importable for pytest without installing, so the host env (and its
+#     hermes-agent) is never handed to the resolver.
+#   * If you DO need to install this plugin into a live gateway venv, use
+#     `pip install --no-deps .` (see README "Install" → no-downgrade rule)
+#     and run `python -m chatlytics_hermes.doctor` afterwards.
 #
-# Requires: docker daemon running. Falls back to local python3 if `docker` is
-# unavailable, but the Docker path is the canonical CI-style invocation.
-#
-# Mounts the REPO root (4 levels up from this script), not just integrations/hermes,
-# because test_action_parity.py reads ../../../src/channel.ts at REPO_ROOT.
+# Usage from the repo root:
+#   bash scripts/test.sh                       # docker if available, else host
+#   bash scripts/test.sh -k longpoll           # extra pytest args pass through
+#   TEST_SH_NO_DOCKER=1 bash scripts/test.sh   # force host path
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HERMES_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-REPO_ROOT="$(cd "$HERMES_DIR/../.." && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-cd "$HERMES_DIR"
+cd "$REPO_DIR"
 
-if command -v docker >/dev/null 2>&1; then
-  echo "[test.sh] Running pytest inside python:3.13-slim container..."
-  HOST_REPO="$REPO_ROOT"
-  if [ -n "${MSYSTEM:-}" ] || uname | grep -qi mingw; then
-    HOST_REPO="$(cd "$REPO_ROOT" && pwd -W 2>/dev/null || cd "$REPO_ROOT" && pwd)"
-    export MSYS_NO_PATHCONV=1
-  fi
-  exec docker run --rm \
-    -v "$HOST_REPO":/repo \
-    -w //repo/integrations/hermes \
+if [ -z "${TEST_SH_NO_DOCKER:-}" ] && command -v docker >/dev/null 2>&1; then
+  echo "[test.sh] Running pytest inside python:3.13-slim container (disposable env)..."
+  MSYS_NO_PATHCONV=1 exec docker run --rm \
+    -v "$REPO_DIR":/work \
+    -w /work \
     python:3.13-slim \
-    bash -c "pip install --quiet --disable-pip-version-check -e '.[test]' && pytest --tb=short $*"
+    bash -c "
+      set -euo pipefail
+      apt-get update -qq >/dev/null 2>&1
+      apt-get install -y -qq --no-install-recommends git ca-certificates >/dev/null 2>&1
+      pip install --quiet --disable-pip-version-check --retries 3 \
+        'hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@v2026.5.16'
+      pip install --quiet --disable-pip-version-check -e '.[dev]'
+      pytest tests/ --tb=short $*
+    "
 fi
 
-if command -v python3 >/dev/null 2>&1; then
-  echo "[test.sh] docker not available — falling back to local python3..."
-  python3 -m pip install --quiet --disable-pip-version-check -e ".[test]"
-  exec python3 -m pytest --tb=short "$@"
-fi
-
-echo "[test.sh] FATAL: neither docker nor python3 available." >&2
-exit 1
+echo "[test.sh] Running pytest against the host environment (no pip install — host env untouched)..."
+PY=python
+command -v python >/dev/null 2>&1 || PY=python3
+exec "$PY" -m pytest tests/ --tb=short "$@"

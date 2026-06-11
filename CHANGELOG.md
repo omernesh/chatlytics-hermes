@@ -1,5 +1,67 @@
 # Changelog
 
+## [4.2.0] - 2026-06-11
+
+Plugin survivability (P3). Kills the "gateway boots with 2 platforms instead
+of 3 and the bot goes silent for days" failure class from four sides: a
+no-downgrade guard, unmissable boot logging, a `doctor` self-check CLI, and
+longpoll reconnect resilience.
+
+### Added
+
+- **No-downgrade guard** (`diagnostics.check_hermes_agent_version`):
+  `register()` compares the installed `hermes-agent` against the plugin floor
+  (`>=0.14`, lockstep with the pyproject dep floor) and logs a clear ERROR —
+  with the `--no-deps` reinstall fix — when the environment has a DOWNGRADED
+  hermes-agent (the v4.1.1 `==0.14.0` pin once dragged production
+  0.15.1 → 0.14.0 via a plain pip install). Never blocks an otherwise-working
+  load; undeterminable versions never flag.
+- **Doctor self-check CLI** (`python -m chatlytics_hermes.doctor`): PASS/FAIL
+  per check — plugin dir present, token configured, hermes-agent floor,
+  `GET /health` reachable, `GET /api/v1/bot/me` token valid (prints bot name),
+  `GET /api/v1/bot/updates` longpoll reachable. Exits non-zero on any FAIL.
+  Supports `--base-url` / `--token` / `--plugins-dir` overrides.
+- **Boot-time loud failure + confirmation**: every partial load failure
+  (missing token, unreachable base_url, health non-200, webhook bind failure,
+  `register()` raise, token rejected) now emits ONE ERROR line prefixed
+  `CHATLYTICS PLUGIN FAILED TO LOAD:` with the reason and the fix — a stable
+  grep target. On success, `register()` logs one INFO confirmation and
+  `connect()` logs `chatlytics platform registered, authenticated as <bot>`
+  via a best-effort `GET /api/v1/bot/me` identity probe (never fails
+  connect(); legacy servers / operator-api_key deployments load unchanged).
+- **base_url symptom → fix mapping** (`diagnostics.map_connect_error`), used
+  by connect(), the longpoll loop, and doctor: timeout → dead Tailscale-style
+  IP (use LAN `http://192.168.1.133:8050` on-prem or
+  `https://node.chatlytics.ai`); connection refused → wrong host/port;
+  401 → bad/rotated token (rotate via chatlytics admin); 502 → Cloudflare
+  tunnel longpoll limit (switch to LAN base_url).
+
+### Changed
+
+- **Longpoll reconnect resilience**: connection refused/reset/timeout, non-200
+  responses, AND the chatlytics v5.4 graceful-shutdown signal (empty 200 +
+  `Connection: close` on server restart) are now treated as NORMAL retry
+  events with a bounded jittered backoff ladder (1s → 2s → 5s → 15s → 30s cap,
+  never gives up, reset on success). Logging is state-change-only: one WARNING
+  on healthy→degraded (with the actionable `map_connect_error` hint), one INFO
+  on recovery — per-attempt records are DEBUG, so a long outage cannot flood
+  logs. Healthy path preserved byte-for-byte: a normal empty JSON batch still
+  loops immediately without acking; 400 invalid_cursor still resets the cursor.
+- `scripts/test.sh` rewritten for the split repo: docker path uses a
+  disposable container; the host path no longer runs `pip install` at all
+  (pytest `pythonpath=src` makes installs unnecessary), closing the
+  plain-install-into-host-venv downgrade vector. README + BETA-INSTALL now
+  document the `--no-deps` install rule for existing gateway venvs.
+
+### Tests
+
+- `tests/test_survivability.py` (+30): version-guard comparisons, backoff
+  ladder/jitter bounds, error-mapping classifier, state-change logging
+  (exactly one WARNING/INFO per transition), empty-200 graceful-shutdown
+  handling, healthy-path no-backoff regression, boot identity probe (INFO /
+  401-ERROR / 404-silent), register loud-failure, and respx-mocked doctor
+  scenarios. Full suite: 169 passed.
+
 ## [4.1.5] - 2026-06-07
 
 ### Changed

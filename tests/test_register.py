@@ -125,7 +125,7 @@ def test_plugin_yaml_is_valid() -> None:
 
     assert manifest["name"] == "chatlytics"
     assert manifest["kind"] == "platform"
-    assert manifest["version"] == "4.1.5"
+    assert manifest["version"] == "4.2.0"
 
     required = {entry["name"] for entry in manifest["requires_env"]}
     assert required == {"CHATLYTICS_BOT_TOKEN"}
@@ -165,7 +165,7 @@ def test_pyproject_declares_hermes_entry_point() -> None:
     assert entry_points["chatlytics"] == "chatlytics_hermes"
 
     project = data["project"]
-    assert project["version"] == "4.1.5"  # v4.1.5 — telegram-style no-token onboarding prompt.
+    assert project["version"] == "4.2.0"  # v4.2.0 — P3 survivability (doctor, no-downgrade guard, longpoll backoff).
     assert project["name"] == "chatlytics-hermes"
 
     deps = project["dependencies"]

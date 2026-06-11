@@ -210,6 +210,26 @@ pip install "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git
 pip install -e ".[dev]"
 ```
 
+### ⚠️ No-downgrade rule (installing into an EXISTING gateway venv)
+
+Never let the resolver touch `hermes-agent` in a live gateway venv. A plain
+`pip install` / `uv pip install` of this package once **silently downgraded a
+production hermes-agent 0.15.1 → 0.14.0** (the v4.1.1 release pinned
+`hermes-agent==0.14.0`; the resolver "helpfully" satisfied it). The pin has
+been a floor (`hermes-agent>=0.14,<1.0`) since v4.1.2, but the discipline
+stands — always install with `--no-deps` into an env that already has
+hermes-agent:
+
+```bash
+uv pip install --no-deps /path/to/chatlytics-hermes   # or: pip install --no-deps .
+python -m chatlytics_hermes.doctor                    # verify nothing broke
+```
+
+The plugin also self-defends: `register()` compares the installed
+hermes-agent against its floor (`>=0.14`) at load time and logs an ERROR
+(with the fix) when the environment has been downgraded — it never blocks an
+otherwise-working load.
+
 ### Install as a Hermes directory plugin (recommended — survives updates)
 
 A `pip install` lands the plugin in the gateway venv's `site-packages`, which a
@@ -228,6 +248,37 @@ Directory plugins live under `$HERMES_HOME/plugins/`, not the venv, so this
 install **survives hermes-agent updates** — unlike `pip install`. Each
 per-profile gateway has its own `$HERMES_HOME/plugins/`, so install and enable
 the plugin once per profile.
+
+## Self-check (doctor)
+
+When the bot goes silent — classic symptom: the gateway boots with
+"2 platforms" instead of 3 — run the doctor from the gateway venv:
+
+```bash
+python -m chatlytics_hermes.doctor
+# or explicitly:
+python -m chatlytics_hermes.doctor --base-url http://192.168.1.133:8050 --token sk_bot_...
+```
+
+It prints `PASS`/`FAIL` per check and exits non-zero on any failure:
+
+| Check         | What it verifies                                                              |
+| ------------- | ----------------------------------------------------------------------------- |
+| `plugin-dir`  | directory-plugin install present (`$HERMES_HOME/plugins/chatlytics/__init__.py`) |
+| `config`      | auth token present (`CHATLYTICS_BOT_TOKEN`, legacy `CHATLYTICS_API_KEY`)       |
+| `hermes-agent`| installed hermes-agent meets the plugin floor (no-downgrade guard)             |
+| `health`      | base_url reachable — `GET /health`                                             |
+| `bot-me`      | token valid — `GET /api/v1/bot/me` (prints the bot name)                       |
+| `longpoll`    | `GET /api/v1/bot/updates` reachable                                            |
+
+FAIL lines map symptoms to fixes: connect **timeout** → likely a dead
+Tailscale-style IP in `CHATLYTICS_BASE_URL` (use the LAN
+`http://192.168.1.133:8050` on-prem, or `https://node.chatlytics.ai`);
+**connection refused** → wrong host/port; **401** → bad/rotated token (rotate
+via the chatlytics admin); **502** → Cloudflare tunnel longpoll limit (switch
+to the LAN base_url). The adapter logs the same hints at runtime: any partial
+load failure emits one ERROR line prefixed `CHATLYTICS PLUGIN FAILED TO
+LOAD:` — grep the gateway log for that string.
 
 ## Configuration
 

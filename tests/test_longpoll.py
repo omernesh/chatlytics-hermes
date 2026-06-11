@@ -241,9 +241,16 @@ class _LiveClient:
         self.acks: List[Dict[str, Any]] = []
 
     async def get(self, path: str, *, params: Dict[str, Any] | None = None, timeout: Any = None) -> httpx.Response:
-        # /health (connect) then bot/updates polls.
+        # /health + /api/v1/bot/me (connect) then bot/updates polls.
         if path == "/health":
             return httpx.Response(200, json={}, request=httpx.Request("GET", BASE_URL))
+        if path == "/api/v1/bot/me":
+            # v4.2.0 boot identity probe (best-effort, issued by connect()).
+            # Served explicitly so it does not consume the scripted poll
+            # counter below.
+            return httpx.Response(
+                200, json={"name": "TestBot"}, request=httpx.Request("GET", BASE_URL + path)
+            )
         self.n += 1
         if self.n == 1:
             body = {

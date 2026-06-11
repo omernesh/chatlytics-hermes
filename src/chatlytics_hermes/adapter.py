@@ -59,6 +59,7 @@ import json
 import logging
 import mimetypes
 import os
+import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -66,6 +67,11 @@ import httpx
 from aiohttp import web
 
 from .client import ChatlyticsClient, USER_AGENT
+from .diagnostics import (
+    check_hermes_agent_version,
+    extract_bot_name,
+    map_connect_error,
+)
 from .inbound import make_health_handler, make_webhook_handler, normalize_payload
 
 
@@ -101,6 +107,39 @@ NO_TOKEN_PROMPT = (
 # (30s, only ~5s margin) was too tight; the poll uses an explicit per-request
 # httpx.Timeout with read = hold + 15s instead. See _poll_loop.
 _LONGPOLL_TIMEOUT_MS: int = 25000
+
+# v4.2.0 (P3 survivability): unmissable load-failure prefix. EVERY partial
+# load failure (missing token, unreachable base_url, register() raise) logs
+# one ERROR line starting with this string, so an operator grepping the
+# gateway log for the "2 platforms instead of 3 / bot silent for days"
+# symptom finds the reason + fix in one hit. Keep the prefix stable — it is
+# a documented grep target (README "Self-check" section).
+_LOAD_FAIL_PREFIX: str = "CHATLYTICS PLUGIN FAILED TO LOAD:"
+
+# v4.2.0 (P3 survivability): bounded longpoll reconnect ladder. Connection
+# refused/reset/timeout AND the chatlytics v5.4 graceful-shutdown signal
+# (empty 200 + Connection: close) are NORMAL retry events: back off
+# 1s → 2s → 5s → 15s → 30s (cap), with jitter, never give up, reset on
+# success. State-change logging (healthy↔degraded) lives in _poll_loop.
+_BACKOFF_LADDER: Tuple[float, ...] = (1.0, 2.0, 5.0, 15.0, 30.0)
+# Multiplicative jitter: delay = base * (1 + uniform(0, frac)). Bounded above
+# by base * 1.25 so tests (and operators reading logs) can reason about it.
+_BACKOFF_JITTER_FRAC: float = 0.25
+
+# Plugin version for log lines (parsed from the client User-Agent so adapter
+# does not import chatlytics_hermes.__init__ — that would be circular).
+_PLUGIN_VERSION: str = USER_AGENT.rsplit("/", 1)[-1]
+
+
+def _backoff_delay(attempt: int) -> float:
+    """Jittered delay for the Nth consecutive longpoll failure (0-based).
+
+    Climbs the :data:`_BACKOFF_LADDER` and stays at the 30s cap once past the
+    end. Jitter spreads simultaneous reconnects from multiple gateways so a
+    chatlytics restart does not get a synchronized thundering herd.
+    """
+    base = _BACKOFF_LADDER[min(attempt, len(_BACKOFF_LADDER) - 1)]
+    return base * (1.0 + random.uniform(0.0, _BACKOFF_JITTER_FRAC))
 
 
 def _token_fingerprint(token: str, length: int = 8) -> str:
@@ -595,16 +634,69 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
           read pointer. The GET does NOT advance it — envelopes re-deliver
           until acked, so we ack AFTER processing every non-empty batch.
 
-        Error discipline (never let the loop die silently):
-          - httpx transport error / non-200: WARNING + exponential backoff
-            (1s -> cap 30s), then retry.
+        Error discipline (never let the loop die silently — reworked in
+        v4.2.0 P3 survivability):
+          - httpx transport error (refused/reset/timeout) / non-200 /
+            empty-200 graceful shutdown: NORMAL retry events. Bounded
+            jittered backoff via the 1→2→5→15→30s :data:`_BACKOFF_LADDER`
+            (never gives up), reset on success.
+          - State-change logging ONLY: one WARNING on healthy→degraded
+            (with the :func:`map_connect_error` actionable hint), one INFO
+            on degraded→healthy. Per-attempt records stay at DEBUG so a
+            long chatlytics outage cannot flood operator logs.
+          - empty 200 + Connection: close — chatlytics v5.4 longpoll
+            graceful shutdown (server restarting). Detected as a 200 with
+            an EMPTY body (a normal empty batch is a JSON object); treated
+            as a retry event, NOT an error, so restarts don't busy-spin.
+            A normal empty JSON batch still loops immediately (healthy
+            path byte-for-byte preserved).
           - 400 invalid_cursor: reset cursor to "" and continue.
-          - 401 bot_token_required: ERROR (token bad/revoked) + 30s backoff.
+          - 401 bot_token_required: ERROR on state change (token
+            bad/revoked, with rotate guidance) + capped backoff.
           - asyncio.CancelledError: exit cleanly (disconnect()).
         """
         cursor: str = ""
-        backoff: float = 1.0
-        backoff_max: float = 30.0
+        # Consecutive-failure count (indexes _BACKOFF_LADDER) and the
+        # degraded-state label (None == healthy). Both reset on success.
+        failures: int = 0
+        degraded: Optional[str] = None
+
+        def _note_degraded(reason: str, hint: str, *, level: int = logging.WARNING) -> float:
+            """Record one failure; log ONCE per healthy→degraded transition.
+
+            Returns the jittered backoff delay for this attempt.
+            """
+            nonlocal failures, degraded
+            delay = _backoff_delay(failures)
+            failures += 1
+            if degraded is None:
+                logger.log(
+                    level,
+                    "longpoll degraded: %s — %s (retrying with bounded "
+                    "backoff, %.1fs now, 30s cap; will log on recovery)",
+                    reason,
+                    hint,
+                    delay,
+                )
+            else:
+                logger.debug(
+                    "longpoll still degraded (%s); attempt %d, backing off %.1fs",
+                    reason,
+                    failures,
+                    delay,
+                )
+            degraded = reason
+            return delay
+
+        def _note_healthy() -> None:
+            nonlocal failures, degraded
+            if degraded is not None:
+                logger.info(
+                    "longpoll recovered (healthy again after: %s)", degraded
+                )
+            degraded = None
+            failures = 0
+
         logger.info(
             "chatlytics inbound: longpoll loop started (polling /api/v1/bot/updates)"
         )
@@ -630,13 +722,13 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             except asyncio.CancelledError:
                 raise
             except httpx.RequestError as exc:
-                logger.warning(
-                    "longpoll GET transport error (%s); backing off %.1fs",
-                    exc,
-                    backoff,
+                # Connection refused/reset/timeout: normal retry events
+                # (chatlytics restart, transient network). Backoff + retry.
+                delay = _note_degraded(
+                    f"transport error ({exc or type(exc).__name__})",
+                    map_connect_error(exc=exc),
                 )
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, backoff_max)
+                await asyncio.sleep(delay)
                 continue
 
             if resp.status_code == 400:
@@ -647,24 +739,38 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 cursor = ""
                 continue
             if resp.status_code == 401:
-                logger.error(
-                    "longpoll GET returned 401 (bot_token_required); the bot "
-                    "token is missing/invalid/revoked. Backing off 30s."
+                delay = _note_degraded(
+                    "HTTP 401 (bot_token_required)",
+                    map_connect_error(status_code=401),
+                    level=logging.ERROR,
                 )
-                await asyncio.sleep(backoff_max)
+                # Token problems don't self-heal fast — wait at the cap.
+                await asyncio.sleep(max(delay, _BACKOFF_LADDER[-1]))
                 continue
             if resp.status_code != 200:
-                logger.warning(
-                    "longpoll GET returned HTTP %d; backing off %.1fs",
-                    resp.status_code,
-                    backoff,
+                delay = _note_degraded(
+                    f"HTTP {resp.status_code}",
+                    map_connect_error(status_code=resp.status_code),
                 )
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, backoff_max)
+                await asyncio.sleep(delay)
                 continue
 
-            # Successful poll — reset backoff.
-            backoff = 1.0
+            # v4.2.0 (P3): chatlytics v5.4 longpoll graceful shutdown —
+            # parked longpolls get an EMPTY 200 + Connection: close when the
+            # server restarts. A normal empty batch is a JSON object
+            # ({"envelopes": [], ...}), so an empty BODY unambiguously means
+            # "server going down; reconnect later". Back off instead of
+            # busy-spinning into the connection-refused window.
+            if not (resp.content or b"").strip():
+                delay = _note_degraded(
+                    "server closed poll (graceful shutdown — chatlytics restarting)",
+                    "the plugin reconnects automatically with backoff",
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            # Successful poll — reset backoff / degraded state.
+            _note_healthy()
             try:
                 data = resp.json()
             except Exception:  # noqa: BLE001 -- JSONDecodeError + httpx variants
@@ -801,6 +907,18 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 "prompt the user for one on first use; set CHATLYTICS_BOT_TOKEN "
                 "to enable sending"
             )
+            # v4.2.0 (P3 survivability): missing token is a partial load —
+            # the platform registers but cannot send/receive. Emit the
+            # unmissable grep-target line so a silent bot is diagnosable
+            # from the gateway log alone. (The WARNING above is the
+            # onboarding-friendly wording; this ERROR is the loud one.)
+            logger.error(
+                "%s no auth token configured (degraded no-credential load). "
+                "Fix: set CHATLYTICS_BOT_TOKEN (sk_bot_...) in the gateway "
+                "profile config/.env and restart. Run "
+                "`python -m chatlytics_hermes.doctor` to verify.",
+                _LOAD_FAIL_PREFIX,
+            )
             return True
 
         # A token IS present: clear any prior degraded flag (defensive against
@@ -841,6 +959,16 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             # can retry from a clean slate.
             await self._client.aclose()
             self._client = None
+            # v4.2.0 (P3): unmissable + actionable. map_connect_error turns
+            # the symptom (timeout vs refused vs reset) into the known fix
+            # (dead Tailscale-style IP → LAN/DNS URL, wrong host/port, ...).
+            logger.error(
+                "%s base_url %s unreachable (%s) — %s",
+                _LOAD_FAIL_PREFIX,
+                self.base_url,
+                exc,
+                map_connect_error(exc=exc),
+            )
             raise ChatlyticsConnectError(
                 f"Chatlytics health check failed: {exc}"
             ) from exc
@@ -848,10 +976,24 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         if response.status_code != 200:
             await self._client.aclose()
             self._client = None
+            logger.error(
+                "%s GET %s/health returned HTTP %d — %s",
+                _LOAD_FAIL_PREFIX,
+                self.base_url,
+                response.status_code,
+                map_connect_error(status_code=response.status_code),
+            )
             raise ChatlyticsConnectError(
                 f"Chatlytics health check returned status "
                 f"{response.status_code}: {response.text[:200]}"
             )
+
+        # v4.2.0 (P3 survivability): boot identity self-check. One INFO line
+        # confirming WHO we are ("registered, authenticated as <bot>") or one
+        # unmissable ERROR when the token is rejected. Best-effort — the probe
+        # NEVER fails connect() (legacy servers without /api/v1/bot/me and
+        # operator-api_key deployments must keep loading exactly as before).
+        await self._log_boot_identity()
 
         # --- Inbound transport selection (v4.1) -----------------------
         # longpoll mode (chatlytics v4.0 bot-updates): do NOT start the
@@ -912,6 +1054,15 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 self._site = None
             await self._client.aclose()
             self._client = None
+            logger.error(
+                "%s webhook server failed to bind %s:%d (%s) — pick a free "
+                "port via CHATLYTICS_WEBHOOK_PORT or stop the conflicting "
+                "process.",
+                _LOAD_FAIL_PREFIX,
+                self.webhook_host,
+                self.webhook_port,
+                exc,
+            )
             raise ChatlyticsConnectError(
                 f"Chatlytics webhook server failed to bind "
                 f"{self.webhook_host}:{self.webhook_port}: {exc}"
@@ -919,6 +1070,54 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
         self._running = True
         return True
+
+    async def _log_boot_identity(self) -> None:
+        """Best-effort GET /api/v1/bot/me after a successful health check.
+
+        v4.2.0 (P3 survivability): closes the "gateway boots with 2 platforms
+        instead of 3 and nobody notices" gap from the LOG side — when the
+        plugin DOES load, the gateway log carries exactly one INFO line
+        confirming the platform is live and which bot it authenticated as,
+        so its ABSENCE is diagnostic. A 401/403 (rotated/revoked token) logs
+        the unmissable :data:`_LOAD_FAIL_PREFIX` ERROR with rotate guidance.
+
+        NEVER raises and NEVER fails connect(): legacy chatlytics servers
+        without /api/v1/bot/me, operator-api_key deployments (the endpoint is
+        bot-token-scoped), and offline test harnesses must keep the exact
+        pre-v4.2.0 connect() behavior. Any non-auth failure logs at DEBUG.
+        """
+        if self._client is None:
+            return
+        try:
+            resp = await self._client.get("/api/v1/bot/me")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — probe is strictly best-effort
+            logger.debug("boot identity probe failed: %s", exc)
+            return
+        if resp.status_code == 200:
+            try:
+                payload: Any = resp.json()
+            except Exception:  # noqa: BLE001
+                payload = None
+            bot_name = extract_bot_name(payload) or "<unnamed bot>"
+            logger.info(
+                "chatlytics platform registered, authenticated as %s (fp=%s)",
+                bot_name,
+                _token_fingerprint(self._auth_token, 8),
+            )
+        elif resp.status_code in (401, 403):
+            logger.error(
+                "%s bot token rejected (HTTP %d on /api/v1/bot/me, fp=%s) — %s",
+                _LOAD_FAIL_PREFIX,
+                resp.status_code,
+                _token_fingerprint(self._auth_token, 8),
+                map_connect_error(status_code=401),
+            )
+        else:
+            logger.debug(
+                "boot identity probe returned HTTP %d; skipping", resp.status_code
+            )
 
     async def disconnect(self) -> None:
         """Stop the aiohttp webhook server and close the httpx client.  Idempotent.
@@ -2084,9 +2283,9 @@ def _make_tool_handler(ctx: Any, name: str, handler: Any) -> Any:
     return _bound
 
 
-def register(ctx: Any) -> None:
-    """Plugin entry point: discovered by Hermes via the ``hermes_agent.plugins``
-    entry point group in ``pyproject.toml``.
+def _register_impl(ctx: Any) -> None:
+    """Actual registration body — see :func:`register` (the public entry
+    point, which wraps this in the v4.2.0 P3 loud-failure guard).
 
     HERMES-01 registers the minimum platform surface required to load
     the plugin.  Subsequent phases extend the ``register_platform`` call
@@ -2159,3 +2358,53 @@ def register(ctx: Any) -> None:
                 # of type coroutine has no len()" on the first tool call.
                 is_async=True,
             )
+
+
+def register(ctx: Any) -> None:
+    """Plugin entry point: discovered by Hermes via the ``hermes_agent.plugins``
+    entry point group in ``pyproject.toml`` AND via the directory-plugin shim
+    (repo-root ``__init__.py`` → ``hermes_plugins.chatlytics``).
+
+    v4.2.0 (P3 survivability) wraps :func:`_register_impl` with:
+
+    1. **No-downgrade guard** — if the installed hermes-agent is OLDER than
+       the plugin floor (>=0.14), log a clear ERROR telling the operator the
+       environment was downgraded (the v4.1.1 ``==0.14.0`` pin once dragged
+       production 0.15.1 → 0.14.0 via a plain pip install) and how to fix it
+       (reinstall + ``--no-deps``). The guard never blocks an
+       otherwise-working load — it only makes the downgrade visible.
+    2. **Loud failure** — if registration raises for ANY reason, log one
+       unmissable :data:`_LOAD_FAIL_PREFIX` ERROR (the "gateway boots with 2
+       platforms instead of 3" symptom now has a grep-able cause + fix in
+       the log) and re-raise so Hermes' PluginManager sees the real error.
+    3. **Boot confirmation** — one INFO line on success, so the line's
+       ABSENCE in a gateway boot log is itself diagnostic. The
+       "authenticated as <bot>" identity line follows at connect() time
+       (:meth:`ChatlyticsAdapter._log_boot_identity`).
+    """
+    downgrade_msg = check_hermes_agent_version()
+    if downgrade_msg:
+        # ERROR, not raise: a floor-violating hermes-agent USUALLY still
+        # imports this plugin fine (the API the plugin needs may predate the
+        # floor bump) — breaking the load would turn a visible degradation
+        # into the silent "2 platforms" outage we are trying to kill.
+        logger.error("chatlytics plugin environment problem: %s", downgrade_msg)
+
+    try:
+        _register_impl(ctx)
+    except Exception as exc:
+        logger.error(
+            "%s register(ctx) raised %s: %s — the gateway will boot WITHOUT "
+            "the chatlytics platform (\"2 platforms\" symptom; bot goes "
+            "silent). Run `python -m chatlytics_hermes.doctor` to diagnose.",
+            _LOAD_FAIL_PREFIX,
+            type(exc).__name__,
+            exc,
+        )
+        raise
+
+    logger.info(
+        "chatlytics plugin registered (chatlytics-hermes v%s): platform + "
+        "tool surface loaded",
+        _PLUGIN_VERSION,
+    )

@@ -14,7 +14,7 @@ This guide is for beta testers. It assumes you've already used Hermes Agent and 
 
 You need:
 
-- **Hermes Agent `>=0.14.0`** — install with `pip install hermes-agent>=0.14,<0.15`. The plugin requires the v0.14 platform-adapter API; earlier versions will not work.
+- **Hermes Agent `>=0.14.0`** — install with `pip install "hermes-agent>=0.14,<1.0"`. The plugin requires the v0.14+ platform-adapter API; earlier versions will not work. **If hermes-agent is ALREADY installed**, never let a plugin install touch it: install this plugin with `--no-deps` (see below) so the resolver can't downgrade your hermes-agent.
 - **Python 3.10 or newer.**
 - **A Chatlytics account.** Private beta. Email **omernesher@gmail.com** for access if you don't have one.
 - **A paired WhatsApp session** — open the Chatlytics admin panel at https://app.chatlytics.ai → Sessions. If your session shows `WORKING`, you're good. If not, scan the QR code from your phone (WhatsApp → Settings → Linked Devices).
@@ -46,8 +46,14 @@ If you prefer not to install via pip:
 ```bash
 git clone https://github.com/omernesh/chatlytics-hermes ~/.hermes/plugins/chatlytics
 cd ~/.hermes/plugins/chatlytics
-pip install -e .
+pip install --no-deps -e .
 ```
+
+`--no-deps` matters when installing into an existing Hermes venv: it stops
+the resolver from "satisfying" the plugin's `hermes-agent` requirement by
+downgrading the one you already run. Install the few runtime deps (`httpx`,
+`aiohttp`, `PyYAML`, `jsonschema`) separately if missing, then verify with
+`python -m chatlytics_hermes.doctor`.
 
 Hermes scans `~/.hermes/plugins/` on startup and loads any directory containing a valid `plugin.yaml`.
 
