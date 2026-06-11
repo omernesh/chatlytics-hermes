@@ -1,5 +1,23 @@
 # Changelog
 
+## [4.5.3] - 2026-06-11
+
+### Fixed
+
+- **Hotfix: host-injected kwargs filtered to the handler signature.** Hermes'
+  `tools/registry.py:403` dispatches `entry.handler(args, **kwargs)` with
+  host bookkeeping kwargs (observed: `task_id`), which `_bound` forwarded raw
+  into bare handlers → `TypeError: chatlytics_health() got an unexpected
+  keyword argument 'task_id'` on EVERY tool call. This was masked before
+  4.5.2 (the adapter-not-connected failure returned first); the
+  `_LIVE_ADAPTERS` fix unmasked it on all 5 gateways. `_make_tool_handler`
+  now inspects the wrapped handler's signature once at bind time and `_bound`
+  drops any kwarg the handler cannot accept — unless the handler declares
+  `**kwargs` (explicit opt-in, gets everything). Robust to ANY future
+  host-injected key. Inbound `client`/`adapter` keys are always dropped
+  (`_bound` supplies those itself). Introspection failure fails open to the
+  previous pass-everything behavior.
+
 ## [4.5.2] - 2026-06-11
 
 ### Fixed

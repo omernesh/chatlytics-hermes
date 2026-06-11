@@ -55,6 +55,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import inspect
 import json
 import logging
 import mimetypes
@@ -3859,6 +3860,44 @@ def _make_tool_handler(ctx: Any, name: str, handler: Any) -> Any:
     # they still report the degraded state rather than the get-a-token prompt.
     no_token_guarded = name not in _NO_TOKEN_EXEMPT_TOOLS
 
+    # v4.5.3 — host-injected kwarg filtering (computed ONCE at bind time).
+    #
+    # Hermes' tools.registry.dispatch (registry.py:403) calls
+    # ``entry.handler(args, **kwargs)`` where kwargs carries HOST-injected
+    # bookkeeping keys (observed: ``task_id``; future hermes versions may add
+    # more). Bare tool handlers like ``chatlytics_health(client)`` do not
+    # accept them, so forwarding kwargs raw raised
+    # ``TypeError: chatlytics_health() got an unexpected keyword argument
+    # 'task_id'`` on EVERY tool call. (Masked before v4.5.2: the
+    # adapter-not-connected failure returned first; the _LIVE_ADAPTERS fix
+    # unmasked it on all 5 gateways — botdaddy errors.log 2026-06-11 19:25+.)
+    #
+    # Filter rule: pass only kwargs the wrapped handler's signature accepts,
+    # UNLESS the handler declares **kwargs (then pass everything — it opted
+    # in). Robust to ANY future host-injected key, not just task_id.
+    # ``client`` / ``adapter`` are excluded from the accepted set: _bound
+    # supplies those itself, so a colliding inbound key must be dropped, not
+    # forwarded twice. Signature introspection failure fails OPEN to the
+    # pre-v4.5.3 pass-everything behavior (never break a callable handler).
+    try:
+        _params = inspect.signature(handler).parameters.values()
+        _accepts_var_kw = any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in _params
+        )
+        _accepted_kwargs = frozenset(
+            p.name
+            for p in _params
+            if p.kind
+            in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+            and p.name not in ("client", "adapter")
+        )
+    except (TypeError, ValueError):  # pragma: no cover — exotic callables
+        _accepts_var_kw = True
+        _accepted_kwargs = frozenset()
+
     def _lookup_adapter() -> Optional["ChatlyticsAdapter"]:
         # ``ctx.get_platform("chatlytics")`` is the v0.14 public accessor;
         # some test harnesses (and older PluginContexts) expose the
@@ -3905,6 +3944,19 @@ def _make_tool_handler(ctx: Any, name: str, handler: Any) -> Any:
         if args:
             for _k, _v in args.items():
                 kwargs.setdefault(_k, _v)
+        # v4.5.3 — drop host-injected kwargs the handler cannot accept (see
+        # bind-time filter above). Applied AFTER the args merge so legit JSON
+        # tool params and host bookkeeping keys get the same treatment.
+        if not _accepts_var_kw:
+            _dropped = [k for k in kwargs if k not in _accepted_kwargs]
+            if _dropped:
+                logger.debug(
+                    "tool %s: dropping kwargs not in handler signature: %s",
+                    name,
+                    _dropped,
+                )
+                for _k in _dropped:
+                    kwargs.pop(_k)
         adapter_inst = _lookup_adapter()
         # v4.1.5 (telegram-style onboarding): if the adapter loaded WITHOUT a
         # bot token (degraded no-credential state), every DATA tool returns the

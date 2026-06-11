@@ -1,7 +1,7 @@
 name: chatlytics
 label: Chatlytics WhatsApp
 kind: platform
-version: "4.5.2"
+version: "4.5.3"
 description: >
   Chatlytics WhatsApp gateway adapter for Hermes Agent. Connects Hermes to
   Chatlytics's REST API for inbound webhooks and outbound messages/media.
