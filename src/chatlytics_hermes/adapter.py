@@ -60,6 +60,7 @@ import logging
 import mimetypes
 import os
 import random
+import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -137,6 +138,15 @@ _LAST_MESSAGE_MEMO_MAX: int = 128
 # unknown values cannot grow adapter memory without limit.
 _UNKNOWN_CONTROL_WARN_CAP: int = 64
 
+# v4.4.0 (chatlytics v5.4 P7): progress-bubble edit-in-place bounds.
+# ``_progress_bubbles`` maps chat_id -> (waha message id, monotonic ts) for
+# the ONE un-consumed "working…" bubble per chat. LRU-evicted past the cap;
+# entries older than the TTL are treated as stale (the turn they belonged to
+# is long gone — editing a 10-minute-old bubble into a fresh reply would be
+# confusing, so the reply falls back to a plain send).
+_PROGRESS_BUBBLE_MAX: int = 100
+_PROGRESS_BUBBLE_TTL_S: float = 600.0
+
 # v4.2.0 (P3 survivability): unmissable load-failure prefix. EVERY partial
 # load failure (missing token, unreachable base_url, register() raise) logs
 # one ERROR line starting with this string, so an operator grepping the
@@ -158,6 +168,27 @@ _BACKOFF_JITTER_FRAC: float = 0.25
 # Plugin version for log lines (parsed from the client User-Agent so adapter
 # does not import chatlytics_hermes.__init__ — that would be circular).
 _PLUGIN_VERSION: str = USER_AGENT.rsplit("/", 1)[-1]
+
+
+def _coerce_flag(value: Any, default: bool) -> bool:
+    """Defensively coerce an env-var / extra-block value to a bool.
+
+    v4.4.0 (P7): config-knob parsing for ``status_edit_in_place``. Accepts
+    the usual textual spellings; anything unrecognized (including ``None``)
+    falls back to ``default`` — a typo'd env var must never flip a
+    default-ON feature into a surprising state, and must never raise at
+    adapter ``__init__`` (gateway boot path).
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return default
 
 
 def _backoff_delay(attempt: int) -> float:
@@ -264,7 +295,13 @@ _CONTROL_CHARS: str = "".join(chr(i) for i in range(32)) + "\x7f"
 # a future contributor who adds a new top-level body field updates the
 # reserved-key check in lockstep instead of silently regressing the
 # 02-LOW-01 WARNING contract.
-_RESERVED_BODY_KEYS: frozenset = frozenset({"chatId", "text", "accountId", "replyTo", "session"})
+# v4.4.0 (P7): ``edit_message_id`` and ``progress`` joined the reserved set —
+# they are server-interpreted /api/v1/send body fields (progress-bubble
+# edit-in-place) that the adapter assigns itself; caller metadata must not
+# be able to inject them.
+_RESERVED_BODY_KEYS: frozenset = frozenset(
+    {"chatId", "text", "accountId", "replyTo", "session", "edit_message_id", "progress"}
+)
 
 
 def _validate_webhook_path(path: Any) -> None:
@@ -549,6 +586,40 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             or "webhook"
         ).strip().lower()
 
+        # v4.4.0 (chatlytics v5.4 P7): progress-bubble edit-in-place knobs.
+        # Default ON — zero behavior change for fast turns (no bubble is ever
+        # sent before the threshold elapses, so no edit happens either).
+        # Flag False disables BOTH the bubble and the edit entirely →
+        # byte-identical to v4.3.0. Env wins over the extra block (matches
+        # the inbound_mode precedence pattern above); env values like
+        # "false"/"0"/"off" disable.
+        _seip_raw: Any = os.getenv("CHATLYTICS_STATUS_EDIT_IN_PLACE")
+        if _seip_raw is None:
+            _seip_raw = extra.get("status_edit_in_place")
+        self.status_edit_in_place: bool = _coerce_flag(_seip_raw, default=True)
+        # Threshold (seconds) before the ONE "working…" bubble fires; <= 0
+        # disables the bubble. Parsed defensively — a bad value falls back
+        # to the 8.0 s default instead of raising at gateway boot.
+        _bubble_after_raw: Any = os.getenv("CHATLYTICS_STATUS_BUBBLE_AFTER_S")
+        if _bubble_after_raw is None:
+            _bubble_after_raw = extra.get("status_bubble_after_s")
+        try:
+            self.status_bubble_after_s: float = (
+                float(_bubble_after_raw) if _bubble_after_raw is not None else 8.0
+            )
+        except (TypeError, ValueError):
+            self.status_bubble_after_s = 8.0
+        self.status_bubble_text: str = str(
+            os.getenv("CHATLYTICS_STATUS_BUBBLE_TEXT")
+            or extra.get("status_bubble_text")
+            or "⏳ working…"
+        )
+        # chat_id -> (waha message id of the un-consumed bubble, monotonic
+        # timestamp). Bounded LRU (cap _PROGRESS_BUBBLE_MAX); entries older
+        # than _PROGRESS_BUBBLE_TTL_S are stale and ignored on pop. Exactly
+        # ONE pending bubble per chat (turn) — see _send_progress_bubble.
+        self._progress_bubbles: "OrderedDict[str, Tuple[str, float]]" = OrderedDict()
+
         # Webhook server settings (HERMES-03).
         self.webhook_host: str = (
             os.getenv("CHATLYTICS_WEBHOOK_HOST") or extra.get("webhook_host", "0.0.0.0")
@@ -658,6 +729,209 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         if mapped:
             return mapped
         return self.session_name
+
+    def _build_send_body(
+        self, chat_id: str, text: str
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Build the base /api/v1/send body shared by send() and the bubble.
+
+        v4.4.0 (P7): factored out of :meth:`send` so the progress-bubble
+        emitter reuses the EXACT same chatId/text/session/accountId
+        resolution instead of duplicating the P-19 session logic. Returns
+        ``(body, None)`` on success or ``(None, error_message)`` when no
+        WAHA session can be resolved for ``chat_id`` (the caller decides
+        whether that is fail-loud — send() — or skip-quietly — bubble).
+        """
+        body: Dict[str, Any] = {
+            "chatId": chat_id,
+            "text": text,
+        }
+        # P-19 fix (carried forward): Chatlytics gateway's /api/v1/send
+        # REQUIRES `session` (the WAHA session name). Without it the server
+        # returns 400 "chatId and session are required" and the reply
+        # silently dies. Resolution: per-chat map populated by inbound
+        # (longpoll envelopes ALWAYS carry session_id; webhook payloads carry
+        # it when chatlytics forwards it) falling back to CHATLYTICS_SESSION.
+        session_name = self._resolve_session_for_chat(chat_id)
+        if session_name:
+            body["session"] = session_name
+        else:
+            return None, (
+                "Chatlytics adapter missing WAHA session for chat "
+                f"{chat_id!r}: set CHATLYTICS_SESSION env var "
+                "(e.g. 3cf11776_logan) or pass session= in the "
+                "platform extra block. Inbound-derived session "
+                "mapping is empty for this chat."
+            )
+        if self.account_id:
+            body["accountId"] = self.account_id
+        return body, None
+
+    # --- Progress bubbles (v4.4.0 — chatlytics v5.4 P7) ---------------------
+
+    def _store_progress_bubble(self, chat_id: str, message_id: str) -> None:
+        """Record the un-consumed bubble id for ``chat_id`` (LRU-bounded)."""
+        self._progress_bubbles[chat_id] = (message_id, time.monotonic())
+        self._progress_bubbles.move_to_end(chat_id)
+        while len(self._progress_bubbles) > _PROGRESS_BUBBLE_MAX:
+            self._progress_bubbles.popitem(last=False)
+
+    def _pop_progress_bubble(self, chat_id: str) -> Optional[str]:
+        """Pop and return the fresh pending bubble id for ``chat_id``.
+
+        Returns ``None`` when no bubble is pending OR the entry is older
+        than :data:`_PROGRESS_BUBBLE_TTL_S` (stale — the turn it belonged
+        to is long gone; the entry is dropped either way so it can never
+        be consumed twice).
+        """
+        entry = self._progress_bubbles.pop(chat_id, None)
+        if entry is None:
+            return None
+        message_id, ts = entry
+        if time.monotonic() - ts > _PROGRESS_BUBBLE_TTL_S:
+            logger.debug(
+                "progress bubble for chat %s is stale; dropping", chat_id
+            )
+            return None
+        return message_id
+
+    def _has_pending_progress_bubble(self, chat_id: str) -> bool:
+        """True when a fresh un-consumed bubble exists for ``chat_id``.
+
+        One-bubble-per-turn guard for :meth:`_send_progress_bubble`. Stale
+        entries are evicted on inspection (and report False).
+        """
+        entry = self._progress_bubbles.get(chat_id)
+        if entry is None:
+            return False
+        if time.monotonic() - entry[1] > _PROGRESS_BUBBLE_TTL_S:
+            self._progress_bubbles.pop(chat_id, None)
+            return False
+        return True
+
+    @staticmethod
+    def _extract_message_id(payload: Any) -> Optional[str]:
+        """Dig the normalized WAHA message id out of a /api/v1/send response.
+
+        chatlytics v5.4 P7 servers return top-level ``message_id``; older /
+        intermediate shapes used ``messageId``; defensive fallbacks dig the
+        raw WAHA echo (``waha.id._serialized`` / ``waha.id`` / ``waha.key.id``)
+        so the edit-in-place feature degrades to "no edit" rather than
+        crashing on a response-shape drift.
+        """
+        if not isinstance(payload, dict):
+            return None
+        for key in ("message_id", "messageId"):
+            mid = payload.get(key)
+            if isinstance(mid, str) and mid:
+                return mid
+        waha = payload.get("waha")
+        if isinstance(waha, dict):
+            wid = waha.get("id")
+            if isinstance(wid, dict):
+                for key in ("_serialized", "id"):
+                    ser = wid.get(key)
+                    if isinstance(ser, str) and ser:
+                        return ser
+            elif isinstance(wid, str) and wid:
+                return wid
+            wkey = waha.get("key")
+            if isinstance(wkey, dict):
+                kid = wkey.get("id")
+                if isinstance(kid, str) and kid:
+                    return kid
+        return None
+
+    async def _send_progress_bubble(self, chat_id: str) -> None:
+        """POST the ONE "working…" bubble for ``chat_id`` and memo its id.
+
+        Failure philosophy mirrors :meth:`_send_typing_once`: the bubble is
+        a UX affordance — every failure path logs at DEBUG and returns
+        without raising, so a flapping gateway can never affect the agent
+        turn it decorates. The bubble body carries ``progress: true`` so the
+        server suppresses reaction-feedback correlation for it.
+        """
+        if self._has_pending_progress_bubble(chat_id):
+            logger.debug(
+                "progress bubble already pending for chat %s; not sending another",
+                chat_id,
+            )
+            return
+        if self._client is None or self._no_credential or not self._auth_token:
+            logger.debug(
+                "progress bubble skipped for chat %s: adapter not connected "
+                "or no credential",
+                chat_id,
+            )
+            return
+        body, err = self._build_send_body(chat_id, self.status_bubble_text)
+        if body is None:
+            logger.debug("progress bubble skipped: %s", err)
+            return
+        body["progress"] = True
+        try:
+            response = await self._client.post("/api/v1/send", json=body)
+        except httpx.RequestError as exc:
+            logger.debug(
+                "progress bubble transport error for chat %s: %s", chat_id, exc
+            )
+            return
+        if response.status_code != 200:
+            logger.debug(
+                "progress bubble send returned HTTP %d for chat %s",
+                response.status_code,
+                chat_id,
+            )
+            return
+        try:
+            payload: Any = response.json()
+        except Exception:  # noqa: BLE001
+            payload = None
+        message_id = self._extract_message_id(payload)
+        if not message_id:
+            logger.debug(
+                "progress bubble response carried no message id for chat %s; "
+                "edit-in-place unavailable for this turn",
+                chat_id,
+            )
+            return
+        self._store_progress_bubble(chat_id, message_id)
+        logger.debug(
+            "progress bubble sent for chat %s (message_id=%s)",
+            chat_id,
+            message_id,
+        )
+
+    async def _progress_bubble_timer(
+        self, chat_id: str, stop_event: Optional[asyncio.Event]
+    ) -> None:
+        """Wait ``status_bubble_after_s``; if the turn is still running, bubble.
+
+        Spawned by :meth:`_keep_typing` (the only in-turn hook the adapter
+        has). When ``stop_event`` fires before the threshold (the common
+        fast-turn case) NO bubble is sent and the request stream is
+        byte-identical to v4.3.0. Errors never propagate (DEBUG only).
+        """
+        try:
+            if stop_event is not None:
+                try:
+                    await asyncio.wait_for(
+                        stop_event.wait(), timeout=self.status_bubble_after_s
+                    )
+                    return  # turn finished before the threshold — no bubble
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(self.status_bubble_after_s)
+            await self._send_progress_bubble(chat_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 -- UX affordance, never propagate
+            logger.debug(
+                "progress bubble timer raised for chat %s; continuing",
+                chat_id,
+                exc_info=True,
+            )
 
     # --- Longpoll inbound consumer (v4.1) ---------------------------------
 
@@ -1570,34 +1844,17 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 error="Adapter not connected: call connect() before send()",
             )
 
-        body: Dict[str, Any] = {
-            "chatId": chat_id,
-            "text": content,
-        }
-        # P-19 fix (carried forward): Chatlytics gateway's /api/v1/send
-        # REQUIRES `session` (the WAHA session name). Without it the server
-        # returns 400 "chatId and session are required" and the reply
-        # silently dies. Resolution: per-chat map populated by inbound
-        # (longpoll envelopes ALWAYS carry session_id; webhook payloads carry
-        # it when chatlytics forwards it) falling back to CHATLYTICS_SESSION.
-        session_name = self._resolve_session_for_chat(chat_id)
-        if session_name:
-            body["session"] = session_name
-        else:
-            # Fail loudly with an operator-actionable error instead of
-            # letting chatlytics return its generic 400.
+        # P-19 session resolution + chatId/text/accountId base body — shared
+        # with the v4.4.0 progress-bubble path via _build_send_body. send()
+        # keeps the fail-loud contract: no resolvable WAHA session is an
+        # operator-actionable error instead of chatlytics's generic 400.
+        body_opt, session_err = self._build_send_body(chat_id, content)
+        if body_opt is None:
             return SendResult(
                 success=False,
-                error=(
-                    "Chatlytics adapter missing WAHA session for chat "
-                    f"{chat_id!r}: set CHATLYTICS_SESSION env var "
-                    "(e.g. 3cf11776_logan) or pass session= in the "
-                    "platform extra block. Inbound-derived session "
-                    "mapping is empty for this chat."
-                ),
+                error=session_err,
             )
-        if self.account_id:
-            body["accountId"] = self.account_id
+        body: Dict[str, Any] = body_opt
         if reply_to:
             body["replyTo"] = reply_to
         if metadata:
@@ -1623,16 +1880,48 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     continue
                 body[key] = value
 
+        # v4.4.0 (P7): progress-bubble edit-in-place. When a fresh bubble is
+        # pending for this chat, POP it (consume exactly once) and ask the
+        # server to EDIT that bubble into this reply instead of stacking a
+        # second message. Server-side the edit is ownership-enforced and
+        # falls back to a normal send automatically — a 200 always means
+        # the text was delivered.
+        edit_message_id: Optional[str] = None
+        if self.status_edit_in_place:
+            edit_message_id = self._pop_progress_bubble(chat_id)
+            if edit_message_id:
+                body["edit_message_id"] = edit_message_id
+
         logger.debug("send -> /api/v1/send chatId=%s len=%d", chat_id, len(content))
 
         try:
             response = await self._client.post("/api/v1/send", json=body)
         except httpx.RequestError as exc:
-            return SendResult(
-                success=False,
-                error=f"Transport error: {exc}",
-                retryable=True,
-            )
+            if edit_message_id:
+                # Never lose the reply over the edit decoration: retry ONCE
+                # as a plain send without edit_message_id. The bubble stays
+                # behind as an acceptable residual.
+                logger.debug(
+                    "edit-tagged send transport error for chat %s (%s); "
+                    "retrying once as plain send",
+                    chat_id,
+                    exc,
+                )
+                body.pop("edit_message_id", None)
+                try:
+                    response = await self._client.post("/api/v1/send", json=body)
+                except httpx.RequestError as exc2:
+                    return SendResult(
+                        success=False,
+                        error=f"Transport error: {exc2}",
+                        retryable=True,
+                    )
+            else:
+                return SendResult(
+                    success=False,
+                    error=f"Transport error: {exc}",
+                    retryable=True,
+                )
 
         # Tolerate non-JSON bodies for diagnostic surface area.
         try:
@@ -1651,9 +1940,30 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             and isinstance(payload, dict)
             and payload.get("success", True)
         ):
+            # v4.4.0 (P7): surface the server's edit outcome at DEBUG. A 200
+            # means the text was delivered either way (the server falls back
+            # to a plain send internally on edit failure / unknown ownership).
+            if edit_message_id:
+                if payload.get("edited"):
+                    logger.debug(
+                        "send edited progress bubble %s in place for chat %s",
+                        edit_message_id,
+                        chat_id,
+                    )
+                elif payload.get("edit_fallback"):
+                    logger.debug(
+                        "send edit fell back to plain send for chat %s "
+                        "(edit_fallback=%s)",
+                        chat_id,
+                        payload.get("edit_fallback"),
+                    )
             return SendResult(
                 success=True,
-                message_id=payload.get("messageId"),
+                # P7: servers >= chatlytics v5.4 return top-level
+                # ``message_id`` (normalized WAHA id); older shapes used
+                # ``messageId``. Prefer the legacy key first so pre-P7
+                # behavior is unchanged, fall back to the new one.
+                message_id=payload.get("messageId") or payload.get("message_id"),
                 raw_response=payload,
             )
 
@@ -2347,45 +2657,68 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # degraded-status path emits exactly ONE WARNING (without
         # traceback).  The previous flow logged twice on the exception
         # branch because the post-try `if not initial_ok` block re-fired.
-        try:
-            initial_ok = await self._send_typing_once(chat_id, duration=30.0)
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "send_typing initial fire raised for chat %s; continuing heartbeat",
-                chat_id,
-                exc_info=True,
+        #
+        # v4.4.0 (P7): _keep_typing is the only in-turn hook the adapter
+        # has (the base class spawns it per inbound message and stops it
+        # when the turn finishes), so it doubles as the progress-bubble
+        # anchor: a sibling timer task waits ``status_bubble_after_s`` on
+        # the SAME stop_event and posts the ONE "working…" bubble only if
+        # the turn outlives the threshold. Fast turns ⇒ timer exits on
+        # stop_event ⇒ zero new requests (byte-identical to v4.3.0).
+        progress_task: Optional[asyncio.Task] = None
+        if self.status_edit_in_place and self.status_bubble_after_s > 0:
+            progress_task = asyncio.create_task(
+                self._progress_bubble_timer(chat_id, stop_event)
             )
-        else:
-            if not initial_ok:
-                # 06-LOW-02: first-fire failure is operator-actionable --
-                # WARNING level so it surfaces in default logging configs.
-                # The DEBUG record from _send_typing_once carries the
-                # "why"; this WARNING carries the "who".
-                logger.warning(
-                    "send_typing initial fire failed for chat %s; continuing heartbeat",
-                    chat_id,
-                )
-
-        while True:
-            if stop_event is not None and stop_event.is_set():
-                return
+        try:
             try:
-                await asyncio.sleep(interval)
+                initial_ok = await self._send_typing_once(chat_id, duration=30.0)
             except asyncio.CancelledError:
-                return
-            if stop_event is not None and stop_event.is_set():
-                return
-            try:
-                await self.send_typing(chat_id, duration=30.0)
-            except asyncio.CancelledError:
-                return
+                raise
             except Exception:  # noqa: BLE001
-                logger.debug(
-                    "send_typing heartbeat raised; continuing",
+                logger.warning(
+                    "send_typing initial fire raised for chat %s; continuing heartbeat",
+                    chat_id,
                     exc_info=True,
                 )
+            else:
+                if not initial_ok:
+                    # 06-LOW-02: first-fire failure is operator-actionable --
+                    # WARNING level so it surfaces in default logging configs.
+                    # The DEBUG record from _send_typing_once carries the
+                    # "why"; this WARNING carries the "who".
+                    logger.warning(
+                        "send_typing initial fire failed for chat %s; continuing heartbeat",
+                        chat_id,
+                    )
+
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    return
+                try:
+                    await asyncio.sleep(interval)
+                except asyncio.CancelledError:
+                    return
+                if stop_event is not None and stop_event.is_set():
+                    return
+                try:
+                    await self.send_typing(chat_id, duration=30.0)
+                except asyncio.CancelledError:
+                    return
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "send_typing heartbeat raised; continuing",
+                        exc_info=True,
+                    )
+        finally:
+            # v4.4.0 (P7): the timer normally exits on its own (stop_event
+            # fired, or bubble already sent). The cancel covers the path
+            # where _keep_typing is cancelled WITHOUT stop_event being set
+            # so the timer can never outlive its turn.
+            if progress_task is not None and not progress_task.done():
+                progress_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await progress_task
 
     @contextlib.asynccontextmanager
     async def _typing_scope(self, chat_id: str, interval: float = 30.0):

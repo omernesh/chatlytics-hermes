@@ -1,5 +1,61 @@
 # Changelog
 
+## [4.4.0] - 2026-06-11
+
+Progress-bubble edit-in-place (chatlytics v5.4 P7, gateway half). When an
+agent turn outlives a threshold (default 8 s) the adapter sends ONE
+"⏳ working…" bubble, then EDITS that bubble into the final reply instead
+of stacking a second message. Fast turns never see a bubble — the request
+stream is byte-identical to v4.3.0 below the threshold, and setting
+`CHATLYTICS_STATUS_EDIT_IN_PLACE=false` disables both the bubble and the
+edit entirely.
+
+### Added
+
+- **Config knobs** (env wins over the platform `extra` block, parsed
+  defensively — bad values fall back to defaults, never raise at boot):
+  - `CHATLYTICS_STATUS_EDIT_IN_PLACE` / `extra.status_edit_in_place` —
+    default **true**.
+  - `CHATLYTICS_STATUS_BUBBLE_AFTER_S` / `extra.status_bubble_after_s` —
+    default 8.0; values <= 0 disable the bubble.
+  - `CHATLYTICS_STATUS_BUBBLE_TEXT` / `extra.status_bubble_text` —
+    default "⏳ working…".
+- **Progress-bubble emission**: anchored on `_keep_typing` (the per-turn
+  background task the gateway already runs) — a sibling timer waits the
+  threshold on the SAME stop_event and POSTs `/api/v1/send` with
+  `progress: true` (server suppresses reaction-feedback correlation for
+  it) only if the turn is still running. Exactly ONE bubble per turn;
+  bubble failures are DEBUG-only and never affect the turn (same
+  philosophy as the typing heartbeat). The returned message id
+  (`message_id` / legacy `messageId` / defensive `waha.id._serialized`
+  digs) is memoized in a bounded per-chat LRU (cap 100, 10-minute
+  staleness TTL).
+- **Edit-in-place in `send()`**: a fresh pending bubble id is popped
+  (consumed exactly once) and carried as `edit_message_id` so the server
+  edits the bubble into the reply (bot-scoped, ownership-enforced
+  server-side). The server falls back to a plain send internally on edit
+  failure / unknown ownership — a 200 always means the text was
+  delivered; `edited` / `edit_fallback` response fields are surfaced at
+  DEBUG. Transport-level failure of the edit-tagged request retries ONCE
+  as a plain send (never lose the reply over the decoration). Media
+  sends do not participate; a pending bubble before a media reply is
+  left behind as an acceptable residual.
+- **Reserved-key hardening**: `edit_message_id` and `progress` joined
+  `_RESERVED_BODY_KEYS` so caller metadata cannot inject them.
+
+### Unchanged
+
+- Flag false → no bubble, no edit, no new request fields (v4.3.0
+  behavior). Webhook/longpoll inbound, control envelopes, media paths,
+  and the v4.2.0/v4.3.0 surfaces are untouched.
+
+### Tests
+
+- `tests/test_status_edit.py`: fast-turn byte-identical path, slow-turn
+  single bubble + edit consume, message-id parsing fallbacks, bubble
+  failure isolation, edit-tagged transport retry, flag-off plain
+  behavior, reserved-key rejection, LRU bound + staleness.
+
 ## [4.3.0] - 2026-06-11
 
 Longpoll control envelopes (chatlytics v5.4 P6, gateway half). WhatsApp

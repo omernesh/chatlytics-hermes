@@ -1,7 +1,7 @@
 name: chatlytics
 label: Chatlytics WhatsApp
 kind: platform
-version: "4.3.0"
+version: "4.4.0"
 description: >
   Chatlytics WhatsApp gateway adapter for Hermes Agent. Connects Hermes to
   Chatlytics's REST API for inbound webhooks and outbound messages/media.
@@ -41,4 +41,16 @@ optional_env:
   - name: CHATLYTICS_HOME_CHANNEL
     description: "Default chat_id for cron/notification delivery"
     prompt: "Home channel chat_id (optional)"
+    password: false
+  - name: CHATLYTICS_STATUS_EDIT_IN_PLACE
+    description: "Progress-bubble edit-in-place (v4.4): on slow agent turns send ONE 'working…' bubble, then edit it into the final reply. Default: true. Set false to disable both the bubble and the edit (v4.3.0 behavior)."
+    prompt: "Enable progress-bubble edit-in-place (true/false)"
+    password: false
+  - name: CHATLYTICS_STATUS_BUBBLE_AFTER_S
+    description: "Seconds an agent turn must run before the progress bubble fires (default: 8). Values <= 0 disable the bubble."
+    prompt: "Progress bubble threshold seconds (optional)"
+    password: false
+  - name: CHATLYTICS_STATUS_BUBBLE_TEXT
+    description: "Text of the progress bubble (default: '⏳ working…')."
+    prompt: "Progress bubble text (optional)"
     password: false
