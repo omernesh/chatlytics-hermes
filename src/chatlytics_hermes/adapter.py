@@ -60,6 +60,7 @@ import logging
 import mimetypes
 import os
 import random
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -107,6 +108,34 @@ NO_TOKEN_PROMPT = (
 # (30s, only ~5s margin) was too tight; the poll uses an explicit per-request
 # httpx.Timeout with read = hold + 15s instead. See _poll_loop.
 _LONGPOLL_TIMEOUT_MS: int = 25000
+
+# v4.3.0 (chatlytics v5.4 P6): capability advertisement. The gateway adds
+# ``caps=control`` as a query parameter on EVERY longpoll GET so the
+# chatlytics server knows this gateway understands control envelopes
+# (``kind == "control"`` — /new /stop /retry conversation commands typed by
+# WhatsApp users). The server records this per-poll and only emits control
+# envelopes to caps-advertising gateways; there is no response handshake and
+# nothing changes on ack. DO NOT remove this param — without it the server
+# silently withholds control envelopes and conversation commands no-op.
+_LONGPOLL_CAPS: str = "control"
+
+# v4.3.0: control-envelope action set (chatlytics v5.4 wire contract).
+# ``kind=="control"`` envelopes carry one of these in ``action``; anything
+# else is logged once and IGNORED (forward-compat — a newer server may emit
+# actions this plugin predates, and they must NEVER be dispatched as
+# message text to the agent).
+_CONTROL_ACTIONS: frozenset = frozenset({"new_conversation", "stop", "retry_last"})
+
+# v4.3.0: bounded per-chat last-message memo for ``retry_last``. Keyed by
+# entity_jid, value = the last NORMAL message envelope dispatched for that
+# chat (the full envelope dict is the minimal re-dispatch unit — it feeds
+# straight back through _dispatch_envelope). LRU-evicted past this cap.
+_LAST_MESSAGE_MEMO_MAX: int = 128
+
+# v4.3.0: cap on the warn-once dedup set for unknown envelope kinds /
+# control actions, so a misbehaving server emitting unbounded distinct
+# unknown values cannot grow adapter memory without limit.
+_UNKNOWN_CONTROL_WARN_CAP: int = 64
 
 # v4.2.0 (P3 survivability): unmissable load-failure prefix. EVERY partial
 # load failure (missing token, unreachable base_url, register() raise) logs
@@ -363,6 +392,7 @@ def _coerce_success_payload(
 try:
     from gateway.platforms.base import BasePlatformAdapter, SendResult
     from gateway.config import Platform, PlatformConfig
+    from gateway.session import build_session_key
 
     _HERMES_AVAILABLE = True
 except ImportError:  # hermes-agent not installed (e.g. acceptance criterion 1)
@@ -370,6 +400,7 @@ except ImportError:  # hermes-agent not installed (e.g. acceptance criterion 1)
     SendResult = None  # type: ignore[assignment]
     Platform = None  # type: ignore[assignment]
     PlatformConfig = None  # type: ignore[assignment]
+    build_session_key = None  # type: ignore[assignment]
 
     _HERMES_AVAILABLE = False
 
@@ -495,6 +526,15 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # Bounded growth: each chat_id is a WhatsApp JID (under ~50 chars),
         # collection naturally tracks active conversations only.
         self._chat_session_map: Dict[str, str] = {}
+
+        # v4.3.0 (control envelopes): bounded LRU of the last NORMAL message
+        # envelope dispatched per chat (entity_jid -> envelope dict), consumed
+        # by the ``retry_last`` control action. See _remember_last_message.
+        self._last_message_memo: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        # v4.3.0: warn-once dedup for unknown envelope kinds / control
+        # actions so a stream of unknown envelopes does not spam the log
+        # per envelope. Bounded by _UNKNOWN_CONTROL_WARN_CAP.
+        self._unknown_control_warned: set = set()
 
         # v4.1 longpoll consumer: asyncio.Task handle for the inbound poll
         # loop, started in connect() when inbound_mode == "longpoll" and
@@ -709,7 +749,16 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             try:
                 resp = await client.get(
                     "/api/v1/bot/updates",
-                    params={"cursor": cursor, "timeout_ms": _LONGPOLL_TIMEOUT_MS},
+                    # v4.3.0: ``caps=control`` advertises control-envelope
+                    # support on EVERY poll (chatlytics v5.4 capability
+                    # negotiation — server-side, per-poll, no handshake).
+                    # This is the ONLY change to the longpoll request shape;
+                    # cursor/timeout semantics are untouched.
+                    params={
+                        "cursor": cursor,
+                        "timeout_ms": _LONGPOLL_TIMEOUT_MS,
+                        "caps": _LONGPOLL_CAPS,
+                    },
                     # Read timeout MUST exceed the server hold (timeout_ms) or
                     # every empty poll times out. read = hold + 15s buffer.
                     timeout=httpx.Timeout(
@@ -832,7 +881,40 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         WAHA session via :meth:`register_chat_session` (every envelope
         carries ``session_id``) so the outbound reply resolves the correct
         session.
+
+        v4.3.0 (chatlytics v5.4 P6 — control envelopes): each envelope MAY
+        now carry a ``kind`` discriminator. Routing rules (wire contract,
+        FIXED — keep in lockstep with the chatlytics server):
+
+        - absent ``kind`` OR ``kind == "message"`` → the existing message
+          path below, byte-for-byte (plus the retry_last memo record).
+        - ``kind == "control"``      → :meth:`_handle_control_envelope`.
+        - any other ``kind``         → log once + IGNORE (forward-compat).
+          NEVER dispatched as message text to the agent.
+
+        Control envelopes ride the same seq space and are acked exactly
+        like message envelopes — the batch-level ack in :meth:`_poll_loop`
+        is unchanged.
         """
+        kind = env.get("kind")
+        if kind is not None and kind != "message":
+            if kind == "control":
+                await self._handle_control_envelope(env)
+            else:
+                self._warn_unknown_control(
+                    f"kind={kind!r}",
+                    "longpoll envelope with unknown kind %r — ignoring "
+                    "(forward-compat; NOT dispatched as message text)",
+                    kind,
+                )
+            return
+
+        # v4.3.0: record the last normal message per chat so a subsequent
+        # ``retry_last`` control envelope can re-dispatch it. Recorded
+        # BEFORE dispatch on purpose: a turn that crashes mid-dispatch is
+        # exactly what /retry exists to re-run.
+        self._remember_last_message(env)
+
         body = {
             "chatId": env["entity_jid"],          # required by normalize_payload
             "text": env.get("text", ""),
@@ -849,6 +931,311 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         self.register_chat_session(body["chatId"], body["session"])
         event = normalize_payload(body, self.platform)
         await self.handle_message(event)
+
+    # --- Control envelopes (v4.3.0 — chatlytics v5.4 P6) -------------------
+
+    def _remember_last_message(self, env: Dict[str, Any]) -> None:
+        """Record ``env`` as the last normal message for its chat (LRU-bounded).
+
+        Keyed by ``entity_jid`` (the chat key per the v5.4 control
+        contract). The stored value is a shallow copy of the envelope —
+        the minimal unit ``retry_last`` needs, because re-dispatch feeds
+        it straight back through :meth:`_dispatch_envelope` (same
+        normalization, session-threading, and handle_message path as the
+        original delivery). Bounded at :data:`_LAST_MESSAGE_MEMO_MAX`
+        chats, one (the last) message per chat.
+        """
+        chat_id = env.get("entity_jid")
+        if not isinstance(chat_id, str) or not chat_id:
+            return
+        self._last_message_memo[chat_id] = dict(env)
+        self._last_message_memo.move_to_end(chat_id)
+        while len(self._last_message_memo) > _LAST_MESSAGE_MEMO_MAX:
+            self._last_message_memo.popitem(last=False)
+
+    def _warn_unknown_control(self, dedup_key: str, msg: str, *args: Any) -> None:
+        """WARNING once per distinct unknown kind/action; DEBUG thereafter.
+
+        Keeps the forward-compat ignore path from spamming one WARNING per
+        envelope when a newer chatlytics server emits values this plugin
+        predates. The dedup set is capped (``_UNKNOWN_CONTROL_WARN_CAP``)
+        so unbounded distinct unknown values cannot grow memory; past the
+        cap every occurrence logs WARNING again (noisy beats silent).
+        """
+        if dedup_key in self._unknown_control_warned:
+            logger.debug(msg, *args)
+            return
+        if len(self._unknown_control_warned) < _UNKNOWN_CONTROL_WARN_CAP:
+            self._unknown_control_warned.add(dedup_key)
+        logger.warning(msg, *args)
+
+    def _control_event(self, env: Dict[str, Any], text: str) -> Any:
+        """Build a MessageEvent (for its SessionSource) from a control envelope.
+
+        Mirrors the body construction in :meth:`_dispatch_envelope` (keep
+        the two in sync!) so the SessionSource — and therefore the session
+        key — derived for a control envelope is IDENTICAL to the one the
+        chat's normal messages produce. ``text`` is cosmetic (the event is
+        never dispatched to the agent; it only feeds harness APIs that
+        take an event/source).
+        """
+        body = {
+            "chatId": env["entity_jid"],
+            "text": text,
+            "senderId": env.get("sender_jid"),
+            "chatType": (
+                "channel"
+                if env.get("chat_type") == "newsletter"
+                else env.get("chat_type") or "dm"
+            ),
+            "session": env.get("session_id"),
+        }
+        return normalize_payload(body, self.platform)
+
+    def _control_session_key(self, source: Any) -> str:
+        """Hermes session key for ``source`` — same derivation as inbound.
+
+        Mirrors ``BasePlatformAdapter.handle_message`` exactly (same
+        ``build_session_key`` call, same config extras) so control actions
+        target the SAME per-chat conversation that normal messages use.
+        """
+        extra = getattr(self.config, "extra", None) or {}
+        return build_session_key(
+            source,
+            group_sessions_per_user=extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
+        )
+
+    def _gateway_runner(self) -> Any:
+        """Best-effort handle on the HermesGateway runner instance.
+
+        The gateway wires ``adapter.set_message_handler(self._handle_message)``
+        at startup (gateway/run.py), so the bound method's ``__self__`` IS
+        the runner. Used (behind ``hasattr`` feature-detection, never
+        required) to reach the runner's own /new and /stop machinery —
+        the ONLY code that can fully reset a conversation (session-store
+        rotation alone leaves the runner's cached AIAgent, which holds the
+        in-memory conversation history, alive). Returns ``None`` when no
+        handler is set (tests, partial wiring) — callers degrade gracefully.
+        """
+        return getattr(getattr(self, "_message_handler", None), "__self__", None)
+
+    async def _handle_control_envelope(self, env: Dict[str, Any]) -> None:
+        """Route one ``kind=="control"`` envelope to its action handler.
+
+        Control envelope shape (chatlytics v5.4 wire contract)::
+
+            { kind: "control",
+              action: "new_conversation" | "stop" | "retry_last",
+              bot_token, session_id, chat_type, entity_jid, sender_jid, ts }
+
+        The chat key is ``entity_jid``. Unknown actions are logged once and
+        IGNORED (forward-compat) — never dispatched as message text.
+        """
+        chat_id = env.get("entity_jid")
+        if not isinstance(chat_id, str) or not chat_id:
+            logger.warning(
+                "control envelope missing entity_jid; ignoring (action=%r)",
+                env.get("action"),
+            )
+            return
+        # Keep the WAHA session map fresh — control envelopes carry
+        # session_id like message envelopes do.
+        session_id = env.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            self.register_chat_session(chat_id, session_id)
+
+        action = env.get("action")
+        if action == "new_conversation":
+            await self._control_new_conversation(env)
+        elif action == "stop":
+            await self._control_stop(env)
+        elif action == "retry_last":
+            await self._control_retry_last(env)
+        else:
+            self._warn_unknown_control(
+                f"action={action!r}",
+                "control envelope with unknown action %r for chat %s — "
+                "ignoring (forward-compat; NOT dispatched as message text)",
+                action,
+                chat_id,
+            )
+
+    async def _control_new_conversation(self, env: Dict[str, Any]) -> None:
+        """``/new`` from WhatsApp: reset the chat's hermes conversation.
+
+        Resolution ladder (most → least complete; each step is
+        feature-detected so harness version drift degrades instead of
+        breaking):
+
+        1. Runner ``_interrupt_and_clear_session`` + ``_handle_reset_command``
+           — the gateway's OWN /new machinery (same calls run.py makes for a
+           typed mid-run /new): interrupts an in-flight agent turn, clears
+           queued/pending work, EVICTS the cached AIAgent (which holds the
+           in-memory conversation), rotates the session-store entry, clears
+           session-scoped overrides, fires session-boundary hooks. The
+           destructive-slash confirm gate is deliberately NOT involved —
+           the chatlytics server owns the user-facing command UX and has
+           already accepted the command.
+        2. ``self._session_store.reset_session(session_key)`` — the harness
+           session-reset API the gateway hands every adapter via
+           ``set_session_store``. Rotates the session id so the next turn
+           starts a fresh transcript (partial: cannot evict a runner-cached
+           agent — logged).
+        3. Neither available → WARNING + ignore (nothing to reset against).
+
+        The handler's reply text (step 1) is discarded — the chatlytics
+        server acks the command to the WhatsApp user itself.
+        """
+        event = self._control_event(env, text="/new")
+        source = event.source
+        session_key = self._control_session_key(source)
+        gw = self._gateway_runner()
+
+        # Step 1a: cancel any in-flight turn + clear queued work first, so
+        # the old conversation cannot keep streaming into the new one.
+        if gw is not None and hasattr(gw, "_interrupt_and_clear_session"):
+            try:
+                await gw._interrupt_and_clear_session(
+                    session_key,
+                    source,
+                    interrupt_reason="chatlytics control: new_conversation",
+                    invalidation_reason="control_new_conversation",
+                )
+            except Exception:  # noqa: BLE001 — best-effort; reset still proceeds
+                logger.exception(
+                    "control new_conversation: interrupt-and-clear raised; "
+                    "continuing with reset"
+                )
+        else:
+            with contextlib.suppress(Exception):
+                await self.interrupt_session_activity(session_key, source.chat_id)
+            getattr(self, "_pending_messages", {}).pop(session_key, None)
+
+        # Step 1b: full reset via the runner's /new handler.
+        if gw is not None and hasattr(gw, "_handle_reset_command"):
+            try:
+                await gw._handle_reset_command(event)
+                logger.info(
+                    "control new_conversation: session %s reset via gateway "
+                    "/new handler",
+                    session_key,
+                )
+                return
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "control new_conversation: gateway reset handler raised; "
+                    "falling back to session-store reset"
+                )
+
+        # Step 2: session-store rotation (partial reset).
+        store = getattr(self, "_session_store", None)
+        if store is not None and hasattr(store, "reset_session"):
+            try:
+                store.reset_session(session_key)
+                logger.info(
+                    "control new_conversation: session %s rotated via "
+                    "session_store.reset_session (gateway /new handler "
+                    "unavailable — a runner-cached agent, if any, was only "
+                    "interrupted, not evicted)",
+                    session_key,
+                )
+                return
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "control new_conversation: session_store.reset_session raised"
+                )
+
+        # Step 3: nothing to reset against.
+        logger.warning(
+            "control new_conversation: no session-reset API available for "
+            "%s (no gateway runner, no session store); ignoring",
+            session_key,
+        )
+
+    async def _control_stop(self, env: Dict[str, Any]) -> None:
+        """``/stop`` from WhatsApp: best-effort cancel the in-flight turn.
+
+        The hermes harness DOES expose real cancellation: the runner's
+        ``_interrupt_and_clear_session`` calls ``running_agent.interrupt()``
+        on the live AIAgent, invalidates the run generation, signals the
+        adapter's per-session interrupt event, stops typing, and drops any
+        adapter-side pending/queued message for the chat — the same path a
+        typed /stop takes. When the runner is unreachable we degrade to the
+        adapter-local surface (interrupt event + pending-queue drop) and
+        log clearly what was NOT cancellable.
+        """
+        event = self._control_event(env, text="/stop")
+        source = event.source
+        session_key = self._control_session_key(source)
+        gw = self._gateway_runner()
+
+        if gw is not None and hasattr(gw, "_interrupt_and_clear_session"):
+            try:
+                await gw._interrupt_and_clear_session(
+                    session_key,
+                    source,
+                    interrupt_reason="chatlytics control: stop",
+                    invalidation_reason="control_stop",
+                )
+                logger.info(
+                    "control stop: interrupted in-flight run + cleared queued "
+                    "work for %s via gateway cancellation",
+                    session_key,
+                )
+                return
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "control stop: gateway cancellation raised; falling back "
+                    "to adapter-side interrupt"
+                )
+
+        # Fallback: adapter-local best effort. The per-session interrupt
+        # event (when an active handler exists) makes the processing task
+        # wind down; dropping the pending slot prevents a queued follow-up
+        # from re-firing the turn we just tried to stop.
+        had_active = session_key in (getattr(self, "_active_sessions", None) or {})
+        with contextlib.suppress(Exception):
+            await self.interrupt_session_activity(session_key, source.chat_id)
+        dropped = (
+            getattr(self, "_pending_messages", {}).pop(session_key, None)
+            is not None
+        )
+        logger.warning(
+            "control stop: gateway cancellation API unavailable for %s — "
+            "signalled adapter interrupt event (active handler: %s), "
+            "dropped pending queued message: %s; an agent turn already "
+            "executing inside the runner could NOT be cancelled from the "
+            "adapter",
+            session_key,
+            had_active,
+            dropped,
+        )
+
+    async def _control_retry_last(self, env: Dict[str, Any]) -> None:
+        """``/retry`` from WhatsApp: re-dispatch the chat's last user message.
+
+        Replays the memoized last NORMAL message envelope through the
+        regular inbound dispatch path (:meth:`_dispatch_envelope` — same
+        normalization, session threading, and handle_message flow as the
+        original delivery). No memo for the chat → log + ignore.
+        """
+        chat_id = env["entity_jid"]
+        memo = self._last_message_memo.get(chat_id)
+        if memo is None:
+            logger.info(
+                "control retry_last: no memoized last message for chat %s; "
+                "ignoring",
+                chat_id,
+            )
+            return
+        logger.info(
+            "control retry_last: re-dispatching last user message for chat %s",
+            chat_id,
+        )
+        # dict() copy so the re-dispatch (which re-records the memo) never
+        # aliases the stored entry.
+        await self._dispatch_envelope(dict(memo))
 
     @property
     def is_bot_token(self) -> bool:

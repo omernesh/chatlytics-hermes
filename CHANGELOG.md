@@ -1,5 +1,58 @@
 # Changelog
 
+## [4.3.0] - 2026-06-11
+
+Longpoll control envelopes (chatlytics v5.4 P6, gateway half). WhatsApp
+users can drive /new /stop /retry conversation commands: the chatlytics
+server intercepts them and emits `kind: "control"` envelopes over the
+existing longpoll channel — but ONLY to gateways that advertise support,
+so pre-4.3.0 gateways never see shapes they would mis-dispatch as text.
+
+### Added
+
+- **Capability negotiation (`caps=control`)**: every longpoll
+  `GET /api/v1/bot/updates` now carries `caps=control` alongside the
+  existing `cursor`/`timeout_ms` params. Server records it per-poll; no
+  response handshake, ack unchanged. This is the ONLY change to the
+  longpoll request shape — the v4.2.0 reconnect/backoff ladder and the
+  healthy empty-batch path are untouched.
+- **Control envelope handling** (`kind == "control"`, chat key =
+  `entity_jid`; rides the same seq space and acks exactly like message
+  envelopes):
+  - `new_conversation` — resets the chat's hermes conversation via the
+    gateway runner's own /new machinery (interrupt in-flight turn, clear
+    queued work, evict the cached agent, rotate the session-store entry);
+    falls back to `session_store.reset_session(session_key)` when the
+    runner is unreachable, then to a logged no-op. The destructive-slash
+    confirm gate is deliberately bypassed — the chatlytics server owns the
+    user-facing command UX.
+  - `stop` — real cancellation via the runner's
+    `_interrupt_and_clear_session` (interrupts the live agent turn, drops
+    pending/queued work); adapter-local fallback signals the per-session
+    interrupt event + drops the pending slot and logs clearly what could
+    NOT be cancelled.
+  - `retry_last` — re-dispatches the chat's last user message through the
+    normal inbound dispatch path. Backed by a new bounded per-chat
+    last-message memo (LRU, max 128 chats, last message only) recorded on
+    every normal message dispatch. No memo for the chat → log + ignore.
+- **Forward-compat ignore**: unknown `kind` values and unknown control
+  `action` values are logged (WARNING once per distinct value, DEBUG
+  after) and IGNORED — never dispatched as message text to the agent.
+
+### Unchanged
+
+- Message envelopes (absent `kind` or `kind == "message"`) flow through
+  the existing dispatch path byte-for-byte (plus the retry memo record).
+  Webhook mode, ack/cursor semantics, and the v4.2.0 survivability
+  surfaces are untouched.
+
+### Tests
+
+- `tests/test_control.py`: caps param on every poll, unchanged message
+  dispatch + ack, control routing for all three actions (gateway runner
+  path + fallbacks), retry memo recording/LRU bound/no-memo ignore,
+  unknown kind/action ignored (and ack still advances), warn-once dedup.
+
 ## [4.2.0] - 2026-06-11
 
 Plugin survivability (P3). Kills the "gateway boots with 2 platforms instead
