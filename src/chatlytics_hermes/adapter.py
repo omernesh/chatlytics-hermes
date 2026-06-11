@@ -2405,6 +2405,10 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 "`python -m chatlytics_hermes.doctor` to verify.",
                 _LOAD_FAIL_PREFIX,
             )
+            # v4.5.2: registered even in the degraded state so health/login
+            # tools can report the no-credential truth (they are exempt from
+            # the no-token guard by design — see _NO_TOKEN_EXEMPT_TOOLS).
+            _register_live_adapter(self)
             return True
 
         # A token IS present: clear any prior degraded flag (defensive against
@@ -2499,6 +2503,10 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             logger.info(
                 "chatlytics inbound: longpoll mode (polling /api/v1/bot/updates)"
             )
+            # v4.5.2: a live longpoll task IS connected — register so
+            # chatlytics_* tools resolve this adapter on longpoll-only
+            # gateways (BotDaddy "adapter is not connected" fix).
+            _register_live_adapter(self)
             return True
 
         # --- Inbound webhook server (HERMES-03) -----------------------
@@ -2514,6 +2522,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 self.webhook_port,
             )
             self._running = True
+            _register_live_adapter(self)  # v4.5.2
             return True
 
         try:
@@ -2560,6 +2569,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             ) from exc
 
         self._running = True
+        _register_live_adapter(self)  # v4.5.2
         return True
 
     def _on_poll_task_done(self, task: "asyncio.Task") -> None:
@@ -2649,6 +2659,10 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # Stop accepting new inbound work before tearing down transports so
         # the longpoll loop sees ``_running == False`` and exits its while.
         self._running = False
+
+        # v4.5.2: drop the live-adapter registry entry (identity-guarded —
+        # a newer adapter that already re-registered is left untouched).
+        _unregister_live_adapter(self)
 
         # v4.1 longpoll: cancel the poll task first so no in-flight GET/ack
         # uses ``self._client`` after we close it below.
@@ -3777,6 +3791,38 @@ async def _standalone_send(text: str, **kwargs: Any) -> Dict[str, Any]:
     }
 
 
+# --- Live-adapter registry (v4.5.2) -----------------------------------------
+#
+# hermes-agent's REAL ``hermes_cli.plugins.PluginContext`` (verified against
+# 0.16.0) exposes NEITHER ``get_platform`` NOR a ``platforms`` mapping — those
+# accessors only ever existed on older/runtime contexts and test harnesses.
+# In production every ``_make_tool_handler._lookup_adapter()`` ctx probe
+# therefore returned ``None`` and EVERY chatlytics_* tool failed with
+# "adapter is not connected" even while the longpoll loop was alive and
+# healthy (observed on the BotDaddy longpoll-only gateway — see
+# profiles/botdaddy/logs/errors.log).
+#
+# Fix: the adapter registers ITSELF here on every successful ``connect()``
+# (including the degraded no-credential load) and unregisters in
+# ``disconnect()``. ``_lookup_adapter`` falls back to this registry after the
+# ctx probes, so tools work whenever the adapter is connected — webhook OR
+# longpoll — regardless of which accessor surface the host gateway provides.
+# Keyed by platform name for forward-compat; identity-guarded unregistration
+# prevents an overlapping reconnect from clobbering the live entry.
+_LIVE_ADAPTERS: Dict[str, "ChatlyticsAdapter"] = {}
+
+
+def _register_live_adapter(adapter: "ChatlyticsAdapter") -> None:
+    """Record ``adapter`` as the process-wide live chatlytics adapter."""
+    _LIVE_ADAPTERS["chatlytics"] = adapter
+
+
+def _unregister_live_adapter(adapter: "ChatlyticsAdapter") -> None:
+    """Drop ``adapter`` from the registry — only if it is still the live one."""
+    if _LIVE_ADAPTERS.get("chatlytics") is adapter:
+        _LIVE_ADAPTERS.pop("chatlytics", None)
+
+
 def _make_tool_handler(ctx: Any, name: str, handler: Any) -> Any:
     """Build a register-time wrapper that resolves the live adapter at call time.
 
@@ -3838,11 +3884,15 @@ def _make_tool_handler(ctx: Any, name: str, handler: Any) -> Any:
             if isinstance(platforms_attr, dict):
                 entry = platforms_attr.get("chatlytics")
         if entry is None:
-            return None
+            # v4.5.2: real hermes PluginContexts (>=0.16) have neither
+            # accessor — fall back to the registry connect() populates.
+            return _LIVE_ADAPTERS.get("chatlytics")
         # Both attribute and dict accessors used by various harnesses.
         adapter_inst = getattr(entry, "adapter", None)
         if adapter_inst is None and isinstance(entry, dict):
             adapter_inst = entry.get("adapter")
+        if adapter_inst is None:
+            adapter_inst = _LIVE_ADAPTERS.get("chatlytics")
         return adapter_inst
 
     async def _bound(args: Optional[Dict[str, Any]] = None, **kwargs: Any) -> str:

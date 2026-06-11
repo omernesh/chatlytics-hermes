@@ -1,5 +1,30 @@
 # Changelog
 
+## [4.5.2] - 2026-06-11
+
+### Fixed
+
+- **chatlytics_health / chatlytics_login (and every chatlytics_* tool) now
+  work on longpoll-only gateways.** Root cause: hermes-agent's real
+  `hermes_cli.plugins.PluginContext` (verified on 0.16.0) exposes NEITHER
+  `get_platform` NOR a `platforms` mapping — the only accessors
+  `_make_tool_handler._lookup_adapter()` probed — so in production every
+  tool call failed with `"adapter is not connected"` even while the
+  longpoll loop was alive and healthy (observed on the BotDaddy gateway).
+  Fix: `connect()` now registers the adapter in a module-level
+  `_LIVE_ADAPTERS` registry (all success paths, including the degraded
+  no-credential load); `_lookup_adapter` falls back to it after the ctx
+  probes (ctx accessors still win when present — test harnesses
+  unchanged); `disconnect()` unregisters with an identity guard so an
+  overlapping reconnect is never clobbered.
+
+### Added
+
+- Cross-repo dedup contract test: a duplicate `question_resolved` control
+  envelope (same `request_id`, entry already popped by the first delivery)
+  is warn-ignored — no `asyncio.InvalidStateError`, first resolution
+  stands (review-d3 informational LOW).
+
 ## [4.5.1] - 2026-06-11
 
 Review-d3 fix pass: poll-loop resilience, question-flow robustness, and

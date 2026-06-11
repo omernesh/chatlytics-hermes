@@ -48,6 +48,23 @@ def _isolate_chatlytics_env(monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _clear_live_adapter_registry():
+    """v4.5.2: hermetic live-adapter registry between tests.
+
+    ``ChatlyticsAdapter.connect()`` registers the instance in the
+    module-level ``_LIVE_ADAPTERS`` fallback (the BotDaddy
+    "adapter is not connected" fix). Tests that connect() without a
+    matching disconnect() must not leak a live adapter into the next
+    test's ``_make_tool_handler`` lookup.
+    """
+    from chatlytics_hermes import adapter as _adapter_mod
+
+    _adapter_mod._LIVE_ADAPTERS.clear()
+    yield
+    _adapter_mod._LIVE_ADAPTERS.clear()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _register_chatlytics_platform():
     """Register the chatlytics platform in gateway.platform_registry.

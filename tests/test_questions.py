@@ -415,6 +415,41 @@ async def test_question_resolved_unknown_request_id_warns_and_noops(
     )
 
 
+async def test_question_resolved_duplicate_envelope_warn_ignored_no_invalid_state(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """v4.5.2 cross-repo dedup contract (review-d3 informational LOW):
+
+    A DUPLICATE ``question_resolved`` control envelope — same request_id,
+    entry already popped by the first delivery (e.g. the chatlytics server
+    re-delivers across the longpoll ack boundary) — must be warn-ignored.
+    In particular it must NOT raise ``asyncio.InvalidStateError`` by
+    re-resolving an already-done future, and the first resolution must
+    stand."""
+    adapter, _fake = _adapter_with_client()
+
+    task = asyncio.create_task(
+        adapter.ask_approval("deploy to prod?", CHAT_ID, timeout_s=5.0)
+    )
+    rid = await _wait_for_pending(adapter)
+
+    # First delivery resolves the pending future normally.
+    await adapter._handle_control_envelope(_resolved_envelope(rid, "approved"))
+    assert await task is True
+
+    # Duplicate delivery (same request_id, even a CONFLICTING resolution):
+    # entry is already popped -> unknown-request-id warn-ignore path. The
+    # handler must not raise (InvalidStateError or otherwise).
+    with caplog.at_level("WARNING", logger="chatlytics_hermes.adapter"):
+        await adapter._handle_control_envelope(_resolved_envelope(rid, "denied"))
+
+    assert any(
+        "unknown/expired request_id" in rec.getMessage() for rec in caplog.records
+    )
+    # First resolution stands; registry stays clean.
+    assert rid not in adapter._pending_questions
+
+
 async def test_question_resolved_missing_request_id_warns_and_noops(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
