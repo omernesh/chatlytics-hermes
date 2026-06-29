@@ -53,6 +53,7 @@ operator-actionable surface for sustained typing-pipeline failure.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import hashlib
 import inspect
@@ -299,6 +300,28 @@ _MEDIA_TYPE_MAP: Dict[str, str] = {
     "document": "file",
     "animation": "video",
     "image_file": "image",
+}
+
+# Media-send fix: the chatlytics gateway has NO ``/api/v1/send-media`` or
+# ``/api/v1/upload`` route. The ONLY send endpoint is ``POST /api/v1/send``,
+# which routes by a top-level ``type`` field through ``SEND_TYPE_TO_PATH``
+# (src/proxy-send-handler.ts: text→/api/sendText, image→/api/sendImage,
+# video→/api/sendVideo, file→/api/sendFile) and forwards the rest of the body
+# verbatim to WAHA. WAHA carries the media in a ``file`` field (src/send.ts
+# buildFilePayload: {url, mimetype?, filename?} for a remote URL, or
+# {data(base64), mimetype, filename} for inlined bytes) and the optional
+# ``caption``. This map turns the adapter's internal ``media_kind`` into the
+# ``type`` value /api/v1/send accepts. ``type`` only supports
+# {text,image,video,file}; voice (a true push-to-talk bubble) is NOT reachable
+# through proxy-send, so it degrades to ``file`` (best available — the audio
+# still delivers as a downloadable attachment) and animation rides ``video``.
+_MEDIA_KIND_TO_SEND_TYPE: Dict[str, str] = {
+    "image": "image",
+    "image_file": "image",
+    "video": "video",
+    "animation": "video",
+    "document": "file",
+    "voice": "file",
 }
 
 
@@ -3258,6 +3281,98 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             retryable=response.status_code >= 500,
         )
 
+    async def _resolve_media_file_field(
+        self,
+        resource: Union[str, Path, bytes, bytearray],
+        *,
+        upload_filename: Optional[str] = None,
+        content_type: Optional[str] = None,
+    ) -> Union[Dict[str, str], str]:
+        """Resolve a media resource to the WAHA ``file`` payload field.
+
+        Media-send fix: ``POST /api/v1/send`` forwards the body verbatim to
+        WAHA, which reads the media from a ``file`` field (see src/send.ts
+        ``buildFilePayload``). There is NO server-side upload endpoint, so a
+        local file/bytes resource must be inlined as base64 here rather than
+        uploaded.
+
+        Returns:
+
+        - ``{"url": <https-url>, ...}`` for a remote URL (passthrough — WAHA
+          fetches it; mimetype/filename added when derivable so WAHA renders
+          proper media instead of a generic attachment).
+        - ``{"data": <base64>, "mimetype": ..., "filename": ...}`` for a
+          local ``Path`` / existing string path / raw bytes (inlined).
+
+        Mirrors the URL-vs-local-vs-bytes auto-detection that
+        ``_resolve_media_url`` used, MINUS the (non-existent) upload step.
+        Blocking file reads run off the event loop via ``asyncio.to_thread``
+        (preserves the 04-MED-02 fix).
+
+        Raises ``PermissionError`` (path outside the upload allowlist),
+        ``ValueError`` (unresolvable input), or ``OSError`` (read failure);
+        all are caught and surfaced by :meth:`_send_media_payload`.
+        """
+        # Branch 1: raw bytes — inline as base64.
+        if isinstance(resource, (bytes, bytearray)):
+            name = upload_filename or "upload.bin"
+            ctype = content_type or _guess_content_type(name)
+            return {
+                "data": base64.b64encode(bytes(resource)).decode("ascii"),
+                "mimetype": ctype,
+                "filename": name,
+            }
+
+        # Branch 2: explicit Path object — local file, allowlist-enforced.
+        if isinstance(resource, Path):
+            resolved = self._enforce_upload_allowlist(resource)
+            content, basename = await asyncio.to_thread(
+                _read_file_sync, str(resolved)
+            )
+            name = upload_filename or basename
+            ctype = content_type or _guess_content_type(name)
+            return {
+                "data": base64.b64encode(content).decode("ascii"),
+                "mimetype": ctype,
+                "filename": name,
+            }
+
+        # Branch 3: URL string — passthrough (WAHA fetches it).
+        if isinstance(resource, str) and resource.startswith(("http://", "https://")):
+            field: Dict[str, str] = {"url": resource}
+            mime = content_type or _guess_content_type(
+                upload_filename or os.path.basename(resource.split("?", 1)[0])
+            )
+            if mime and mime != "application/octet-stream":
+                field["mimetype"] = mime
+            derived_name = upload_filename or (
+                os.path.basename(resource.split("?", 1)[0]) or None
+            )
+            if derived_name:
+                field["filename"] = derived_name
+            return field
+
+        # Branch 4: string path that exists on disk — local file, inlined.
+        if isinstance(resource, str) and Path(resource).expanduser().exists():
+            resolved = self._enforce_upload_allowlist(Path(resource))
+            content, basename = await asyncio.to_thread(
+                _read_file_sync, str(resolved)
+            )
+            name = upload_filename or basename
+            ctype = content_type or _guess_content_type(name)
+            return {
+                "data": base64.b64encode(content).decode("ascii"),
+                "mimetype": ctype,
+                "filename": name,
+            }
+
+        # Branch 5: unresolvable input — clean ValueError.
+        raise ValueError(
+            "resource must be a URL (http://, https://) or a local "
+            f"file path that exists; got {type(resource).__name__}="
+            f"{resource!r}"
+        )
+
     async def _send_media_payload(
         self,
         chat_id: str,
@@ -3268,11 +3383,16 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         filename: Optional[str] = None,
         content_type: Optional[str] = None,
     ) -> "SendResult":
-        """Resolve resource -> URL, build payload, POST /api/v1/send-media.
+        """Resolve resource -> file field, build body, POST /api/v1/send.
 
-        Shared body for the 6 media handlers below.  ``media_kind`` is
-        one of the keys in :data:`_MEDIA_TYPE_MAP` and gets translated
-        to the Chatlytics ``mediaType`` wire value.
+        Shared body for the media handlers. Media-send fix: routes through
+        the REAL endpoint ``POST /api/v1/send`` (NOT the non-existent
+        ``/api/v1/send-media``) with a top-level ``type`` field — mirroring
+        how :meth:`send` carries text. ``media_kind`` maps to the
+        ``/api/v1/send`` ``type`` value via :data:`_MEDIA_KIND_TO_SEND_TYPE`;
+        the media itself rides the WAHA ``file`` passthrough field built by
+        :meth:`_resolve_media_file_field` (remote URL or base64-inlined local
+        bytes — there is no server upload endpoint).
         """
         if self._client is None:
             return SendResult(
@@ -3281,7 +3401,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             )
 
         try:
-            media_url = await self._resolve_media_url(
+            file_field = await self._resolve_media_file_field(
                 resource,
                 upload_filename=filename,
                 content_type=content_type,
@@ -3294,43 +3414,43 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             # generic OSError so the tool layer / operator can tell why.
             return SendResult(success=False, error=f"Permission denied: {exc}")
         except ValueError as exc:
-            # HERMES-15: resource was neither a URL, a Path, nor an
-            # existing string path. _resolve_media_url raised cleanly;
-            # surface as a regular SendResult failure for the caller.
+            # resource was neither a URL, a Path, nor an existing string path.
             return SendResult(success=False, error=f"Invalid resource: {exc}")
         except OSError as exc:
             return SendResult(success=False, error=f"File read error: {exc}")
         except RuntimeError as exc:
             return SendResult(success=False, error=str(exc))
-        except httpx.RequestError as exc:
-            return SendResult(
-                success=False,
-                error=f"Upload transport error: {exc}",
-                retryable=True,
-            )
 
-        body: Dict[str, Any] = {
-            "chatId": chat_id,
-            "mediaType": _MEDIA_TYPE_MAP[media_kind],
-            "mediaUrl": media_url,
-        }
+        # Reuse the P-19 session/chatId/accountId resolution shared with
+        # send() + the progress bubble. Fail loud when no WAHA session can be
+        # resolved (same contract as send()).
+        body, session_err = self._build_send_body(chat_id, "")
+        if body is None:
+            return SendResult(success=False, error=session_err)
+        # Media has no text body; ``file`` + optional ``caption`` carry it.
+        body.pop("text", None)
+        body["type"] = _MEDIA_KIND_TO_SEND_TYPE[media_kind]
+        body["file"] = file_field
         if caption:
             body["caption"] = caption
+        # A caller-supplied display filename overrides the file-field default
+        # for documents (the recipient sees this name on the attachment).
         if filename and media_kind in {"document", "image_file"}:
             body["filename"] = filename
 
         logger.debug(
-            "send_media (%s) -> /api/v1/send-media chatId=%s",
+            "send_media (%s -> type=%s) -> /api/v1/send chatId=%s",
             media_kind,
+            body["type"],
             chat_id,
         )
 
         try:
-            response = await self._client.send_media(body)
+            response = await self._client.post("/api/v1/send", json=body)
         except httpx.RequestError as exc:
             return SendResult(
                 success=False,
-                error=f"send-media transport error: {exc}",
+                error=f"send transport error: {exc}",
                 retryable=True,
             )
 

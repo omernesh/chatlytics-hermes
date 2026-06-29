@@ -1,8 +1,12 @@
 """HERMES-04 acceptance tests for the chatlytics-hermes media surface.
 
-Seven ``respx``-mocked tests cover the 5 media handlers (``send_image``,
-``send_voice``, ``send_video``, ``send_document``, ``send_animation``)
-plus the ``_keep_typing`` 30s heartbeat asynccontextmanager.
+Media-send fix (event-loop + endpoint correction milestone): the chatlytics
+gateway has NO ``/api/v1/send-media`` or ``/api/v1/upload`` route. The ONLY
+send endpoint is ``POST /api/v1/send``, which routes media by a top-level
+``type`` field (image/video/file) and carries the media in the WAHA ``file``
+passthrough field (``{url, mimetype?, filename?}`` for a remote URL, or
+``{data(base64), mimetype, filename}`` for an inlined local file). These tests
+assert that real contract; the pre-fix tests asserted the phantom endpoints.
 
 HERMES-15 (v3.0 BREAKING): the v2.0 ``send_image_file`` companion was
 removed. The ``TestResourceAutoDetection`` class at the bottom covers
@@ -16,6 +20,7 @@ The 8th acceptance test (``_standalone_send`` cron hook) lives in
 from __future__ import annotations
 
 import asyncio
+import base64
 import json as _json
 import tempfile
 from pathlib import Path
@@ -31,6 +36,7 @@ from tests._fixtures import FakePlatformConfig
 BASE_URL = "https://gateway.test.chatlytics.ai"
 API_KEY = "test-api-key-abc123"
 CHAT_ID = "120363100000000000@g.us"
+SESSION = "3cf11776_logan"
 EXPECTED_AUTH = f"Bearer {API_KEY}"
 
 
@@ -40,12 +46,15 @@ def adapter() -> ChatlyticsAdapter:
     # for local-file media tests to pass under the new default-deny
     # allowlist.  ``tempfile.gettempdir()`` covers ``tmp_path`` (pytest's
     # per-test temp dir lives under it).
+    # Media-send fix: ``/api/v1/send`` REQUIRES a WAHA session (the P-19
+    # contract shared with text send()), so the fixture pins one.
     return ChatlyticsAdapter(
         FakePlatformConfig(
             extra={
                 "base_url": BASE_URL,
                 "api_key": API_KEY,
                 "account_id": "acct-1",
+                "session": SESSION,
                 "upload_allowed_roots": tempfile.gettempdir(),
             }
         )
@@ -58,13 +67,13 @@ def mock_router():
         yield router
 
 
-# --- AC-1: send_image(url) posts to /api/v1/send-media ----------------
+# --- AC-1: send_image(url) posts to /api/v1/send (type=image) ---------
 
 async def test_send_image_url_path(
     adapter: ChatlyticsAdapter, mock_router: respx.MockRouter
 ) -> None:
     mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
-    media_route = mock_router.post("/api/v1/send-media").mock(
+    send_route = mock_router.post("/api/v1/send").mock(
         return_value=httpx.Response(200, json={"success": True, "messageId": "m-img"})
     )
     await adapter.connect()
@@ -74,39 +83,42 @@ async def test_send_image_url_path(
     assert result.success is True
     assert result.message_id == "m-img"
 
-    body = _json.loads(media_route.calls.last.request.content)
+    body = _json.loads(send_route.calls.last.request.content)
     assert body["chatId"] == CHAT_ID
-    assert body["mediaType"] == "image"
-    assert body["mediaUrl"] == "https://cdn.test/x.png"
+    assert body["session"] == SESSION
+    assert body["type"] == "image"
     assert body["caption"] == "hi there"
-    assert media_route.calls.last.request.headers["authorization"] == EXPECTED_AUTH
+    # Remote URL rides the WAHA ``file`` passthrough field.
+    assert body["file"]["url"] == "https://cdn.test/x.png"
+    assert send_route.calls.last.request.headers["authorization"] == EXPECTED_AUTH
     await adapter.disconnect()
 
 
-# --- AC-2: send_voice yields mediaType=voice (NOT "audio") -----------
+# --- AC-2: send_voice routes through /api/v1/send (type=file) ----------
 
-async def test_send_voice_yields_voice_message(
+async def test_send_voice_routes_via_send(
     adapter: ChatlyticsAdapter, mock_router: respx.MockRouter
 ) -> None:
-    """Regression guard: WhatsApp voice bubbles vs media-player audio.
+    """Voice is not a proxy-send ``type``; it degrades to ``file``.
 
-    Chatlytics distinguishes ``mediaType=voice`` (push-to-talk UX,
-    waveform) from ``mediaType=audio`` (full media player).  This
-    handler must always emit voice.
+    A true WhatsApp voice bubble (push-to-talk) is only reachable on the
+    direct WAHA path, not via ``/api/v1/send`` (whose ``type`` set is
+    text/image/video/file). The audio still delivers as a downloadable
+    attachment under ``type=file``.
     """
     mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
-    media_route = mock_router.post("/api/v1/send-media").mock(
+    send_route = mock_router.post("/api/v1/send").mock(
         return_value=httpx.Response(200, json={"success": True, "messageId": "m-voice"})
     )
     await adapter.connect()
     result = await adapter.send_voice(CHAT_ID, "https://cdn.test/v.ogg")
     assert result.success is True
 
-    body = _json.loads(media_route.calls.last.request.content)
-    assert body["mediaType"] == "voice", (
-        f"send_voice must emit mediaType=voice, got {body['mediaType']!r}"
+    body = _json.loads(send_route.calls.last.request.content)
+    assert body["type"] == "file", (
+        f"send_voice must route as type=file via /api/v1/send, got {body['type']!r}"
     )
-    assert body["mediaUrl"] == "https://cdn.test/v.ogg"
+    assert body["file"]["url"] == "https://cdn.test/v.ogg"
     await adapter.disconnect()
 
 
@@ -116,7 +128,7 @@ async def test_send_video(
     adapter: ChatlyticsAdapter, mock_router: respx.MockRouter
 ) -> None:
     mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
-    media_route = mock_router.post("/api/v1/send-media").mock(
+    send_route = mock_router.post("/api/v1/send").mock(
         return_value=httpx.Response(200, json={"success": True, "messageId": "m-vid"})
     )
     await adapter.connect()
@@ -125,9 +137,9 @@ async def test_send_video(
     )
     assert result.success is True
 
-    body = _json.loads(media_route.calls.last.request.content)
-    assert body["mediaType"] == "video"
-    assert body["mediaUrl"] == "https://cdn.test/clip.mp4"
+    body = _json.loads(send_route.calls.last.request.content)
+    assert body["type"] == "video"
+    assert body["file"]["url"] == "https://cdn.test/clip.mp4"
     assert body["caption"] == "check this clip"
     await adapter.disconnect()
 
@@ -138,7 +150,7 @@ async def test_send_document_with_filename(
     adapter: ChatlyticsAdapter, mock_router: respx.MockRouter
 ) -> None:
     mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
-    media_route = mock_router.post("/api/v1/send-media").mock(
+    send_route = mock_router.post("/api/v1/send").mock(
         return_value=httpx.Response(200, json={"success": True, "messageId": "m-doc"})
     )
     await adapter.connect()
@@ -147,10 +159,11 @@ async def test_send_document_with_filename(
     )
     assert result.success is True
 
-    body = _json.loads(media_route.calls.last.request.content)
-    assert body["mediaType"] == "file"
+    body = _json.loads(send_route.calls.last.request.content)
+    assert body["type"] == "file"
+    # Caller-supplied display name surfaces as the top-level filename.
     assert body["filename"] == "report.pdf"
-    assert body["mediaUrl"] == "https://cdn.test/d.pdf"
+    assert body["file"]["url"] == "https://cdn.test/d.pdf"
     await adapter.disconnect()
 
 
@@ -159,15 +172,13 @@ async def test_send_document_with_filename(
 async def test_send_animation(
     adapter: ChatlyticsAdapter, mock_router: respx.MockRouter
 ) -> None:
-    """Animation media type per Chatlytics convention.
+    """Animation delivers as inline video (``type=video``).
 
-    The Chatlytics gateway delivers gif/mp4 animations under
-    ``mediaType=video`` (WhatsApp has no native GIF primitive -- clients
-    render short MP4s in a loop).  We accept either ``"video"`` or
-    ``"gif"`` for forward-compat with any future gateway change.
+    WhatsApp has no native GIF primitive -- clients render short MP4s in a
+    loop -- so the gateway routes animations under ``type=video``.
     """
     mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
-    media_route = mock_router.post("/api/v1/send-media").mock(
+    send_route = mock_router.post("/api/v1/send").mock(
         return_value=httpx.Response(200, json={"success": True, "messageId": "m-ani"})
     )
     await adapter.connect()
@@ -176,62 +187,51 @@ async def test_send_animation(
     )
     assert result.success is True
 
-    body = _json.loads(media_route.calls.last.request.content)
-    assert body["mediaType"] in {"video", "gif"}, (
-        f"animation mediaType must be video or gif, got {body['mediaType']!r}"
+    body = _json.loads(send_route.calls.last.request.content)
+    assert body["type"] == "video", (
+        f"animation must route as type=video, got {body['type']!r}"
     )
-    assert body["mediaUrl"] == "https://cdn.test/a.gif"
+    assert body["file"]["url"] == "https://cdn.test/a.gif"
     await adapter.disconnect()
 
 
-# --- AC-6: send_image with a Path object uploads local bytes -----------
+# --- AC-6: send_image with a Path object inlines local bytes ----------
 
-async def test_send_image_local_path_uploads_bytes(
+async def test_send_image_local_path_inlines_bytes(
     adapter: ChatlyticsAdapter,
     mock_router: respx.MockRouter,
     tmp_path: Path,
 ) -> None:
-    """HERMES-15: send_image(Path) reads bytes, uploads, references URL.
+    """send_image(Path) reads bytes and base64-inlines them into ``file.data``.
 
-    Renamed from ``test_send_image_file_uploads_local_bytes`` when the
-    v2.0 ``send_image_file`` companion was deleted. The unified
-    ``send_image`` method now accepts a ``Path`` object and routes
-    through the auto-detection branch in ``_resolve_media_url``.
+    Media-send fix: there is no server upload endpoint, so a local file is
+    inlined as base64 in the WAHA ``file`` field (``{data, mimetype,
+    filename}``) instead of being uploaded to the (non-existent)
+    ``/api/v1/upload``.
     """
     img_path = tmp_path / "x.png"
     fake_png = b"\x89PNG\r\n\x1a\n" + b"some-bytes-x123"
     img_path.write_bytes(fake_png)
 
     mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
-    upload_route = mock_router.post("/api/v1/upload").mock(
-        return_value=httpx.Response(
-            200, json={"url": "https://cdn.test/uploaded.png"}
-        )
-    )
-    media_route = mock_router.post("/api/v1/send-media").mock(
+    send_route = mock_router.post("/api/v1/send").mock(
         return_value=httpx.Response(
             200, json={"success": True, "messageId": "m-imgfile"}
         )
     )
 
     await adapter.connect()
-    # HERMES-15: was adapter.send_image_file(CHAT_ID, str(img_path), ...).
     result = await adapter.send_image(CHAT_ID, Path(img_path), caption="local")
     assert result.success is True
     assert result.message_id == "m-imgfile"
 
-    # Upload was called with the file bytes.
-    assert upload_route.called
-    upload_req = upload_route.calls.last.request
-    # multipart body must contain the raw file bytes.
-    assert fake_png in upload_req.content
-    assert upload_req.headers["authorization"] == EXPECTED_AUTH
-
-    # Send-media references the returned URL.
-    media_body = _json.loads(media_route.calls.last.request.content)
-    assert media_body["mediaUrl"] == "https://cdn.test/uploaded.png"
-    assert media_body["mediaType"] == "image"
-    assert media_body["caption"] == "local"
+    body = _json.loads(send_route.calls.last.request.content)
+    assert body["type"] == "image"
+    assert body["caption"] == "local"
+    # Local bytes are base64-inlined under file.data (NOT uploaded).
+    assert body["file"]["data"] == base64.b64encode(fake_png).decode("ascii")
+    assert body["file"]["filename"] == "x.png"
+    assert body["file"]["mimetype"] == "image/png"
     await adapter.disconnect()
 
 
@@ -243,19 +243,13 @@ async def test_send_image_local_path_reads_off_event_loop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``_resolve_media_url`` must read local files via ``asyncio.to_thread``.
+    """Local-file resolution must read via ``asyncio.to_thread``.
 
-    Regression for 04-REVIEW MED-02 (surfaced through 05-REVIEW MED-02):
-    the local-file branch of ``_resolve_media_url`` previously called
-    ``open()`` + ``fh.read()`` directly on the event loop thread, which
-    blocks all other coroutines for the duration of the read on
-    multi-MB files. HERMES-06 wraps the read in ``asyncio.to_thread``.
-
-    HERMES-15: renamed from ``test_send_image_file_reads_off_event_loop``
-    when the v2.0 ``send_image_file`` companion was deleted; the call
-    now goes through ``adapter.send_image(Path(...))`` (Branch 2 of
-    ``_resolve_media_url``) and still exercises the same
-    ``asyncio.to_thread`` wrap.
+    Regression for 04-REVIEW MED-02: the local-file branch previously
+    called ``open()`` + ``fh.read()`` directly on the event loop thread,
+    which blocks all other coroutines for the duration of the read on
+    multi-MB files. The read stays wrapped in ``asyncio.to_thread`` in the
+    media-send fix's ``_resolve_media_file_field``.
 
     We assert the wrap is in effect by capturing the thread on which
     ``open()`` runs: it must NOT be the main thread (the loop thread).
@@ -268,10 +262,7 @@ async def test_send_image_local_path_reads_off_event_loop(
     img_path.write_bytes(fake_png)
 
     mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
-    mock_router.post("/api/v1/upload").mock(
-        return_value=httpx.Response(200, json={"url": "https://cdn.test/x.png"})
-    )
-    mock_router.post("/api/v1/send-media").mock(
+    mock_router.post("/api/v1/send").mock(
         return_value=httpx.Response(200, json={"success": True, "messageId": "m-thr"})
     )
 
@@ -280,11 +271,6 @@ async def test_send_image_local_path_reads_off_event_loop(
     real_open = builtins.open
 
     def spy_open(*args, **kwargs):  # noqa: ANN001 -- builtin shim
-        # Record the thread that performed the open. ``_resolve_media_url``
-        # is the only path under test that opens ``img_path`` -- other
-        # opens (e.g. inside respx, pytest plumbing) MAY hit the main
-        # thread legitimately, so only record opens against our fixture
-        # file.
         if args and str(args[0]) == str(img_path):
             threads_seen.append(threading.current_thread())
         return real_open(*args, **kwargs)
@@ -292,7 +278,6 @@ async def test_send_image_local_path_reads_off_event_loop(
     monkeypatch.setattr(builtins, "open", spy_open)
 
     await adapter.connect()
-    # HERMES-15: was adapter.send_image_file(CHAT_ID, str(img_path), ...).
     result = await adapter.send_image(CHAT_ID, Path(img_path), caption="thr")
     assert result.success is True
 
@@ -300,7 +285,7 @@ async def test_send_image_local_path_reads_off_event_loop(
     for thr in threads_seen:
         assert thr is not main_thread, (
             f"open() on local media path ran on the main/event-loop thread "
-            f"({thr!r}); _resolve_media_url must use asyncio.to_thread"
+            f"({thr!r}); _resolve_media_file_field must use asyncio.to_thread"
         )
     await adapter.disconnect()
 
@@ -319,17 +304,14 @@ async def test_send_image_local_path_reads_off_event_loop(
 class TestResourceAutoDetection:
     """Adapter.send_image auto-detection branches (HERMES-15)."""
 
-    async def test_url_string_passes_through_without_upload(
+    async def test_url_string_passes_through_as_file_url(
         self,
         adapter: ChatlyticsAdapter,
         mock_router: respx.MockRouter,
     ) -> None:
-        """Branch 3: http(s):// string -> mediaUrl passthrough, NO upload call."""
+        """Branch 3: http(s):// string -> file.url passthrough, no inlining."""
         mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
-        upload_route = mock_router.post("/api/v1/upload").mock(
-            return_value=httpx.Response(200, json={"url": "should-not-be-used"})
-        )
-        media_route = mock_router.post("/api/v1/send-media").mock(
+        send_route = mock_router.post("/api/v1/send").mock(
             return_value=httpx.Response(200, json={"success": True, "messageId": "m-url"})
         )
 
@@ -338,64 +320,55 @@ class TestResourceAutoDetection:
             CHAT_ID, "https://cdn.test/cat.jpg", caption="url branch"
         )
         assert result.success is True
-        assert not upload_route.called, (
-            "URL passthrough must not trigger an upload"
-        )
 
-        body = _json.loads(media_route.calls.last.request.content)
-        assert body["mediaUrl"] == "https://cdn.test/cat.jpg"
+        body = _json.loads(send_route.calls.last.request.content)
+        assert body["file"]["url"] == "https://cdn.test/cat.jpg"
+        # URL passthrough must NOT inline bytes.
+        assert "data" not in body["file"]
         await adapter.disconnect()
 
-    async def test_path_object_uploads_via_multipart(
+    async def test_path_object_inlines_base64(
         self,
         adapter: ChatlyticsAdapter,
         mock_router: respx.MockRouter,
         tmp_path: Path,
     ) -> None:
-        """Branch 2: explicit Path object -> multipart upload + URL reference."""
+        """Branch 2: explicit Path object -> base64-inlined file.data."""
         img_path = tmp_path / "p.png"
         img_path.write_bytes(b"path-object-bytes")
 
         mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
-        upload_route = mock_router.post("/api/v1/upload").mock(
-            return_value=httpx.Response(200, json={"url": "https://cdn.test/p.png"})
-        )
-        mock_router.post("/api/v1/send-media").mock(
+        send_route = mock_router.post("/api/v1/send").mock(
             return_value=httpx.Response(200, json={"success": True, "messageId": "m-path"})
         )
 
         await adapter.connect()
         result = await adapter.send_image(CHAT_ID, Path(img_path))
         assert result.success is True
-        assert upload_route.called, "Path branch must upload via multipart"
-        assert b"path-object-bytes" in upload_route.calls.last.request.content
+        body = _json.loads(send_route.calls.last.request.content)
+        assert body["file"]["data"] == base64.b64encode(b"path-object-bytes").decode("ascii")
         await adapter.disconnect()
 
-    async def test_string_path_that_exists_uploads_via_multipart(
+    async def test_string_path_that_exists_inlines_base64(
         self,
         adapter: ChatlyticsAdapter,
         mock_router: respx.MockRouter,
         tmp_path: Path,
     ) -> None:
-        """Branch 4: ``str`` whose path exists -> multipart upload (parity with Path)."""
+        """Branch 4: ``str`` whose path exists -> base64 inline (parity with Path)."""
         img_path = tmp_path / "s.png"
         img_path.write_bytes(b"string-path-bytes")
 
         mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
-        upload_route = mock_router.post("/api/v1/upload").mock(
-            return_value=httpx.Response(200, json={"url": "https://cdn.test/s.png"})
-        )
-        mock_router.post("/api/v1/send-media").mock(
+        send_route = mock_router.post("/api/v1/send").mock(
             return_value=httpx.Response(200, json={"success": True, "messageId": "m-str"})
         )
 
         await adapter.connect()
         result = await adapter.send_image(CHAT_ID, str(img_path))
         assert result.success is True
-        assert upload_route.called, (
-            "String-path-that-exists branch must upload via multipart"
-        )
-        assert b"string-path-bytes" in upload_route.calls.last.request.content
+        body = _json.loads(send_route.calls.last.request.content)
+        assert body["file"]["data"] == base64.b64encode(b"string-path-bytes").decode("ascii")
         await adapter.disconnect()
 
     async def test_unresolvable_string_returns_invalid_resource_error(
@@ -406,14 +379,9 @@ class TestResourceAutoDetection:
     ) -> None:
         """Branch 5: str that's neither URL nor existing path -> SendResult(False, ...).
 
-        ``_resolve_media_url`` raises ``ValueError`` and
-        ``_send_media_payload`` catches it and surfaces a clean
-        failure dict to the caller instead of an uncaught raise.
-
-        LOW-03 fix (15-REVIEW): the bare string ``"not-a-url-not-a-path-zzz"``
-        would accidentally hit Branch 4 if a developer happens to have a
-        file by that name in their CWD. Use ``tmp_path`` + a uuid suffix
-        to guarantee the path does NOT exist.
+        ``_resolve_media_file_field`` raises ``ValueError`` and
+        ``_send_media_payload`` catches it and surfaces a clean failure dict
+        to the caller instead of an uncaught raise.
         """
         import uuid
 
@@ -425,7 +393,7 @@ class TestResourceAutoDetection:
         )
 
         mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
-        # No upload route mocked — should never be called.
+        # No send route mocked — should never be called.
 
         await adapter.connect()
         result = await adapter.send_image(CHAT_ID, nonexistent)
@@ -444,19 +412,6 @@ class TestResourceAutoDetection:
         shadows the inherited method with a ``_RemovedMethod`` descriptor
         that raises ``AttributeError`` on access — v2.x callers see a
         clear migration error pointing at ``send_image``.
-
-        Two-part check honoring the "clean break, no deprecation alias"
-        intent:
-
-        1. Instance attribute access raises ``AttributeError`` with
-           migration guidance — direct callers of
-           ``adapter.send_image_file(...)`` see a clear error pointing
-           at ``send_image`` instead of silently degrading. This is
-           the load-bearing contract.
-        2. ``getattr(adapter, "send_image_file", None) is None`` —
-           the ROADMAP HERMES-15 acceptance criterion 4 literal text.
-           Satisfied because ``getattr`` with a default swallows the
-           ``AttributeError`` raised by the descriptor.
         """
         # AC #4 literal: getattr with default returns None on AttributeError.
         assert getattr(adapter, "send_image_file", None) is None, (

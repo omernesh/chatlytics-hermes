@@ -136,10 +136,22 @@ def _err_from_exception(exc: Exception) -> Dict[str, Any]:
     return {"success": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
+# Bug 3 (search ReadTimeout): server-side cold-cache search can exceed the
+# client-level 30s default. ``chatlytics_search`` threads this longer read
+# window through ``_post`` so ONLY the search call gets the extended timeout;
+# every other tool keeps the default. connect/write/pool stay tight so a dead
+# connection still fails fast — only the server's processing window is widened.
+_SEARCH_TIMEOUT: httpx.Timeout = httpx.Timeout(
+    connect=10.0, read=90.0, write=10.0, pool=10.0
+)
+
+
 async def _post(
     client: ChatlyticsClient,
     path: str,
     body: Dict[str, Any],
+    *,
+    timeout: Any = httpx.USE_CLIENT_DEFAULT,
 ) -> Dict[str, Any]:
     """POST helper -- enforces the canonical return shape.
 
@@ -150,9 +162,13 @@ async def _post(
     ``200 {"success": false, "error": "..."}`` now correctly returns
     ``{"success": false, ...}`` instead of being coerced to truthy by
     :func:`_ok`.
+
+    ``timeout`` defaults to the client-level timeout; callers that need a
+    longer read window (e.g. ``chatlytics_search`` cold-cache) pass an
+    explicit :class:`httpx.Timeout`. Bug 3 fix.
     """
     try:
-        response = await client.post(path, json=body)
+        response = await client.post(path, json=body, timeout=timeout)
     except httpx.RequestError as exc:
         return _err_from_exception(exc)
     if response.status_code >= 400:
@@ -938,8 +954,10 @@ async def chatlytics_search(
     *,
     query: str,
 ) -> Dict[str, Any]:
+    # Bug 3: server cold-cache search can exceed the 30s client default and
+    # trip a ReadTimeout. Use the extended read window for THIS call only.
     body = {"action": "search", "params": {"query": query}}
-    return await _post(client, "/api/v1/actions", body)
+    return await _post(client, "/api/v1/actions", body, timeout=_SEARCH_TIMEOUT)
 
 
 async def chatlytics_actions(client: ChatlyticsClient) -> Dict[str, Any]:

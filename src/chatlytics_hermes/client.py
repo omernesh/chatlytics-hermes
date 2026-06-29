@@ -10,6 +10,7 @@ instance.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict, Optional
 
@@ -49,16 +50,121 @@ class ChatlyticsClient:
         self.base_url: str = base_url.rstrip("/")
         self._api_key: str = api_key
         self.timeout: float = float(timeout)
+        self._headers: Dict[str, str] = {
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": user_agent,
+            "Accept": "application/json",
+        }
 
-        self._client: httpx.AsyncClient = httpx.AsyncClient(
+        # Loop-aware lazy construction (event-loop binding fix).
+        # ``httpx.AsyncClient`` binds an internal connection pool whose locks
+        # (and httpcore's anyio primitives) are tied to the event loop that
+        # is running when a request is first awaited. The Hermes gateway
+        # constructs this client on its OWN loop (connect() / longpoll), but
+        # the MCP server later awaits the SAME instance on a DIFFERENT loop —
+        # which raised ``RuntimeError: <asyncio.locks.Event ...> is bound to a
+        # different event loop`` for every tool call (poll, directory,
+        # getChats, getChatMessages, getAllLids, getContacts, ...).
+        #
+        # Fix: keep ONE shared inner client (built eagerly here, exactly as
+        # before — so the single-loop fast path is byte-for-byte unchanged)
+        # but record which loop it is bound to and rebuild it transparently in
+        # ``_get_client`` ONLY when a later request runs on a DIFFERENT loop.
+        # Working tools (send/read/health/login) and the gateway keep reusing
+        # the same client on their own loop with zero extra cost; the rebuild
+        # fires solely on the cross-loop reuse that triggered the RuntimeError.
+        #
+        # ``_bound_loop`` captures the loop running at construction time, if
+        # any (the gateway builds this client inside connect()/longpoll, i.e.
+        # on a loop). Constructed with no running loop (tests / sync caller),
+        # it stays None and binds to the first loop that issues a request.
+        self._client: httpx.AsyncClient = self._build_client()
+        try:
+            self._bound_loop: Optional[asyncio.AbstractEventLoop] = (
+                asyncio.get_running_loop()
+            )
+        except RuntimeError:
+            self._bound_loop = None
+
+    # --- internal: loop-aware client accessor ------------------------
+
+    def _build_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
             base_url=self.base_url,
             timeout=self.timeout,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "User-Agent": user_agent,
-                "Accept": "application/json",
-            },
+            headers=dict(self._headers),
         )
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """Return the shared ``httpx.AsyncClient``, rebuilt only on loop change.
+
+        The common case (every request on the same loop) returns the
+        existing shared client immediately — identical to the pre-fix
+        single-client behavior, so concurrent requests still share one pool.
+
+        A rebuild fires only when:
+
+        - the client was closed (defensive; e.g. a prior aclose()), or
+        - the current running loop differs from the loop the client is bound
+          to AND the client has actually been bound to a real (different)
+          loop. This is the gateway-built-on-loop-A, MCP-awaits-on-loop-B
+          case that raised the cross-loop ``RuntimeError``.
+
+        When the client was constructed with no running loop (``_bound_loop``
+        is None — tests / sync construction), the FIRST request simply
+        ADOPTS its loop with no rebuild: the eager client has never touched a
+        loop, so it is safe to bind in place and keep the shared-pool fast
+        path for concurrent first requests.
+        """
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            current = None
+
+        # Adopt-in-place: never used on a loop yet → bind to the first one.
+        if self._bound_loop is None and not self._client.is_closed:
+            self._bound_loop = current
+            return self._client
+
+        needs_rebuild = self._client.is_closed or (
+            current is not None and self._bound_loop is not current
+        )
+        if not needs_rebuild:
+            return self._client
+
+        stale = self._client
+        if (
+            not stale.is_closed
+            and self._bound_loop is not None
+            and self._bound_loop is not current
+            and not self._bound_loop.is_closed()
+        ):
+            # The stale client belongs to another (live) loop — closing it
+            # from here would itself cross loops. Schedule aclose() on its OWN
+            # loop; never let teardown of the old client raise into the fresh
+            # request path.
+            def _close_stale(c: httpx.AsyncClient = stale) -> None:
+                try:
+                    asyncio.ensure_future(c.aclose())
+                except Exception:  # noqa: BLE001 -- best-effort only
+                    logger.debug(
+                        "ChatlyticsClient: stale-client aclose schedule "
+                        "failed; relying on GC",
+                        exc_info=True,
+                    )
+
+            try:
+                self._bound_loop.call_soon_threadsafe(_close_stale)
+            except Exception:  # noqa: BLE001 -- best-effort cleanup only
+                logger.debug(
+                    "ChatlyticsClient: could not schedule stale-client close "
+                    "on its origin loop; relying on GC",
+                    exc_info=True,
+                )
+
+        self._client = self._build_client()
+        self._bound_loop = current
+        return self._client
 
     # --- lifecycle ---------------------------------------------------
 
@@ -96,7 +202,7 @@ class ChatlyticsClient:
         — otherwise every empty poll trips a ReadTimeout. See
         ``adapter._poll_loop``.
         """
-        return await self._client.get(path, params=params, timeout=timeout)
+        return await self._get_client().get(path, params=params, timeout=timeout)
 
     async def post(
         self,
@@ -106,7 +212,7 @@ class ChatlyticsClient:
         timeout: Any = httpx.USE_CLIENT_DEFAULT,
     ) -> httpx.Response:
         """POST ``{base_url}{path}`` with a JSON body."""
-        return await self._client.post(path, json=json, timeout=timeout)
+        return await self._get_client().post(path, json=json, timeout=timeout)
 
     async def post_multipart(
         self,
@@ -122,7 +228,7 @@ class ChatlyticsClient:
         Chatlytics upload endpoint contract.  ``data`` is optional
         non-file form fields.
         """
-        return await self._client.post(path, files=files, data=data or {})
+        return await self._get_client().post(path, files=files, data=data or {})
 
     # --- HERMES-04 helpers ------------------------------------------------
 
@@ -133,7 +239,7 @@ class ChatlyticsClient:
         helpers (signed-upload buckets, retry shims) can subclass-override
         without re-implementing the JSON post path.
         """
-        return await self._client.post("/api/v1/send-media", json=payload)
+        return await self._get_client().post("/api/v1/send-media", json=payload)
 
     async def upload_file(
         self,
