@@ -324,6 +324,21 @@ _MEDIA_KIND_TO_SEND_TYPE: Dict[str, str] = {
     "voice": "file",
 }
 
+# Media sends route through WAHA, which TRANSCODES video/animation (ffmpeg,
+# convert:true) before sending — far slower than image/file. The chatlytics
+# server waits up to ~120s for that transcode, so the client read timeout MUST
+# exceed it or every video/animation send trips an httpx ReadTimeout (surfaced
+# as "send transport error") while images (no transcode) succeed instantly.
+# Non-video media still gets a generous window for large base64 uploads. The
+# client-level default (~30s) was the root cause of send_animation/send_video
+# failing on every URL.
+_MEDIA_VIDEO_TIMEOUT: httpx.Timeout = httpx.Timeout(
+    connect=10.0, read=150.0, write=60.0, pool=10.0
+)
+_MEDIA_DEFAULT_TIMEOUT: httpx.Timeout = httpx.Timeout(
+    connect=10.0, read=60.0, write=60.0, pool=10.0
+)
+
 
 def _guess_content_type(filename: Optional[str]) -> str:
     """Best-effort MIME guess for upload payloads."""
@@ -3429,7 +3444,8 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             return SendResult(success=False, error=session_err)
         # Media has no text body; ``file`` + optional ``caption`` carry it.
         body.pop("text", None)
-        body["type"] = _MEDIA_KIND_TO_SEND_TYPE[media_kind]
+        send_type = _MEDIA_KIND_TO_SEND_TYPE[media_kind]
+        body["type"] = send_type
         body["file"] = file_field
         if caption:
             body["caption"] = caption
@@ -3445,8 +3461,16 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             chat_id,
         )
 
+        # Video/animation transcode is slow server-side — wait longer than the
+        # ~30s client default (the root cause of send_animation/send_video
+        # ReadTimeouts). Other media uses a moderate window for large uploads.
+        media_timeout = (
+            _MEDIA_VIDEO_TIMEOUT if send_type == "video" else _MEDIA_DEFAULT_TIMEOUT
+        )
         try:
-            response = await self._client.post("/api/v1/send", json=body)
+            response = await self._client.post(
+                "/api/v1/send", json=body, timeout=media_timeout
+            )
         except httpx.RequestError as exc:
             return SendResult(
                 success=False,
