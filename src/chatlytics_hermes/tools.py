@@ -499,7 +499,7 @@ POLL_SCHEMA: Dict[str, Any] = {
 }
 
 
-# Media tools share a common shape: chatId + (mediaUrl XOR filePath), optional caption.
+# Media tools share a common shape: chatId + file (URL or local path; mediaUrl/filePath aliases), optional caption.
 def _media_schema(title: str, description: str, extra_props: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     base: Dict[str, Any] = {
         "$schema": _DRAFT,
@@ -509,12 +509,14 @@ def _media_schema(title: str, description: str, extra_props: Optional[Dict[str, 
         "properties": {
             # HERMES-14 (v3.0 BREAKING): strict JID validation via _chat_id_field().
             "chatId": _chat_id_field(),
-            "mediaUrl": {"type": "string", "format": "uri", "description": "https:// URL of the media."},
-            "filePath": {"type": "string", "description": "Local file path; uploaded to /api/v1/upload."},
+            "file": {"type": "string", "description": "Media to send: an https:// URL or a local file path (preferred — URL vs path auto-detected)."},
+            "mediaUrl": {"type": "string", "format": "uri", "description": "https:// URL of the media (alias of file)."},
+            "filePath": {"type": "string", "description": "Local file path (alias of file)."},
             "caption": {"type": "string"},
         },
         "required": ["chatId"],
         "anyOf": [
+            {"required": ["file"]},
             {"required": ["mediaUrl"]},
             {"required": ["filePath"]},
         ],
@@ -788,15 +790,19 @@ async def chatlytics_poll(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_resource(*, mediaUrl: Optional[str], filePath: Optional[str]) -> Any:
+def _resolve_resource(*, file: Optional[str] = None, mediaUrl: Optional[str] = None, filePath: Optional[str] = None) -> Any:
     """Pick the resource argument for adapter.send_<media> from tool kwargs.
 
-    mediaUrl wins when both are present (an explicit URL is cheaper than
-    re-uploading a local file).  Returning ``None`` is a programming error
-    (the schema's ``anyOf`` already enforces presence of at least one),
-    but defensively returning empty bytes here would mask that bug, so we
-    let the adapter call fail with a clear ``FileNotFoundError``.
+    ``file`` is the canonical param — a URL or a local path; the adapter
+    auto-detects URL vs local-path vs bytes in
+    :meth:`ChatlyticsAdapter._resolve_media_url`. ``mediaUrl``/``filePath``
+    are back-compat aliases. Precedence: file > mediaUrl > filePath.
+    Returning ``None`` is a programming error (the schema's ``anyOf``
+    enforces presence of at least one); the adapter call then fails with a
+    clear error rather than masking the bug.
     """
+    if file:
+        return file
     if mediaUrl:
         return mediaUrl
     return filePath
@@ -807,6 +813,7 @@ async def chatlytics_send_image(
     *,
     adapter: Any = None,
     chatId: str,
+    file: Optional[str] = None,
     mediaUrl: Optional[str] = None,
     filePath: Optional[str] = None,
     caption: Optional[str] = None,
@@ -833,9 +840,9 @@ async def chatlytics_send_image(
     # v4.1.5 (telegram-style onboarding): no-credential degraded state.
     if _adapter_lacks_credential(adapter):
         return _no_token_failure()
-    resource = _resolve_resource(mediaUrl=mediaUrl, filePath=filePath)
+    resource = _resolve_resource(file=file, mediaUrl=mediaUrl, filePath=filePath)
     if not resource:
-        return {"success": False, "error": "Either mediaUrl or filePath is required."}
+        return {"success": False, "error": "A media `file` (an https:// URL or a local path) is required."}
     result = await adapter.send_image(chatId, resource, caption=caption)
     return _media_result_dict(result)
 
@@ -845,6 +852,7 @@ async def chatlytics_send_voice(
     *,
     adapter: Any = None,
     chatId: str,
+    file: Optional[str] = None,
     mediaUrl: Optional[str] = None,
     filePath: Optional[str] = None,
     caption: Optional[str] = None,
@@ -854,9 +862,9 @@ async def chatlytics_send_voice(
     # v4.1.5 (telegram-style onboarding): no-credential degraded state.
     if _adapter_lacks_credential(adapter):
         return _no_token_failure()
-    resource = _resolve_resource(mediaUrl=mediaUrl, filePath=filePath)
+    resource = _resolve_resource(file=file, mediaUrl=mediaUrl, filePath=filePath)
     if not resource:
-        return {"success": False, "error": "Either mediaUrl or filePath is required."}
+        return {"success": False, "error": "A media `file` (an https:// URL or a local path) is required."}
     result = await adapter.send_voice(chatId, resource, caption=caption)
     return _media_result_dict(result)
 
@@ -866,6 +874,7 @@ async def chatlytics_send_video(
     *,
     adapter: Any = None,
     chatId: str,
+    file: Optional[str] = None,
     mediaUrl: Optional[str] = None,
     filePath: Optional[str] = None,
     caption: Optional[str] = None,
@@ -875,9 +884,9 @@ async def chatlytics_send_video(
     # v4.1.5 (telegram-style onboarding): no-credential degraded state.
     if _adapter_lacks_credential(adapter):
         return _no_token_failure()
-    resource = _resolve_resource(mediaUrl=mediaUrl, filePath=filePath)
+    resource = _resolve_resource(file=file, mediaUrl=mediaUrl, filePath=filePath)
     if not resource:
-        return {"success": False, "error": "Either mediaUrl or filePath is required."}
+        return {"success": False, "error": "A media `file` (an https:// URL or a local path) is required."}
     result = await adapter.send_video(chatId, resource, caption=caption)
     return _media_result_dict(result)
 
@@ -887,6 +896,7 @@ async def chatlytics_send_file(
     *,
     adapter: Any = None,
     chatId: str,
+    file: Optional[str] = None,
     mediaUrl: Optional[str] = None,
     filePath: Optional[str] = None,
     caption: Optional[str] = None,
@@ -897,9 +907,9 @@ async def chatlytics_send_file(
     # v4.1.5 (telegram-style onboarding): no-credential degraded state.
     if _adapter_lacks_credential(adapter):
         return _no_token_failure()
-    resource = _resolve_resource(mediaUrl=mediaUrl, filePath=filePath)
+    resource = _resolve_resource(file=file, mediaUrl=mediaUrl, filePath=filePath)
     if not resource:
-        return {"success": False, "error": "Either mediaUrl or filePath is required."}
+        return {"success": False, "error": "A media `file` (an https:// URL or a local path) is required."}
     result = await adapter.send_document(
         chatId, resource, caption=caption, file_name=filename
     )
@@ -911,6 +921,7 @@ async def chatlytics_send_animation(
     *,
     adapter: Any = None,
     chatId: str,
+    file: Optional[str] = None,
     mediaUrl: Optional[str] = None,
     filePath: Optional[str] = None,
     caption: Optional[str] = None,
@@ -920,9 +931,9 @@ async def chatlytics_send_animation(
     # v4.1.5 (telegram-style onboarding): no-credential degraded state.
     if _adapter_lacks_credential(adapter):
         return _no_token_failure()
-    resource = _resolve_resource(mediaUrl=mediaUrl, filePath=filePath)
+    resource = _resolve_resource(file=file, mediaUrl=mediaUrl, filePath=filePath)
     if not resource:
-        return {"success": False, "error": "Either mediaUrl or filePath is required."}
+        return {"success": False, "error": "A media `file` (an https:// URL or a local path) is required."}
     result = await adapter.send_animation(chatId, resource, caption=caption)
     return _media_result_dict(result)
 
