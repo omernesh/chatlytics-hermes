@@ -1,5 +1,25 @@
 # Changelog
 
+## [4.5.7] - 2026-07-05
+
+### Fixed
+
+- **`connect()` now accepts the framework's `is_reconnect` keyword — fixes a
+  reconnect crash-loop that silently killed the longpoll consumer.** The Hermes
+  gateway framework calls `adapter.connect(*, is_reconnect=...)` on every
+  (re)connect, but the adapter declared `async def connect(self) -> bool:` with
+  no such parameter. Cold boot worked (no kwarg passed), but the FIRST reconnect
+  raised `TypeError: ChatlyticsAdapter.connect() got an unexpected keyword
+  argument 'is_reconnect'`, which the framework could not recover from — the
+  inbound longpoll consumer stayed down until a full gateway restart. In
+  production this manifested as a bot that stopped receiving WhatsApp messages
+  for hours (observed: 55h dead consumer → `bot_longpoll_queue_undrained`
+  alert). Signature is now `connect(self, *, is_reconnect: bool = False,
+  **_kwargs)` — accepts and ignores the framework kwarg (plus any future ones).
+  This was patched live across all 5 deployed gateway plugin copies (global +
+  4 per-profile) on 2026-07-05; this release lands the same one-liner in source
+  so a plugin reinstall does not reintroduce the bug.
+
 ## [4.5.3] - 2026-06-11
 
 ### Fixed

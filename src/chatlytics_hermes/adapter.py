@@ -2398,8 +2398,16 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
     # --- Lifecycle (HERMES-02) ---------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False, **_kwargs) -> bool:
         """Connect to the Chatlytics gateway.
+
+        The Hermes gateway framework calls ``connect(*, is_reconnect=...)`` on
+        every (re)connect. Accept and ignore that keyword (plus any future
+        framework kwargs) so a reconnect never raises ``TypeError`` and dead-
+        loops the consumer — the historic v4.5.6 crash where the signature was
+        ``connect(self)`` and every reconnect threw, silently killing the
+        longpoll consumer until a full gateway restart. DO NOT narrow this
+        signature back to ``connect(self)``.
 
         1. Construct ``self._client`` (httpx).
         2. Issue ``GET {base_url}/health`` against the Chatlytics gateway
