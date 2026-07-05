@@ -20,7 +20,7 @@ owner's DM, and a cron-delivery hook for scheduled sends.
 
 ## Status
 
-**Stable v4.5.3.** Requires `hermes-agent>=0.14,<1.0` (runs on 0.14.x through
+**Stable v4.5.8.** Requires `hermes-agent>=0.14,<1.0` (runs on 0.14.x through
 0.16.x — the v4.5.2/v4.5.3 hotfixes specifically target the hermes 0.16
 `PluginContext` and tool-registry dispatch shapes). Python 3.10+.
 
@@ -156,13 +156,14 @@ Quick reference (full table + per-profile YAML examples in
 | `CHATLYTICS_API_KEY` | yes\* | Legacy operator bearer. Fallback; removed in plugin v5.0. |
 | `CHATLYTICS_BASE_URL` | no | Gateway base URL. Default `https://node.chatlytics.ai`. On-prem gateways should use the LAN URL. |
 | `CHATLYTICS_INBOUND_MODE` | no | `webhook` (default) or `longpoll` (PULL via `GET /api/v1/bot/updates` — use behind NAT). |
-| `CHATLYTICS_SESSION` | no | Default WAHA session for outbound sends. Required in webhook mode; longpoll envelopes carry it per-message. |
+| `CHATLYTICS_SESSION` | no | **Deprecated (v4.5.8).** Legacy webhook mode only; no-op when `CHATLYTICS_BOT_TOKEN` is set. Will be removed in v5.0. |
 | `CHATLYTICS_STATUS_EDIT_IN_PLACE` | no | Progress-bubble edit-in-place (default `true`). |
 | `CHATLYTICS_UPLOAD_ALLOWED_ROOTS` | no | Default-deny allowlist for local-file media uploads. |
 
 \* One of `CHATLYTICS_BOT_TOKEN` / `CHATLYTICS_API_KEY`. Since v4.1.5 a
 token-less gateway still boots (degraded): data tools return a
 get-a-token prompt instead of failing the whole platform load.
+`CHATLYTICS_SESSION` is deprecated as of v4.5.8 and will be removed in v5.0.
 
 ## Feature highlights (v4.2 → v4.5)
 

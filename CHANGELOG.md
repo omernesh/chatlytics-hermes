@@ -1,5 +1,13 @@
 # Changelog
 
+## [4.5.8] - 2026-07-05
+
+### Deprecated
+- `CHATLYTICS_SESSION` env var is deprecated. Bot tokens (`sk_bot_*`) pin the WhatsApp
+  session server-side; clients must not send a `session` field. The env var is now a
+  no-op when `CHATLYTICS_BOT_TOKEN` is configured and will be removed in v5.0.
+  In legacy webhook mode (no bot token) it still works with a deprecation warning.
+
 ## [4.5.7] - 2026-07-05
 
 ### Fixed

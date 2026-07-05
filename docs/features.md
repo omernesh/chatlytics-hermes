@@ -1,6 +1,6 @@
 # Features: longpoll durability, control envelopes, channel prompts, progress bubbles
 
-> Applies to plugin **v4.5.3**. Everything below is verified behavior in
+> Applies to plugin **v4.5.8**. Everything below is verified behavior in
 > `src/chatlytics_hermes/adapter.py`; wire contracts are noted where the
 > chatlytics server is the counterpart.
 
@@ -129,10 +129,14 @@ Mechanics (all on `/api/v1/send`):
 
 ## Session threading (P-19, carried forward)
 
-The chatlytics `/api/v1/send` endpoint requires the WAHA `session` name.
-The adapter resolves it per-send: (1) the per-chat session recorded from
-inbound (the webhook handler records a payload's top-level `session`; every
-longpoll envelope carries `session_id`), then (2) the
-`CHATLYTICS_SESSION` / `extra.session` fallback. When neither is available
-the send fails loudly with an operator-actionable error instead of silently
-dropping the reply.
+The chatlytics `/api/v1/send` endpoint requires a WAHA `session` name in
+**legacy operator-key mode** (`CHATLYTICS_API_KEY`). When **bot-token auth**
+(`CHATLYTICS_BOT_TOKEN`) is active, the token pins the session server-side
+and the adapter omits the `session` field entirely.
+
+In legacy mode the adapter resolves it per-send: (1) the per-chat session
+recorded from inbound (the webhook handler records a payload's top-level
+`session`; every longpoll envelope carries `session_id`), then (2) the
+`CHATLYTICS_SESSION` / `extra.session` fallback (deprecated v4.5.8 — will
+be removed in v5.0). When neither is available the send fails loudly with
+an operator-actionable error instead of silently dropping the reply.

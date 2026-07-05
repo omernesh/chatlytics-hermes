@@ -1,6 +1,6 @@
 # Troubleshooting
 
-> Applies to plugin **v4.5.3**.
+> Applies to plugin **v4.5.8**.
 
 ## First move: run the doctor
 
@@ -123,10 +123,13 @@ See [approvals.md](approvals.md).
 
 ### Replies fail with 400 `"chatId and session are required"`
 
+This only occurs in **legacy operator-key mode** (`CHATLYTICS_API_KEY`).
 The outbound send couldn't resolve a WAHA session for the chat. In webhook
-mode set `CHATLYTICS_SESSION` (or `extra.session`); in longpoll mode this
-resolves automatically from each inbound envelope — for proactive sends to
-chats with no inbound history, set the fallback too.
+mode set `extra.session` (or `CHATLYTICS_SESSION`, deprecated v4.5.8); in
+longpoll mode the session resolves automatically from each inbound
+envelope — for proactive sends to chats with no inbound history, set the
+fallback too. When using bot-token auth (`CHATLYTICS_BOT_TOKEN`) the
+session is pinned server-side and this error should not occur.
 
 ### Local file upload returns "Permission denied: Local file uploads are disabled"
 

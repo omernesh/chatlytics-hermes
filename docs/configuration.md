@@ -1,6 +1,6 @@
 # Configuration
 
-> Applies to plugin **v4.5.3**.
+> Applies to plugin **v4.5.8**.
 
 Configure the plugin via environment variables (preferred — set them in the
 gateway profile's `.env` / service environment) or the platform `extra`
@@ -41,7 +41,7 @@ first):
 | `CHATLYTICS_API_KEY` | yes\* | Legacy operator bearer. Fallback when `CHATLYTICS_BOT_TOKEN` is unset; removed in plugin v5.0. |
 | `CHATLYTICS_BASE_URL` | no | Chatlytics gateway base URL. Default `https://node.chatlytics.ai`. Override to self-host or target a non-default node. **On-prem gateways should use the LAN URL** (e.g. `http://192.168.1.133:8050`) — the Cloudflare tunnel in front of the public DNS name caps concurrent longpolls and 502s past the limit. |
 | `CHATLYTICS_INBOUND_MODE` | no | `webhook` (default — aiohttp PUSH server) or `longpoll` (PULL via `GET /api/v1/bot/updates`). |
-| `CHATLYTICS_SESSION` | no\* | Default WAHA session name (e.g. `3cf11776_logan`) used for outbound `/api/v1/send` when no inbound-derived session is known. Required in webhook mode; longpoll envelopes carry the session per-message. |
+| `CHATLYTICS_SESSION` | no | **Deprecated (v4.5.8).** Default WAHA session name (e.g. `3cf11776_logan`) used for outbound `/api/v1/send` in **legacy webhook mode only** (no `CHATLYTICS_BOT_TOKEN`). A no-op when bot-token auth is active — bot tokens pin the session server-side. Will be removed in v5.0. |
 | `CHATLYTICS_ACCOUNT_ID` | no | Default session/account ID for outbound sends. |
 | `CHATLYTICS_HOME_CHANNEL` | no | Default chat_id for cron / notification delivery. |
 | `CHATLYTICS_WEBHOOK_HOST` | no | Webhook bind host (default `0.0.0.0`). Webhook mode only. |
@@ -54,9 +54,7 @@ first):
 | `CHATLYTICS_UPLOAD_ALLOWED_ROOTS` | no | OS-pathsep-separated absolute paths that media tools may read from disk. **Default-deny when unset.** See below. |
 
 \* One of `CHATLYTICS_BOT_TOKEN` / `CHATLYTICS_API_KEY` must be set for the
-plugin to do anything useful. `CHATLYTICS_SESSION` is required in webhook
-mode (the webhook transform does not always forward the session) and a
-useful fallback in longpoll mode.
+plugin to do anything useful.
 
 All knobs are parsed defensively — a typo'd value falls back to the default
 and never raises at gateway boot.
@@ -75,7 +73,7 @@ platforms:
       bot_token: ${CHATLYTICS_BOT_TOKEN}
       # base_url: http://192.168.1.133:8050    # LAN URL for on-prem gateways
       # inbound_mode: longpoll                 # default: webhook
-      # session: 3cf11776_logan                # WAHA session fallback
+      # session: 3cf11776_logan                # WAHA session fallback (legacy mode only; deprecated)
       account_id: 3cf11776_logan
       webhook_port: 8765
       home_channel: "120363100000000000@g.us"
@@ -94,8 +92,11 @@ outbound — no threads) that chatlytics POSTs inbound messages to. Configure
 the bot/session's webhook URL on the chatlytics side to point at
 `http://<gateway-host>:<CHATLYTICS_WEBHOOK_PORT><CHATLYTICS_WEBHOOK_PATH>`.
 Optionally set `CHATLYTICS_WEBHOOK_SECRET` to enable HMAC verification.
-Requires the gateway host to be reachable from chatlytics, and
-`CHATLYTICS_SESSION` set for outbound replies.
+Requires the gateway host to be reachable from chatlytics. In legacy
+operator-key mode (`CHATLYTICS_API_KEY`), set `CHATLYTICS_SESSION` (or
+`extra.session`) so the adapter can resolve the WAHA session for outbound
+replies. When using bot-token auth (`CHATLYTICS_BOT_TOKEN`), the session
+is pinned server-side and no `CHATLYTICS_SESSION` is needed.
 
 ### `longpoll`
 
@@ -115,10 +116,11 @@ on a crash/restart (at-least-once).
 **The bot's `webhook_url` must be `null`** on the chatlytics side —
 otherwise chatlytics will POST AND queue, double-delivering every message.
 
-Replies still go out via `/api/v1/send`, which requires the WAHA `session` —
-under longpoll this is threaded automatically from each inbound envelope's
-`session_id`, so `CHATLYTICS_SESSION` is optional (but a useful fallback for
-proactive sends to chats with no inbound history).
+Replies still go out via `/api/v1/send`. Under bot-token auth the session
+is pinned server-side; no `CHATLYTICS_SESSION` needed. In legacy
+operator-key mode the session is threaded automatically from each inbound
+envelope's `session_id`; `CHATLYTICS_SESSION` remains a useful fallback for
+proactive sends to chats with no inbound history.
 
 Longpoll is the transport that carries **control envelopes** (`/new` `/stop`
 `/retry` conversation commands) and **owner-DM question resolutions** — see

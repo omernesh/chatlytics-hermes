@@ -691,10 +691,13 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         #      on every inbound message.
         #   2. self.session_name (env var / extra fallback for single-tenant
         #      operator config; required for webhook deployments where the
-        #      chatlytics-server hermes transform does not forward `session`)
-        self.session_name: Optional[str] = (
-            os.getenv("CHATLYTICS_SESSION") or extra.get("session")
-        )
+        #      chatlytics-server hermes transform does not forward `session`).
+        #
+        #      DEPRECATED (v4.5.8): CHATLYTICS_SESSION is a no-op when
+        #      CHATLYTICS_BOT_TOKEN is set — bot tokens pin the session
+        #      server-side.  The env var will be removed in v5.0.
+        _session_env: Optional[str] = os.getenv("CHATLYTICS_SESSION")
+        self.session_name: Optional[str] = _session_env or extra.get("session")
         # Per-chat session map populated by inbound (webhook / longpoll).
         # Bounded growth: each chat_id is a WhatsApp JID (under ~50 chars),
         # collection naturally tracks active conversations only.
@@ -721,6 +724,14 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             or extra.get("inbound_mode")
             or "webhook"
         ).strip().lower()
+
+        # Emit a one-time deprecation warning when CHATLYTICS_SESSION is set
+        # AND bot-token auth is in use (the env var is a no-op in that path).
+        if _session_env and self._auth_token and self._auth_token.startswith("sk_bot_"):
+            logger.warning(
+                "CHATLYTICS_SESSION is deprecated and will be removed in v5.0; "
+                "bot tokens pin the session server-side."
+            )
 
         # v4.4.0 (chatlytics v5.4 P7): progress-bubble edit-in-place knobs.
         # Default ON — zero behavior change for fast turns (no bubble is ever
@@ -895,22 +906,29 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             "text": text,
         }
         # P-19 fix (carried forward): Chatlytics gateway's /api/v1/send
-        # REQUIRES `session` (the WAHA session name). Without it the server
-        # returns 400 "chatId and session are required" and the reply
-        # silently dies. Resolution: per-chat map populated by inbound
-        # (longpoll envelopes ALWAYS carry session_id; webhook payloads carry
-        # it when chatlytics forwards it) falling back to CHATLYTICS_SESSION.
-        session_name = self._resolve_session_for_chat(chat_id)
-        if session_name:
-            body["session"] = session_name
+        # REQUIRES `session` (the WAHA session name) in legacy (api_key) mode.
+        # Bot-token auth (sk_bot_*) pins the session server-side — do NOT
+        # include `session` in the outbound body when bot-token auth is active.
+        _using_bot_token = bool(
+            self._auth_token and self._auth_token.startswith("sk_bot_")
+        )
+        if _using_bot_token:
+            # Session is pinned server-side; omit the field entirely.
+            pass
         else:
-            return None, (
-                "Chatlytics adapter missing WAHA session for chat "
-                f"{chat_id!r}: set CHATLYTICS_SESSION env var "
-                "(e.g. 3cf11776_logan) or pass session= in the "
-                "platform extra block. Inbound-derived session "
-                "mapping is empty for this chat."
-            )
+            # Legacy operator-key path: session must be resolved and sent.
+            session_name = self._resolve_session_for_chat(chat_id)
+            if session_name:
+                body["session"] = session_name
+            else:
+                return None, (
+                    "Chatlytics adapter missing WAHA session for chat "
+                    f"{chat_id!r}: in legacy webhook mode, set the WAHA "
+                    "session via the per-chat inbound map or the "
+                    "extra.session / extra.account_id config block. "
+                    "In bot-token mode (CHATLYTICS_BOT_TOKEN=sk_bot_*) "
+                    "the session is pinned server-side and no config is needed."
+                )
         if self.account_id:
             body["accountId"] = self.account_id
         return body, None

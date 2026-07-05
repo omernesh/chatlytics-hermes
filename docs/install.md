@@ -1,6 +1,6 @@
 # Installing chatlytics-hermes
 
-> Applies to plugin **v4.5.3**. Requires `hermes-agent>=0.14,<1.0`
+> Applies to plugin **v4.5.8**. Requires `hermes-agent>=0.14,<1.0`
 > (verified through 0.16.x) and Python 3.10+.
 
 There are two install channels. **Use the directory plugin** unless you have
@@ -152,7 +152,9 @@ After installing, decide how inbound WhatsApp messages reach the gateway:
   transport that carries control envelopes and owner-DM question
   resolutions.
 - **`webhook`** (default): the plugin runs an aiohttp server that chatlytics
-  POSTs to. Requires a URL chatlytics can reach and `CHATLYTICS_SESSION` set.
+  POSTs to. Requires a URL chatlytics can reach. In legacy operator-key mode,
+  also set `CHATLYTICS_SESSION` (or `extra.session`) for outbound session
+  resolution; bot-token auth resolves the session server-side.
 
 Details in [configuration.md](configuration.md) and
 [features.md](features.md).
