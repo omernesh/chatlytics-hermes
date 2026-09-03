@@ -568,7 +568,11 @@ async def test_connect_wires_done_callback_that_surfaces_poll_death(
     (contract-violating) poll-loop death surfaces as the EXITED ERROR."""
     adapter = _make_adapter()
 
-    async def _dying_loop() -> None:
+    # v4.6.0 (MULTIBOT): _poll_loop takes the _BotConn it serves. The stub
+    # must mirror the real signature — a zero-arg double would fail here for
+    # the wrong reason (TypeError at spawn) instead of exercising the
+    # done-callback path this test is about.
+    async def _dying_loop(conn: Any = None) -> None:
         raise RuntimeError("escaped the catch-all somehow")
 
     monkeypatch.setattr(adapter, "_poll_loop", _dying_loop)

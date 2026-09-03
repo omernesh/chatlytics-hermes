@@ -62,6 +62,7 @@ import logging
 import mimetypes
 import os
 import random
+import re
 import time
 import uuid
 from collections import OrderedDict
@@ -90,6 +91,13 @@ from .inbound import make_health_handler, make_webhook_handler, normalize_payloa
 # Detection prefix is documented at chatlytics.ai/CLAUDE.md (API Keys table,
 # CHATLYTICS_BOT_TOKEN row) — sk_bot_ prefix is the canonical shape.
 _BOT_TOKEN_PREFIX: str = "sk_bot_"
+
+# v4.6.0 (MULTIBOT): chat -> bot-connection binding cap. One entry per chat
+# the adapter has seen inbound traffic for; bounded LRU so a long-lived
+# gateway serving many chats cannot grow memory without limit. Sized to match
+# _LAST_MESSAGE_MEMO_MAX's order of magnitude — an evicted binding falls back
+# to the PRIMARY bot, which is exactly the pre-v4.6.0 behavior.
+_CHAT_BOT_BINDING_MAX: int = 512
 
 # v4.1.5 (telegram-style onboarding): when NO bot token is configured the
 # adapter loads in a degraded "no-credential" state instead of hard-failing
@@ -618,6 +626,51 @@ class ChatlyticsLookupError(RuntimeError):
         self.message = message
 
 
+class _BotConn:
+    """One authenticated chatlytics bot connection (v4.6.0 — MULTIBOT).
+
+    A single ``chatlytics`` platform instance serves N bots. Each bot owns
+    its OWN bearer, its OWN :class:`ChatlyticsClient`, its OWN long-poll
+    cursor, and its OWN backoff/degraded state — so one bot's outage
+    (revoked token, dead session, server 500s) cannot take the others down.
+
+    WHY a per-bot client and not one client with a swapped header: the
+    reply bearer IS the routing decision. Chatlytics resolves the WhatsApp
+    session server-side FROM the bot token (``resolveBotFromBearer`` — bot
+    tokens pin the session, see ``_build_send_body``). Replying to a
+    message that arrived on bot B using bot A's bearer would egress on the
+    WRONG WhatsApp account. Keeping one immutable bearer per client makes
+    that mistake unrepresentable rather than merely discouraged.
+
+    ``index`` 0 is ALWAYS the primary bot (``extra.bot_token`` /
+    ``CHATLYTICS_BOT_TOKEN``). Its client is the same object as
+    ``adapter._client``, so every non-chat-scoped path (health probe, boot
+    identity, tools, cron, home-channel sends, uploads) keeps using the
+    primary bot exactly as it did before v4.6.0.
+    """
+
+    __slots__ = ("token", "fp", "client", "label", "index", "task")
+
+    def __init__(self, token: str, index: int) -> None:
+        self.token: str = token
+        # Fingerprint is the ONLY form of the token that may be logged or
+        # reported (chatlytics INV-02). Plaintext never leaves this object.
+        self.fp: str = _token_fingerprint(token, 8)
+        self.client: Optional[ChatlyticsClient] = None
+        # Display name from GET /api/v1/bot/me; falls back to the fingerprint
+        # until the identity probe resolves it.
+        self.label: str = f"bot fp={self.fp}"
+        self.index: int = index
+        self.task: Optional["asyncio.Task"] = None
+
+    @property
+    def is_primary(self) -> bool:
+        return self.index == 0
+
+    def __repr__(self) -> str:  # pragma: no cover -- diagnostics only
+        return f"<_BotConn #{self.index} {self.label} fp={self.fp}>"
+
+
 class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
     """Async Chatlytics adapter implementing the ``BasePlatformAdapter`` contract.
 
@@ -669,6 +722,35 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # token shape (sk_bot_ prefix → resolveBotFromBearer; otherwise →
         # requirePublicApiAuth). Plugin stays agnostic to the gateway path.
         self._auth_token: str = self.bot_token or self.api_key
+        # v4.6.0 (MULTIBOT): ADDITIONAL bot tokens this ONE platform instance
+        # also consumes. Each gets an independent long-poll loop and its own
+        # reply bearer (see :class:`_BotConn`).
+        #
+        # WHY this lives here and not in a second `platforms:` key: hermes's
+        # `platforms` config is a dict KEYED BY PLATFORM IDENTITY and
+        # ``PlatformConfig`` has no type/plugin indirection, so a second
+        # "chatlytics-proxy" key has no plugin to bind to — and
+        # ``GatewayConfig.from_dict`` DROPS unknown keys SILENTLY (bare
+        # `except ValueError: pass`). A second key produces no error, no
+        # warning, and no second connection. Multiplexing inside the one
+        # registered platform is the only route. DO NOT "simplify" this back
+        # to a second platform entry.
+        #
+        # Sources (both accepted; env WINS and REPLACES rather than merges,
+        # matching every other setting's precedence in this constructor):
+        #   1. CHATLYTICS_EXTRA_BOT_TOKENS — comma/whitespace-separated
+        #   2. extra.extra_bot_tokens      — YAML list (or a single string)
+        # Default is an EMPTY list, so a config that never mentions it keeps
+        # the exact single-bot v4.5.x behavior.
+        self.extra_bot_tokens: List[str] = self._parse_extra_bot_tokens(
+            os.getenv("CHATLYTICS_EXTRA_BOT_TOKENS"),
+            extra.get("extra_bot_tokens"),
+        )
+        # Populated in connect(); index 0 is always the primary bot.
+        self._conns: List[_BotConn] = []
+        # chat_id -> the _BotConn the chat's inbound arrived on. Bounded LRU;
+        # an evicted (or never-seen) chat falls back to the primary bot.
+        self._chat_bot: "OrderedDict[str, _BotConn]" = OrderedDict()
         # v4.1.5 (telegram-style onboarding): degraded "no-credential" state.
         # Set True by connect() when no auth token is configured. When True the
         # adapter has loaded (platform registered, tools callable) but has NO
@@ -856,6 +938,263 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         """
         return self._client
 
+    # --- Multi-bot fan-out (v4.6.0 — MULTIBOT) ----------------------------
+
+    def _parse_extra_bot_tokens(
+        self, env_value: Optional[str], config_value: Any
+    ) -> List[str]:
+        """Normalize the extra-bot-token setting into a clean token list.
+
+        Accepts a comma/whitespace-separated string (env var) OR a YAML list
+        (config) OR a single YAML string. Entries are stripped, empties
+        dropped, and duplicates removed while PRESERVING order — including
+        any entry equal to the primary token, which is dropped so a
+        copy-paste of the primary into the extras list cannot open a second
+        redundant long-poll against the same bot (two consumers on one token
+        fight over the same server-side cursor).
+
+        Never raises: a malformed value degrades to "no extra bots" with a
+        WARNING rather than failing gateway boot over an optional feature.
+        """
+        raw: List[Any]
+        if env_value is not None and str(env_value).strip():
+            raw = [p for p in re.split(r"[,\s]+", str(env_value)) if p]
+        elif isinstance(config_value, str):
+            raw = [p for p in re.split(r"[,\s]+", config_value) if p]
+        elif isinstance(config_value, (list, tuple)):
+            raw = list(config_value)
+        elif config_value is None:
+            return []
+        else:
+            logger.warning(
+                "extra_bot_tokens must be a list or a comma-separated string "
+                "(got %s) — ignoring; no extra bots will be served",
+                type(config_value).__name__,
+            )
+            return []
+
+        tokens: List[str] = []
+        seen = {self._auth_token} if self._auth_token else set()
+        for entry in raw:
+            if not isinstance(entry, str):
+                logger.warning(
+                    "extra_bot_tokens entry of type %s ignored (expected a "
+                    "token string)",
+                    type(entry).__name__,
+                )
+                continue
+            token = entry.strip()
+            if not token:
+                continue
+            if token in seen:
+                # Either a duplicate within the list or the primary itself.
+                logger.warning(
+                    "extra_bot_tokens: duplicate token (fp=%s) ignored — a "
+                    "second long-poll on one token would contend for the "
+                    "same server-side cursor",
+                    _token_fingerprint(token, 8),
+                )
+                continue
+            seen.add(token)
+            if not token.startswith(_BOT_TOKEN_PREFIX):
+                # Extra bots MUST be per-bot bearers: a legacy operator
+                # api_key has no bot identity, so the server cannot pin a
+                # session for it and replies would have nowhere to egress.
+                logger.warning(
+                    "extra_bot_tokens: entry fp=%s does not look like a bot "
+                    "token (expected the %s prefix) — ignoring. Extra bots "
+                    "require per-bot bearers; a legacy operator api_key "
+                    "cannot pin a WhatsApp session.",
+                    _token_fingerprint(token, 8),
+                    _BOT_TOKEN_PREFIX,
+                )
+                continue
+            tokens.append(token)
+        return tokens
+
+    def _bind_chat_bot(self, chat_id: str, conn: Optional["_BotConn"]) -> None:
+        """Record which bot connection ``chat_id``'s inbound arrived on.
+
+        This is the multi-bot analogue of :meth:`register_chat_session`, and
+        it is deliberately the SAME shape: a per-chat map written on inbound
+        and read on the reply path.
+
+        WHY per-chat and not a contextvar: ``BasePlatformAdapter.handle_message``
+        "returns quickly by spawning background tasks", and the reply is sent
+        from one of SEVERAL task/handler paths inside the harness
+        (``_process_message_background``, the active-session command bypass,
+        the clarify text-intercept, ``_send_with_retry`` retries, scheduled
+        ephemeral deletes). Every one of them reaches the adapter through a
+        ``chat_id``-keyed call. Keying on chat_id therefore routes ALL of
+        them; a contextvar would only route the ones that happen to inherit
+        our context and would silently mis-route the rest — i.e. reply from
+        the wrong WhatsApp account, the exact failure this exists to prevent.
+        """
+        if conn is None or not chat_id:
+            return
+        prior = self._chat_bot.get(chat_id)
+        if prior is not None and prior is not conn:
+            # A chat that moves between bots is legitimate (both bots are in
+            # the group), but it is worth one line: it changes which account
+            # the replies egress from.
+            logger.info(
+                "chat %s re-bound from %s to %s — replies now egress on the "
+                "latter's connection",
+                chat_id,
+                prior.label,
+                conn.label,
+            )
+        self._chat_bot[chat_id] = conn
+        self._chat_bot.move_to_end(chat_id)
+        while len(self._chat_bot) > _CHAT_BOT_BINDING_MAX:
+            self._chat_bot.popitem(last=False)
+
+    def _conn_for_chat(self, chat_id: str) -> Optional["_BotConn"]:
+        """Return the bot connection bound to ``chat_id``, else the primary."""
+        conn = self._chat_bot.get(chat_id) if chat_id else None
+        if conn is not None:
+            self._chat_bot.move_to_end(chat_id)
+            return conn
+        return self._conns[0] if self._conns else None
+
+    def _client_for_chat(self, chat_id: str) -> Optional[ChatlyticsClient]:
+        """Resolve the outbound client whose bearer matches ``chat_id``'s bot.
+
+        Falls back to ``self._client`` (the PRIMARY bot) for any chat with no
+        binding — an un-seen chat, an LRU-evicted one, a tool-initiated send,
+        or a single-bot deployment. That fallback IS the pre-v4.6.0 behavior,
+        so nothing changes for a gateway that configures no extra bots.
+        """
+        conn = self._conn_for_chat(chat_id)
+        if conn is not None and conn.client is not None:
+            return conn.client
+        return self._client
+
+    async def _verify_bot_identity(self, conn: "_BotConn") -> bool:
+        """Probe ``GET /api/v1/bot/me`` for ``conn``; log WHO it is.
+
+        Returns True when the bot authenticated (so its poll loop should
+        start), False on a definitive auth rejection (401/403 — a revoked or
+        mistyped token; starting a poll loop for it would just log a 401
+        every 30s forever).
+
+        A non-auth failure (transport error, legacy server with no
+        ``/api/v1/bot/me``, 5xx) returns True: the identity probe is
+        best-effort and must never be the reason a working bot goes unserved.
+        Mirrors :meth:`_log_boot_identity`'s never-fail-connect contract.
+        Token plaintext is NEVER logged — only ``conn.fp``.
+        """
+        if conn.client is None:
+            return False
+        try:
+            resp = await conn.client.get("/api/v1/bot/me")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- probe is best-effort
+            logger.warning(
+                "extra bot fp=%s identity probe failed (%s) — starting its "
+                "long-poll anyway; watch for 401s if the token is bad",
+                conn.fp,
+                exc,
+            )
+            return True
+        if resp.status_code == 200:
+            try:
+                payload: Any = resp.json()
+            except Exception:  # noqa: BLE001
+                payload = None
+            name = extract_bot_name(payload)
+            if name:
+                conn.label = name
+            logger.info(
+                "chatlytics extra bot #%d authenticated as %s (fp=%s)",
+                conn.index,
+                conn.label,
+                conn.fp,
+            )
+            return True
+        if resp.status_code in (401, 403):
+            logger.error(
+                "%s extra bot fp=%s REJECTED (HTTP %d on /api/v1/bot/me) — "
+                "this bot will NOT be served; the other bots are unaffected. "
+                "%s",
+                _LOAD_FAIL_PREFIX,
+                conn.fp,
+                resp.status_code,
+                map_connect_error(status_code=401),
+            )
+            return False
+        logger.warning(
+            "extra bot fp=%s identity probe returned HTTP %d — starting its "
+            "long-poll anyway",
+            conn.fp,
+            resp.status_code,
+        )
+        return True
+
+    async def _start_extra_bots(self) -> None:
+        """Build a client + identity-check + long-poll task per extra bot.
+
+        Called from :meth:`connect` AFTER the primary bot is fully up, and
+        ONLY in longpoll inbound mode (the webhook PUSH transport is a single
+        server-registered URL — there is no per-bot fan-in to multiplex, so
+        extra bots in webhook mode are a config error, reported as such).
+
+        FAILURE ISOLATION is the contract: each bot is built, probed, and
+        started inside its own try/except. One bad token, one unreachable
+        probe, one task that fails to spawn — none of it may prevent the
+        remaining bots (INCLUDING the primary, which is already running by
+        the time we get here) from being served.
+        """
+        if not self.extra_bot_tokens:
+            return
+        if self.inbound_mode != "longpoll":
+            logger.error(
+                "%s extra_bot_tokens is configured (%d extra bot(s)) but "
+                "inbound_mode is %r — extra bots are served ONLY in longpoll "
+                "mode (webhook mode has a single server-registered URL with "
+                "no per-bot fan-in). The extra bots are NOT being served; "
+                "set inbound_mode: longpoll.",
+                _LOAD_FAIL_PREFIX,
+                len(self.extra_bot_tokens),
+                self.inbound_mode,
+            )
+            return
+
+        for token in self.extra_bot_tokens:
+            existing = next((c for c in self._conns if c.token == token), None)
+            if existing is not None:
+                # Reconnect: the conn survives, only a dead task is respawned.
+                conn = existing
+            else:
+                conn = _BotConn(token, index=len(self._conns))
+                self._conns.append(conn)
+            try:
+                if conn.client is None:
+                    conn.client = ChatlyticsClient(
+                        base_url=self.base_url, api_key=conn.token
+                    )
+                if not await self._verify_bot_identity(conn):
+                    continue
+                if conn.task is None or conn.task.done():
+                    conn.task = asyncio.create_task(self._poll_loop(conn))
+                    conn.task.add_done_callback(self._on_poll_task_done)
+                    logger.info(
+                        "chatlytics inbound: longpoll loop started for extra "
+                        "bot #%d %s (fp=%s)",
+                        conn.index,
+                        conn.label,
+                        conn.fp,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 -- isolation: one bad bot only
+                logger.exception(
+                    "extra bot fp=%s failed to start — the other bots "
+                    "(including the primary) are unaffected",
+                    conn.fp,
+                )
+
     # --- Session threading (P-19, carried forward) ------------------------
 
     def register_chat_session(self, chat_id: str, session: str) -> None:
@@ -1035,8 +1374,9 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             logger.debug("progress bubble skipped: %s", err)
             return
         body["progress"] = True
+        _client = self._client_for_chat(chat_id) or self._client
         try:
-            response = await self._client.post("/api/v1/send", json=body)
+            response = await _client.post("/api/v1/send", json=body)
         except httpx.RequestError as exc:
             logger.debug(
                 "progress bubble transport error for chat %s: %s", chat_id, exc
@@ -1101,8 +1441,16 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
     # --- Longpoll inbound consumer (v4.1) ---------------------------------
 
-    async def _poll_loop(self) -> None:
+    async def _poll_loop(self, conn: Optional["_BotConn"] = None) -> None:
         """PULL inbound messages from chatlytics via long-poll.
+
+        v4.6.0 (MULTIBOT): one loop instance PER BOT. ``conn`` selects which
+        bot's bearer, client, cursor and backoff state this loop owns; it
+        defaults to the primary bot so single-bot deployments (and every
+        pre-v4.6.0 caller/test) behave exactly as before. Every piece of
+        retry state below is a LOCAL, so two loops cannot interfere: a
+        proxy bot stuck at the 30s backoff cap does not slow, degrade, or
+        silence the primary bot's loop, and vice versa.
 
         Replaces the webhook PUSH transport when ``inbound_mode ==
         "longpoll"``. Implements the chatlytics v4.0 bot-updates contract:
@@ -1135,9 +1483,18 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             bad/revoked, with rotate guidance) + capped backoff.
           - asyncio.CancelledError: exit cleanly (disconnect()).
         """
+        if conn is None:
+            conn = self._conns[0] if self._conns else None
+        # Log prefix: EMPTY for the primary bot so single-bot log output is
+        # byte-for-byte identical to v4.5.x (existing log greps keep working);
+        # extra bots are identified by name + fingerprint on every line.
+        tag: str = "" if (conn is None or conn.is_primary) else f"[{conn.label} fp={conn.fp}] "
+
         cursor: str = ""
         # Consecutive-failure count (indexes _BACKOFF_LADDER) and the
         # degraded-state label (None == healthy). Both reset on success.
+        # LOCALS, not instance state: this is what isolates one bot's
+        # backoff from every other bot's (v4.6.0 MULTIBOT).
         failures: int = 0
         degraded: Optional[str] = None
 
@@ -1167,8 +1524,9 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             if degraded is None:
                 logger.log(
                     level,
-                    "longpoll degraded: %s — %s (retrying with bounded "
+                    "%slongpoll degraded: %s — %s (retrying with bounded "
                     "backoff, %.1fs now, 30s cap; will log on recovery)",
+                    tag,
                     reason,
                     hint,
                     delay,
@@ -1176,8 +1534,9 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             elif degraded != cls_key:
                 logger.log(
                     level,
-                    "longpoll degraded reason changed: %s -> %s — %s "
+                    "%slongpoll degraded reason changed: %s -> %s — %s "
                     "(attempt %d, backing off %.1fs)",
+                    tag,
                     degraded,
                     reason,
                     hint,
@@ -1186,7 +1545,8 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 )
             else:
                 logger.debug(
-                    "longpoll still degraded (%s); attempt %d, backing off %.1fs",
+                    "%slongpoll still degraded (%s); attempt %d, backing off %.1fs",
+                    tag,
                     reason,
                     failures,
                     delay,
@@ -1198,13 +1558,15 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             nonlocal failures, degraded
             if degraded is not None:
                 logger.info(
-                    "longpoll recovered (healthy again after: %s)", degraded
+                    "%slongpoll recovered (healthy again after: %s)", tag, degraded
                 )
             degraded = None
             failures = 0
 
         logger.info(
-            "chatlytics inbound: longpoll loop started (polling /api/v1/bot/updates)"
+            "%schatlytics inbound: longpoll loop started (polling "
+            "/api/v1/bot/updates)",
+            tag,
         )
         # v4.5.1 (review-d3 X1): error classes already reported at ERROR by
         # the catch-all below. The full traceback logs ONCE per distinct
@@ -1213,7 +1575,10 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         unexpected_seen: set = set()
 
         while self._running:
-            client = self._client
+            # v4.6.0 (MULTIBOT): this loop uses ITS OWN bot's client, never
+            # self._client — using the shared/primary client here would send
+            # this bot's acks (and route its envelopes) under the WRONG bearer.
+            client = conn.client if conn is not None else self._client
             if client is None:
                 # connect() always sets _client before starting the task,
                 # but guard defensively against a teardown race.
@@ -1266,7 +1631,9 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 if resp.status_code == 400:
                     # Bad/expired cursor — reset and re-poll from the tail.
                     logger.warning(
-                        "longpoll GET returned 400 (invalid_cursor); resetting cursor"
+                        "%slongpoll GET returned 400 (invalid_cursor); "
+                        "resetting cursor",
+                        tag,
                     )
                     cursor = ""
                     continue
@@ -1323,13 +1690,15 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
                 for env in envelopes:
                     try:
-                        await self._dispatch_envelope(env)
+                        await self._dispatch_envelope(env, conn)
                     except asyncio.CancelledError:
                         raise
                     except Exception:  # noqa: BLE001 -- one bad envelope must not
                         # kill the loop or block the ack for the rest of the batch.
                         logger.exception(
-                            "longpoll: failed to dispatch one envelope; continuing"
+                            "%slongpoll: failed to dispatch one envelope; "
+                            "continuing",
+                            tag,
                         )
 
                 # Advance + persist the read pointer. Ack AFTER processing so an
@@ -1392,8 +1761,24 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 )
                 await asyncio.sleep(delay)
 
-    async def _dispatch_envelope(self, env: Dict[str, Any]) -> None:
+    async def _dispatch_envelope(
+        self, env: Dict[str, Any], conn: Optional["_BotConn"] = None
+    ) -> None:
         """Translate one InboundEnvelope -> MessageEvent and dispatch it.
+
+        v4.6.0 (MULTIBOT): ``conn`` is the bot connection this envelope
+        ARRIVED on — the receiving long-poll loop, which is the authoritative
+        and unambiguous discriminator. We deliberately do NOT read
+        ``env["bot_token"]`` for this: it is a plaintext secret we must never
+        handle or risk logging (chatlytics INV-02), and the loop already
+        knows the answer without it.
+
+        The binding is recorded BEFORE dispatch, next to (and for the same
+        reason as) :meth:`register_chat_session` — so the reply, whichever
+        harness path emits it, goes out under the bearer of the bot that
+        received the message. ``conn=None`` (webhook transport, tests,
+        ``retry_last`` replays) falls back to the primary bot, which is the
+        pre-v4.6.0 behavior.
 
         InboundEnvelope shape (chatlytics v4.0 bot-updates contract)::
 
@@ -1420,6 +1805,16 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         like message envelopes — the batch-level ack in :meth:`_poll_loop`
         is unchanged.
         """
+        # v4.6.0 (MULTIBOT): bind the chat to its bot FIRST — before the kind
+        # branch — so CONTROL envelopes (/new, /stop, /retry, /approve) reply
+        # on the right connection too. Those paths emit user-visible text via
+        # the same chat_id-keyed send path as a normal reply, so binding only
+        # on the message branch would leave them egressing from the primary
+        # bot's WhatsApp account.
+        chat_key = env.get("entity_jid")
+        if isinstance(chat_key, str):
+            self._bind_chat_bot(chat_key, conn)
+
         kind = env.get("kind")
         if kind is not None and kind != "message":
             if kind == "control":
@@ -1932,9 +2327,15 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             body["ttl_s"] = int(ttl_s)
         for attempt in (0, 1):
             try:
-                response = await self._client.post(
-                    "/api/v1/bot/questions", json=body
-                )
+                # v4.6.0 (MULTIBOT): the server DMs this question to the
+                # PAIRED OWNER OF THE BEARER'S BOT. Using the primary bearer
+                # for a question raised in a chat served by another bot would
+                # ask the wrong person on the wrong account, and the
+                # question_resolved envelope would come back on a longpoll
+                # this chat is not bound to.
+                response = await (
+                    self._client_for_chat(chat_id) or self._client
+                ).post("/api/v1/bot/questions", json=body)
             except asyncio.CancelledError:
                 raise
             except httpx.RequestError as exc:
@@ -2489,6 +2890,15 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 api_key=self._auth_token,
             )
 
+        # v4.6.0 (MULTIBOT): register the PRIMARY bot as connection #0 and
+        # point it at the very same client object built above, so every
+        # existing non-chat-scoped call site (health, boot identity, tools,
+        # uploads, cron) keeps using it unchanged. Idempotent across
+        # reconnects — the conn is reused, only its client reference refreshes.
+        if not self._conns:
+            self._conns.append(_BotConn(self._auth_token, index=0))
+        self._conns[0].client = self._client
+
         # HERMES-V2 (Phase 336): log which auth identity the plugin uses
         # so operators can confirm bot vs legacy at gateway start. Token
         # plaintext NEVER appears — only the 8-char SHA256 fingerprint.
@@ -2559,15 +2969,22 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             self._running = True
             # Idempotency: don't spawn a second poll task on re-connect.
             if self._poll_task is None or self._poll_task.done():
-                self._poll_task = asyncio.create_task(self._poll_loop())
+                self._poll_task = asyncio.create_task(
+                    self._poll_loop(self._conns[0])
+                )
                 # v4.5.1 (review-d3 X1): belt + suspenders for the loop's
                 # never-exit contract — if the task ever completes without
                 # being cancelled, that is a dead inbound transport and MUST
                 # be unmissable in the log.
                 self._poll_task.add_done_callback(self._on_poll_task_done)
+                self._conns[0].task = self._poll_task
             logger.info(
                 "chatlytics inbound: longpoll mode (polling /api/v1/bot/updates)"
             )
+            # v4.6.0 (MULTIBOT): fan out to any additional bots. Runs AFTER
+            # the primary is fully up and never raises — an extra bot that
+            # cannot start must not fail the platform for the primary.
+            await self._start_extra_bots()
             # v4.5.2: a live longpoll task IS connected — register so
             # chatlytics_* tools resolve this adapter on longpoll-only
             # gateways (BotDaddy "adapter is not connected" fix).
@@ -2648,12 +3065,24 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         """
         if task.cancelled():
             return  # disconnect() — clean shutdown.
+        # v4.6.0 (MULTIBOT): name WHICH bot died. With N loops running, "the
+        # longpoll task exited" is not actionable on its own — the operator
+        # needs to know which WhatsApp account just went silent.
+        who = next(
+            (
+                f" [{c.label} fp={c.fp}]"
+                for c in self._conns
+                if c.task is task and not c.is_primary
+            ),
+            "",
+        )
         exc = task.exception()
         if exc is not None:
             logger.error(
-                "chatlytics longpoll task EXITED with %r — inbound is DEAD "
+                "chatlytics longpoll task%s EXITED with %r — inbound is DEAD "
                 "until the gateway reconnects (this should be impossible; "
                 "the loop's catch-all was bypassed)",
+                who,
                 exc,
                 exc_info=exc,
             )
@@ -2662,8 +3091,9 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             # (the client-is-None teardown-race guard is the only normal
             # return, and disconnect() flips _running first).
             logger.error(
-                "chatlytics longpoll task EXITED (returned while running) — "
-                "inbound is DEAD until the gateway reconnects"
+                "chatlytics longpoll task%s EXITED (returned while running) — "
+                "inbound is DEAD until the gateway reconnects",
+                who,
             )
 
     async def _log_boot_identity(self) -> None:
@@ -2738,6 +3168,35 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 await self._poll_task
             self._poll_task = None
 
+        # v4.6.0 (MULTIBOT): tear down every EXTRA bot (index >= 1). The
+        # primary's task is self._poll_task, cancelled above, and its client
+        # is self._client, closed below — so this loop deliberately skips
+        # index 0 rather than double-closing it. Each teardown is isolated:
+        # one bot that raises on cancel/close must not strand the rest.
+        for conn in self._conns[1:]:
+            if conn.task is not None:
+                conn.task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await conn.task
+                conn.task = None
+            if conn.client is not None:
+                logger.info(
+                    "Stopping Chatlytics longpoll consumer for %s (fp=%s)",
+                    conn.label,
+                    conn.fp,
+                )
+                try:
+                    await conn.client.aclose()
+                except Exception:  # noqa: BLE001 -- teardown never raises
+                    logger.exception(
+                        "extra bot fp=%s client close raised; continuing",
+                        conn.fp,
+                    )
+                conn.client = None
+        # Bindings point at now-closed clients; drop them so a reconnect
+        # re-learns them from live inbound instead of reusing dead handles.
+        self._chat_bot.clear()
+
         if self._runner is not None:
             logger.info("Stopping Chatlytics webhook server")
             try:
@@ -2751,6 +3210,13 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             logger.info("Disconnecting from Chatlytics gateway")
             await self._client.aclose()
             self._client = None
+        # v4.6.0: the primary conn shares the client just closed — drop the
+        # duplicate reference so nothing can send through a closed handle.
+        # The _BotConn objects themselves survive so reconnect() reuses them
+        # (and their resolved labels) instead of re-probing identity.
+        if self._conns:
+            self._conns[0].client = None
+            self._conns[0].task = None
 
     # --- Outbound (HERMES-02) ---------------------------------------------
 
@@ -2832,8 +3298,15 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
         logger.debug("send -> /api/v1/send chatId=%s len=%d", chat_id, len(content))
 
+        # v4.6.0 (MULTIBOT): resolve the bearer that matches THIS chat's
+        # bot. The bot token IS the routing decision — chatlytics pins the
+        # WhatsApp session server-side from the bearer, so replying with
+        # the wrong bot's token egresses on the wrong account. Falls back
+        # to the primary client for unbound chats (pre-v4.6.0 behavior).
+        _client = self._client_for_chat(chat_id) or self._client
+
         try:
-            response = await self._client.post("/api/v1/send", json=body)
+            response = await _client.post("/api/v1/send", json=body)
         except httpx.RequestError as exc:
             if edit_message_id:
                 # Never lose the reply over the edit decoration: retry ONCE
@@ -2855,7 +3328,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 body.pop("edit_message_id", None)
                 edit_message_id = None  # retried plain — no edit outcome to log
                 try:
-                    response = await self._client.post("/api/v1/send", json=body)
+                    response = await _client.post("/api/v1/send", json=body)
                 except httpx.RequestError as exc2:
                     return SendResult(
                         success=False,
@@ -2884,7 +3357,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             body.pop("edit_message_id", None)
             edit_message_id = None
             try:
-                response = await self._client.post("/api/v1/send", json=body)
+                response = await _client.post("/api/v1/send", json=body)
             except httpx.RequestError as exc2:
                 return SendResult(
                     success=False,
@@ -3011,7 +3484,10 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             return False
 
         try:
-            response = await self._client.post(
+            # v4.6.0 (MULTIBOT): presence is chat-scoped — the typing
+            # indicator must appear from the same WhatsApp account that is
+            # about to send the reply.
+            response = await (self._client_for_chat(chat_id) or self._client).post(
                 "/api/v1/typing",
                 json={"chatId": chat_id, "duration": float(duration)},
             )
@@ -3073,7 +3549,10 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             )
 
         try:
-            response = await self._client.get(
+            # v4.6.0 (MULTIBOT): read the chat through the bot that serves it
+            # — a bot only sees chats on its own WhatsApp session, so the
+            # primary bearer would 404 on a proxy-bot-only chat.
+            response = await (self._client_for_chat(chat_id) or self._client).get(
                 "/api/v1/chat",
                 params={"chatId": chat_id},
             )
@@ -3494,7 +3973,9 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             _MEDIA_VIDEO_TIMEOUT if send_type == "video" else _MEDIA_DEFAULT_TIMEOUT
         )
         try:
-            response = await self._client.post(
+            # v4.6.0 (MULTIBOT): same bearer-is-routing rule as send() — media
+            # must egress on the account bound to this chat.
+            response = await (self._client_for_chat(chat_id) or self._client).post(
                 "/api/v1/send", json=body, timeout=media_timeout
             )
         except httpx.RequestError as exc:

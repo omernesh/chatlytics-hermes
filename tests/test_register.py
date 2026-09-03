@@ -125,7 +125,7 @@ def test_plugin_yaml_is_valid() -> None:
 
     assert manifest["name"] == "chatlytics"
     assert manifest["kind"] == "platform"
-    assert manifest["version"] == "4.5.8"
+    assert manifest["version"] == "4.6.0"
 
     required = {entry["name"] for entry in manifest["requires_env"]}
     assert required == {"CHATLYTICS_BOT_TOKEN"}
@@ -165,7 +165,7 @@ def test_pyproject_declares_hermes_entry_point() -> None:
     assert entry_points["chatlytics"] == "chatlytics_hermes"
 
     project = data["project"]
-    assert project["version"] == "4.5.8"  # v4.5.7 — connect() accepts framework is_reconnect kwarg (fixes reconnect TypeError that dead-looped the longpoll consumer).
+    assert project["version"] == "4.6.0"  # v4.6.0 — one platform instance serves N bots (extra_bot_tokens); replies use the bearer the message arrived on.
     assert project["name"] == "chatlytics-hermes"
 
     deps = project["dependencies"]

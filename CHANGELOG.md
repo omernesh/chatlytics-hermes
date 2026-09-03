@@ -1,5 +1,87 @@
 # Changelog
 
+## [4.6.0] - 2026-09-03
+
+### Added
+
+- **One `chatlytics` platform instance can now serve MULTIPLE bots
+  (`extra_bot_tokens`).** A single Hermes agent — one process, one memory,
+  one identity — consumes N chatlytics bots at once and answers on whichever
+  connection the message arrived on. The motivating case: Sammie answering
+  `!sammie` both on his own WhatsApp account and, via a proxy bot, from
+  inside Omer's account, with shared context by construction.
+
+  ```yaml
+  platforms:
+    chatlytics:
+      extra:
+        bot_token: sk_bot_...          # primary — unchanged
+        extra_bot_tokens:              # NEW, default [] (empty)
+          - sk_bot_...                 # each gets its own long-poll loop
+  ```
+
+  Also settable as `CHATLYTICS_EXTRA_BOT_TOKENS` (comma/whitespace-separated;
+  env REPLACES the config value, matching every other setting's precedence).
+
+  Per bot: an independent `ChatlyticsClient`, an identity check at startup
+  (`GET /api/v1/bot/me`, logging the display name and the 8-char fingerprint
+  — never the token), an independent long-poll loop, and independent cursor
+  and backoff state.
+
+  **Reply-bearer routing is the correctness heart.** Chatlytics resolves the
+  WhatsApp session server-side FROM the bot bearer, so replying with the
+  wrong bot's token would egress on the wrong WhatsApp account. Each chat is
+  bound to the connection its inbound arrived on (recorded next to, and for
+  the same reason as, the existing per-chat session threading), and every
+  chat-scoped outbound — `send`, media, typing, `get_chat_info`, and owner
+  questions — resolves its client through that binding. Binding happens
+  before the envelope-kind branch, so control envelopes (`/new`, `/stop`,
+  `/retry`) reply on the right account too.
+
+  Keyed on `chat_id` rather than a contextvar deliberately: the harness's
+  `handle_message` "returns quickly by spawning background tasks" and emits
+  replies from several different task paths, all of which reach the adapter
+  through a `chat_id`-keyed call. A contextvar would route only the paths
+  that happen to inherit the dispatch context and silently mis-route the
+  rest.
+
+  **Failure isolation:** one bot's revoked token, unreachable probe, or
+  wedged loop cannot affect another's — retry state is per-loop local, and
+  each bot is built, probed, and started inside its own `try/except`. A bot
+  rejected with 401/403 at startup is not served at all (rather than logging
+  a 401 every 30s forever); the others, including the primary, come up
+  normally.
+
+  **Backwards compatible by construction:** with no `extra_bot_tokens`
+  configured the adapter builds exactly one connection, `self._client` is
+  that connection's client, every chat falls back to it, and log lines carry
+  no bot prefix — byte-for-byte v4.5.x behavior.
+
+### Fixed
+
+- `client.USER_AGENT` had drifted to `4.5.1` while the package was at
+  `4.5.8`, so `_PLUGIN_VERSION` (parsed from it) under-reported the running
+  version. Re-pinned to the release version. `__init__.__version__` had
+  likewise drifted to `4.5.3`.
+
+### Notes
+
+- ⚠️ **A second `platforms:` key can never work — and fails SILENTLY.**
+  Hermes' `platforms` config is a dict whose KEY *is* the platform identity;
+  `PlatformConfig` has no type/plugin indirection, and
+  `GatewayConfig.from_dict` drops keys it cannot resolve inside a bare
+  `except ValueError: pass`. A `chatlytics-proxy:` entry therefore produces
+  no error, no warning, and no second connection — it simply vanishes.
+  Multiplexing inside the one registered platform (this release) is the only
+  route. Do not "simplify" `extra_bot_tokens` back into a second key.
+- Extra bots require `inbound_mode: longpoll`. Webhook PUSH mode has a
+  single server-registered URL and no per-bot fan-in to multiplex; extra
+  bots configured in webhook mode are refused with an explicit ERROR rather
+  than being silently ignored.
+- Extra tokens must be per-bot bearers (`sk_bot_` prefix). A legacy operator
+  `api_key` has no bot identity for the server to pin a session from, so it
+  is rejected at parse time.
+
 ## [4.5.8] - 2026-07-05
 
 ### Deprecated

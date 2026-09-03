@@ -157,6 +157,7 @@ Quick reference (full table + per-profile YAML examples in
 | `CHATLYTICS_BASE_URL` | no | Gateway base URL. Default `https://node.chatlytics.ai`. On-prem gateways should use the LAN URL. |
 | `CHATLYTICS_INBOUND_MODE` | no | `webhook` (default) or `longpoll` (PULL via `GET /api/v1/bot/updates` — use behind NAT). |
 | `CHATLYTICS_SESSION` | no | **Deprecated (v4.5.8).** Legacy webhook mode only; no-op when `CHATLYTICS_BOT_TOKEN` is set. Will be removed in v5.0. |
+| `CHATLYTICS_EXTRA_BOT_TOKENS` | no | **v4.6.0.** Additional `sk_bot_...` bearers this one platform instance also serves, comma-separated (config: `extra.extra_bot_tokens`, a YAML list). Requires `longpoll` inbound mode. |
 | `CHATLYTICS_STATUS_EDIT_IN_PLACE` | no | Progress-bubble edit-in-place (default `true`). |
 | `CHATLYTICS_UPLOAD_ALLOWED_ROOTS` | no | Default-deny allowlist for local-file media uploads. |
 
@@ -164,6 +165,33 @@ Quick reference (full table + per-profile YAML examples in
 token-less gateway still boots (degraded): data tools return a
 get-a-token prompt instead of failing the whole platform load.
 `CHATLYTICS_SESSION` is deprecated as of v4.5.8 and will be removed in v5.0.
+
+### Serving several bots from one agent (v4.6.0)
+
+One Hermes agent can consume several chatlytics bots at once — same process,
+same memory, same identity — replying on whichever connection each message
+arrived on:
+
+```yaml
+platforms:
+  chatlytics:
+    extra:
+      bot_token: sk_bot_...        # primary
+      extra_bot_tokens:            # each gets its own long-poll loop
+        - sk_bot_...               # e.g. a proxy bot on another account
+      inbound_mode: longpoll       # required for extra bots
+```
+
+Each bot keeps its own bearer, cursor, and backoff, so one bot's outage
+cannot silence another. Replies are routed by the bot the message came in
+on — chatlytics pins the WhatsApp session from the bearer, so this is what
+keeps a reply from egressing on the wrong account.
+
+> ⚠️ **Do not try to add a second `platforms:` entry instead.** Hermes keys
+> `platforms` by platform identity, and `GatewayConfig.from_dict` discards
+> keys it cannot resolve inside a bare `except ValueError: pass`. A
+> `chatlytics-proxy:` key produces no error, no warning, and no second
+> connection — it silently disappears.
 
 ## Feature highlights (v4.2 → v4.5)
 
