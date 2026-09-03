@@ -329,7 +329,13 @@ _MEDIA_KIND_TO_SEND_TYPE: Dict[str, str] = {
     "video": "video",
     "animation": "video",
     "document": "file",
-    "voice": "file",
+    # v4.6.1 (2026-09-03): voice now routes as type=voice -> /api/sendVoice.
+    # The server has supported it since chatlytics Phase 168 and defaults
+    # convert=true (v6.132.x), so any source audio becomes a real push-to-talk
+    # bubble. The old voice->file downgrade made agent voice notes arrive as
+    # downloadable attachments (measured 2026-09-03); the stale rationale in
+    # the block comment above is OBSOLETE for voice.
+    "voice": "voice",
 }
 
 # Media sends route through WAHA, which TRANSCODES video/animation (ffmpeg,

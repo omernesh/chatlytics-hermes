@@ -99,12 +99,15 @@ async def test_send_image_url_path(
 async def test_send_voice_routes_via_send(
     adapter: ChatlyticsAdapter, mock_router: respx.MockRouter
 ) -> None:
-    """Voice is not a proxy-send ``type``; it degrades to ``file``.
+    """Voice routes as ``type=voice`` -> /api/sendVoice (v4.6.1).
 
-    A true WhatsApp voice bubble (push-to-talk) is only reachable on the
-    direct WAHA path, not via ``/api/v1/send`` (whose ``type`` set is
-    text/image/video/file). The audio still delivers as a downloadable
-    attachment under ``type=file``.
+    Until v4.6.0 this test pinned the OPPOSITE: ``voice degrades to file``,
+    written when /api/v1/send only accepted text/image/video/file. The server
+    has routed type=voice to /api/sendVoice since chatlytics Phase 168 and
+    (v6.132.x) defaults convert=true there, so the downgrade silently turned
+    every agent voice note into a downloadable attachment - measured
+    2026-09-03. The media payload stays under ``file`` (WAHA's
+    MessageVoiceRequest field name).
     """
     mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
     send_route = mock_router.post("/api/v1/send").mock(
@@ -115,8 +118,8 @@ async def test_send_voice_routes_via_send(
     assert result.success is True
 
     body = _json.loads(send_route.calls.last.request.content)
-    assert body["type"] == "file", (
-        f"send_voice must route as type=file via /api/v1/send, got {body['type']!r}"
+    assert body["type"] == "voice", (
+        f"send_voice must route as type=voice via /api/v1/send, got {body['type']!r}"
     )
     assert body["file"]["url"] == "https://cdn.test/v.ogg"
     await adapter.disconnect()

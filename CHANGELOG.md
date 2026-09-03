@@ -1,3 +1,7 @@
+## 4.6.1 - 2026-09-03
+
+- Fixed: agent voice notes now send as real WhatsApp voice bubbles (push-to-talk). The adapter had been downgrading voice to a plain file attachment based on a stale assumption about the server's send types; the server has routed type=voice to /api/sendVoice since Phase 168 and now defaults audio transcoding on that path, so any source format becomes a proper voice bubble.
+
 # Changelog
 
 ## [4.6.0] - 2026-09-03
