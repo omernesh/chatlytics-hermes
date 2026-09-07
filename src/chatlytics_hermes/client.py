@@ -23,7 +23,7 @@ DEFAULT_TIMEOUT_SECONDS: float = 30.0
 # pyproject.toml / plugin.yaml / __init__.__version__ on EVERY release
 # (adapter._PLUGIN_VERSION is parsed from this string). History: stuck at
 # 2.0.0 until HERMES-V2 (Phase 336) tied it to the release cycle.
-USER_AGENT: str = "chatlytics-hermes/4.7.1"
+USER_AGENT: str = "chatlytics-hermes/4.7.2"
 
 
 class ChatlyticsClient:

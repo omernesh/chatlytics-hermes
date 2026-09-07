@@ -1,3 +1,18 @@
+## [4.7.2] - 2026-09-07
+
+### Fixed
+
+- **fix: resolve_entity's best match was repeated in "other candidates".**
+  `_render_resolve_entity` excluded the best match from the "other
+  candidate(s)" list by Python object identity, but `best` and its
+  duplicate entry in `matches` are separate dict objects once the payload
+  has round-tripped through JSON (e.g. via the v4.7.1 envelope-unwrap
+  path) -- so the exclusion never matched and the winning candidate was
+  listed a second time as an "other," reading to an LLM as two different
+  people (confirmed live: query "Zeev", 1 match, rendered "Best match:
+  Zeev Nesher ... 1 other candidate(s): Zeev Nesher ..."). Now excludes
+  by `jid` instead.
+
 ## [4.7.1] - 2026-09-07
 
 ### Fixed

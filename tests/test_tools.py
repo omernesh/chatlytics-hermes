@@ -251,6 +251,48 @@ async def test_resolve_entity_best_match_renders_decisively(
     assert result["success"] is True
     assert "Best match: Alice" in result["message"]
     assert "ask the user" not in result["message"]
+    # v4.7.2 regression: with only 1 match, best IS that match -- it must
+    # not also be listed as an "other candidate" (dedup was by identity,
+    # which always failed once the payload round-tripped through JSON).
+    assert result["message"].count("Best match") == 1
+    assert "other candidate" not in result["message"]
+
+
+async def test_resolve_entity_best_match_excludes_itself_from_others(
+    client: ChatlyticsClient, mock_router: respx.MockRouter
+) -> None:
+    """v4.7.2 regression: 3 matches, best is one of them -> exactly 2
+    "other candidates" listed, and the best is not among them."""
+    best_candidate = {
+        "jid": "9725001@c.us",
+        "name": "Alice",
+        "type": "contact",
+        "confidence": 0.95,
+        "phone": "+9725001",
+    }
+    mock_router.post("/api/v1/actions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True,
+                "matches": [
+                    dict(best_candidate),  # separate dict, same jid -- the bug case
+                    {"jid": "9725002@c.us", "name": "Alicia", "type": "contact", "confidence": 0.4},
+                    {"jid": "9725003@c.us", "name": "Alison", "type": "contact", "confidence": 0.3},
+                ],
+                "best": dict(best_candidate),
+                "ambiguous": False,
+                "reason": "single_best",
+            },
+        )
+    )
+    result = await chatlytics_resolve_entity(client, query="Ali")
+    assert result["message"].count("Best match") == 1
+    assert "2 other candidate(s)" in result["message"]
+    assert "Alicia" in result["message"] and "Alison" in result["message"]
+    # The best (Alice) must not appear a second time as an "other".
+    others_clause = result["message"].split("other candidate(s):", 1)[1]
+    assert "Alice" not in others_clause
 
 
 async def test_resolve_entity_ambiguous_asks_the_user(

@@ -1128,7 +1128,18 @@ def _render_resolve_entity(payload: Dict[str, Any]) -> str:
             best = matches[0]
 
     if best is not None:
-        others = [m for m in matches if m is not best]
+        # Bug (found live, v4.7.2): ``best`` and the matching entry in
+        # ``matches`` are DIFFERENT dict objects once the payload has been
+        # through json.loads() (the unwrap path), so `m is not best`
+        # never excludes anything -- the best match got listed a second
+        # time as an "other candidate", reading to an LLM as two distinct
+        # people. Exclude by ``jid`` (the stable identity field) instead;
+        # fall back to identity only when ``best`` has no jid at all.
+        best_jid = best.get("jid")
+        if best_jid is not None:
+            others = [m for m in matches if m.get("jid") != best_jid]
+        else:
+            others = [m for m in matches if m is not best]
         lines = [f"Best match: {_fmt_resolve_candidate(best)}."]
         if others:
             lines.append(
