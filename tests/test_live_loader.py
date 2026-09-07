@@ -7,7 +7,7 @@ Chatlytics backend to prove:
 1. The plugin loads (``register(ctx)`` is called).
 2. The chatlytics platform registers with the canonical
    ``register_platform`` kwargs.
-3. All 21 tools land on the ``PluginContext`` registry under the
+3. All 22 tools land on the ``PluginContext`` registry under the
    ``chatlytics`` toolset.
 4. BL-01 / HI-01 / HI-03 are reproduced under strict-xfail markers
    (Phase 8 fixes them; ``strict=True`` forces un-xfailing then).
@@ -45,10 +45,10 @@ pytestmark = pytest.mark.asyncio
 BASE_URL = "https://gateway.test.chatlytics.ai"
 API_KEY = "test-api-key-live-loader"
 
-# Canonical tool-name set sourced from the locked-21 TOOLS registry.
+# Canonical tool-name set sourced from the locked-22 TOOLS registry.
 _EXPECTED_TOOL_NAMES = frozenset(name for name, _, _ in TOOLS)
-assert len(_EXPECTED_TOOL_NAMES) == 21, (
-    f"tools.TOOLS drift: expected 21 unique names, got {len(_EXPECTED_TOOL_NAMES)}"
+assert len(_EXPECTED_TOOL_NAMES) == 22, (
+    f"tools.TOOLS drift: expected 22 unique names, got {len(_EXPECTED_TOOL_NAMES)}"
 )
 
 
@@ -157,15 +157,15 @@ async def test_loader_registers_chatlytics_platform() -> None:
 
 
 # ---------------------------------------------------------------------
-# AC-2: all 21 tools land on the context with correct toolset/handler shape
+# AC-2: all 22 tools land on the context with correct toolset/handler shape
 # ---------------------------------------------------------------------
 
 
-async def test_loader_registers_21_tools() -> None:
+async def test_loader_registers_22_tools() -> None:
     ctx = _CapturingContext()
     register(ctx)
-    assert len(ctx.tool_calls) == 21, (
-        f"Expected exactly 21 tools, got {len(ctx.tool_calls)}: "
+    assert len(ctx.tool_calls) == 22, (
+        f"Expected exactly 22 tools, got {len(ctx.tool_calls)}: "
         f"{[c['name'] for c in ctx.tool_calls]}"
     )
     registered_names = {c["name"] for c in ctx.tool_calls}
@@ -205,7 +205,7 @@ async def test_loader_handles_missing_env_vars_gracefully(monkeypatch) -> None:
     ctx = _CapturingContext()
     register(ctx)  # must not raise
     assert len(ctx.platform_calls) == 1
-    assert len(ctx.tool_calls) == 21
+    assert len(ctx.tool_calls) == 22
 
 
 # ---------------------------------------------------------------------

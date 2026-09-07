@@ -20,7 +20,7 @@ sole entry point. It:
    ``required_env``, ``env_enablement_fn``, ``cron_deliver_env_var``,
    ``standalone_sender_fn``, ``emoji``, ``install_hint``,
    ``platform_hint``).
-2. Iterates the locked-21 tool surface from
+2. Iterates the locked-22 tool surface from
    ``chatlytics_hermes.tools.TOOLS`` and calls
    ``ctx.register_tool(name=, toolset="chatlytics", schema=, handler=)``
    for each, wrapping each handler via ``_make_tool_handler`` so the
@@ -29,7 +29,7 @@ sole entry point. It:
 
 The live-loader contract is verified by ``tests/test_live_loader.py``,
 which drives a ``PluginContext``-compatible recorder through
-``register(ctx)`` end-to-end and asserts the platform + 21 tools land
+``register(ctx)`` end-to-end and asserts the platform + 22 tools land
 correctly. That same file holds the strict-xfail regression tests for
 BL-01, HI-01, HI-03 surfaced by the v2.0 milestone-wide review
 (``.planning/v2.0-MILESTONE-CODE-REVIEW.md``); Phase 8 fixes them and
@@ -37,6 +37,6 @@ un-xfails the markers.
 """
 from .adapter import register
 
-__version__ = "4.6.0"
+__version__ = "4.7.0"
 
 __all__ = ["register", "__version__"]

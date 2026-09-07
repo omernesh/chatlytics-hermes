@@ -5,7 +5,7 @@
 Production-grade messaging through the [Chatlytics](https://chatlytics.ai)
 gateway -- text, all six media types (image, voice, video, document, animation,
 sticker), reactions, groups, channels, contacts, polls, labels, presence,
-profile. **21 Hermes tools, the full upstream `BasePlatformAdapter` contract,
+profile. **22 Hermes tools, the full upstream `BasePlatformAdapter` contract,
 end-to-end async.**
 
 [![PyPI](https://img.shields.io/pypi/v/chatlytics-hermes.svg)](https://pypi.org/project/chatlytics-hermes/) [![Python](https://img.shields.io/pypi/pyversions/chatlytics-hermes.svg)](https://pypi.org/project/chatlytics-hermes/) [![License](https://img.shields.io/pypi/l/chatlytics-hermes.svg)](LICENSE)
@@ -13,14 +13,14 @@ end-to-end async.**
 A first-class platform plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 One install hands your agent a fully-stocked WhatsApp toolbox -- a
 `BasePlatformAdapter` subclass implementing all required methods plus all six
-media variants, 21 Hermes tools auto-registered through `ctx.register_tool()`,
+media variants, 22 Hermes tools auto-registered through `ctx.register_tool()`,
 a durable long-poll inbound consumer (or an aiohttp webhook server living
 *inside* `connect()`), native exec-approval / clarify routing to the bot
 owner's DM, and a cron-delivery hook for scheduled sends.
 
 ## Status
 
-**Stable v4.5.8.** Requires `hermes-agent>=0.14,<1.0` (runs on 0.14.x through
+**Stable v4.7.0.** Requires `hermes-agent>=0.14,<1.0` (runs on 0.14.x through
 0.16.x — the v4.5.2/v4.5.3 hotfixes specifically target the hermes 0.16
 `PluginContext` and tool-registry dispatch shapes). Python 3.10+.
 
@@ -40,9 +40,9 @@ channel (see [Install](#install)). PyPI hosts the 3.x line only.
 ## Why chatlytics-hermes?
 
 - **Full surface, not a stub** -- every Chatlytics REST action exposed as a
-  Hermes tool. 21 tools covering send (text + 6 media), read, search,
-  directory, sessions, presence, profile, actions enumeration, health,
-  dispatch.
+  Hermes tool. 22 tools covering send (text + 6 media), read, search,
+  entity resolution, directory, sessions, presence, profile, actions
+  enumeration, health, dispatch.
 - **Survives the host** -- installs as a Hermes *directory plugin* under
   `$HERMES_HOME/plugins/`, so a hermes-agent update (`setup-hermes.sh`'s
   `rm -rf venv`) cannot wipe it. A no-downgrade guard at `register()` time
@@ -251,9 +251,15 @@ result = await ctx.tools.chatlytics_send(
 
 ## Tool catalog
 
-Twenty-one tools are registered under the `chatlytics` toolset, grouped by
+Twenty-two tools are registered under the `chatlytics` toolset, grouped by
 function. Full JSON schemas live in
 [`src/chatlytics_hermes/tools.py`](src/chatlytics_hermes/tools.py).
+
+**Looking up a contact, group or channel by name or phone? Use
+`chatlytics_resolve_entity` first** (see Directory / search below) — it
+returns ranked candidates with a confidence score and only ever names a
+single winner when the match is unambiguous, so the agent asks the user
+instead of guessing when it isn't sure.
 
 ### Messaging (10)
 
@@ -269,9 +275,20 @@ remote `mediaUrl` or a local `filePath`; local files are uploaded to the
 gateway's `/api/v1/upload` endpoint first and gated by the
 `CHATLYTICS_UPLOAD_ALLOWED_ROOTS` default-deny allowlist.
 
-### Directory / search (3)
+### Directory / search (4)
 
-`chatlytics_directory`, `chatlytics_search`, `chatlytics_actions`.
+`chatlytics_resolve_entity`, `chatlytics_directory`, `chatlytics_search`,
+`chatlytics_actions`.
+
+`chatlytics_resolve_entity` is the preferred way to find a single contact,
+group, or channel by fuzzy name or phone number before sending -- it wraps
+the gateway's `resolveTarget` action and returns ranked candidates plus a
+`message` field with a decisive natural-language verdict: "Best match: …"
+only when the server is confident about one candidate, otherwise "NO
+single match -- ask the user which one they mean:" followed by the ranked
+list. Use `chatlytics_directory`'s `search` param instead when you want to
+browse several candidates rather than resolve to one.
+
 `chatlytics_actions` is read-only -- it issues a **GET** against the
 gateway's action catalog and returns the list of dispatchable actions
 with their schemas. Use it when an agent needs to discover what actions

@@ -4710,7 +4710,8 @@ def _register_impl(ctx: Any) -> None:
     )
 
     # --- HERMES-05: tool surface -------------------------------------
-    # Iterate the locked-21 TOOLS registry and register each as a Hermes
+    # Iterate the locked-22 TOOLS registry (v4.7.0 added
+    # chatlytics_resolve_entity for issue #35) and register each as a Hermes
     # tool under the ``chatlytics`` toolset.  ``ctx`` from the v0.14
     # PluginContext exposes ``register_tool(name=, toolset=, schema=,
     # handler=, ...)`` (see ``plugins/spotify/__init__.py`` for the

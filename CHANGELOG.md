@@ -1,3 +1,23 @@
+## [4.7.0] - 2026-09-07
+
+### Added
+
+- **New tool `chatlytics_resolve_entity`** — finds a single WhatsApp
+  contact, group, or channel by fuzzy name or phone number, wrapping the
+  gateway's `resolveTarget` action. Fixes the Hermes half of GitHub issue
+  omernesh/chatlytics.ai#35: a bot could not reliably find a contact by
+  name because `chatlytics_directory` only ever "browses", so the agent
+  guessed from an unranked list and picked the wrong phone number. The
+  new tool returns ranked candidates with a confidence score plus a
+  `message` field carrying a decisive natural-language verdict — it says
+  "Best match: …" only when the server has positively identified a single
+  winner, and otherwise leads with "NO single match — ask the user which
+  one they mean:" so the agent is never tempted to treat the first
+  candidate as certain. Tool count is now locked at 22 (was 21).
+- `chatlytics_directory`'s description now points agents at
+  `chatlytics_resolve_entity` for a single best match by name, reserving
+  `chatlytics_directory` for browsing/filtering multiple candidates.
+
 ## 4.6.1 - 2026-09-03
 
 - Fixed: agent voice notes now send as real WhatsApp voice bubbles (push-to-talk). The adapter had been downgrading voice to a plain file attachment based on a stale assumption about the server's send types; the server has routed type=voice to /api/sendVoice since Phase 168 and now defaults audio transcoding on that path, so any source format becomes a proper voice bubble.

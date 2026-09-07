@@ -13,7 +13,7 @@
 #   3. ``pytest tests/`` reports zero failures.
 #   4. (HERMES-07) Live-loader integration: tests/test_live_loader.py
 #      drives the real PluginContext contract -- ``register(ctx)``
-#      registers the chatlytics platform and all 21 tools.
+#      registers the chatlytics platform and all 22 tools.
 #
 # Exits 0 on full success, non-zero otherwise.
 #
@@ -189,7 +189,7 @@ print(f\"entry-points OK: chatlytics in {names}\")
 
       echo "--- smoke step 4/4: live-loader integration ---"
       pytest tests/test_live_loader.py -q --no-header --tb=short
-      echo "live-loader: chatlytics platform + 21 tools registered"
+      echo "live-loader: chatlytics platform + 22 tools registered"
 
       echo "--- smoke PASS (cached) ---"
     '
@@ -230,7 +230,7 @@ print(f\"entry-points OK: chatlytics in {names}\")
 
     echo "--- smoke step 4/4: live-loader integration ---"
     pytest tests/test_live_loader.py -q --no-header --tb=short
-    echo "live-loader: chatlytics platform + 21 tools registered"
+    echo "live-loader: chatlytics platform + 22 tools registered"
 
     echo "--- smoke PASS ---"
   '

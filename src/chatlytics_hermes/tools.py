@@ -23,16 +23,21 @@ responses spread the gateway payload into the dict; ``False`` responses
 include ``"error"`` (str) and, on HTTP failures, ``"status_code"`` and
 ``"raw_response"``.
 
-Tool count is locked at **21** for HERMES-05; the registration test
-guards against accidental growth or shrinkage.  Sources:
+Tool count is locked at **22** (v4.7.0, issue #35); the registration
+test guards against accidental growth or shrinkage.  Sources:
 - 8 baseline tools from the Claude Code MCP bundle
   (``chatlytics-mcp.js`` at ``omernesh/chatlytics-claude-code``).
 - 10 messaging extensions specified in ROADMAP HERMES-05.
 - 5 media tools wrapping HERMES-04 adapter handlers.
 - (-2) overlap: ``chatlytics_send`` and ``chatlytics_read`` exist in
   both groups; counted once.
+- +1 ``chatlytics_resolve_entity`` (v4.7.0): a Hermes bot could not
+  reliably find a contact by name because the fuzzy ``resolveTarget``
+  action was not exposed as a tool, so agents fell back to browsing
+  ``chatlytics_directory`` and sometimes guessed the wrong candidate.
+  See GitHub issue omernesh/chatlytics.ai#35.
 
-= 8 + 10 + 5 - 2 = 21.
+= 8 + 10 + 5 - 2 + 1 = 22.
 """
 
 from __future__ import annotations
@@ -553,11 +558,21 @@ SEND_ANIMATION_SCHEMA = _media_schema(
 DIRECTORY_SCHEMA: Dict[str, Any] = {
     "$schema": _DRAFT,
     "title": "chatlytics_directory",
-    "description": "Browse WhatsApp contacts, groups, and newsletters.",
+    "description": (
+        "Browse or SEARCH WhatsApp contacts, groups and newsletters. Pass "
+        "`search=<name or phone fragment>` to filter (indexed, Hebrew ok). "
+        "For a single best match by name use chatlytics_resolve_entity."
+    ),
     "type": "object",
     "properties": {
         "type": {"type": "string", "enum": ["contact", "group", "newsletter"]},
-        "search": {"type": "string", "description": "Substring filter."},
+        "search": {
+            "type": "string",
+            "description": (
+                "Substring filter (indexed, Hebrew ok). For a single best "
+                "match by name, prefer chatlytics_resolve_entity instead."
+            ),
+        },
         "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
     },
     "required": [],
@@ -572,6 +587,43 @@ SEARCH_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
         "query": {"type": "string", "minLength": 1},
+    },
+    "required": ["query"],
+    "additionalProperties": False,
+}
+
+
+# HERMES issue #35 (v4.7.0): Sammie (a Hermes bot) could not find a contact
+# by name because chatlytics_directory is described as "Browse..." and the
+# real fuzzy resolver (server-side `resolveTarget` action) was not exposed
+# as a tool -- he used a partner's MCP instead, and his first guess was the
+# WRONG phone number. This schema/handler pair exposes `resolveTarget`
+# directly with a description written to stop that guess: the tool ONLY
+# ever says "this is the one" when the server has positively identified a
+# single winner (`best` non-null); otherwise the render leads with an
+# explicit "ask the user" instruction. See _render_resolve_entity below.
+RESOLVE_ENTITY_SCHEMA: Dict[str, Any] = {
+    "$schema": _DRAFT,
+    "title": "chatlytics_resolve_entity",
+    "description": (
+        "Find a WhatsApp contact, group or channel by name or phone BEFORE "
+        "sending. Returns ranked candidates with confidence. `best` is set "
+        "only when one candidate clearly wins; if it is null the match is "
+        "ambiguous or weak -- ask the user which candidate they mean, "
+        "never guess. Use this instead of browsing the directory."
+    ),
+    "type": "object",
+    "properties": {
+        "query": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Name or phone number to resolve.",
+        },
+        "type": {
+            "type": "string",
+            "enum": ["contact", "group", "channel", "auto"],
+            "description": "Restrict the search to one entity type. Default: auto (search everything).",
+        },
     },
     "required": ["query"],
     "additionalProperties": False,
@@ -971,6 +1023,96 @@ async def chatlytics_search(
     return await _post(client, "/api/v1/actions", body, timeout=_SEARCH_TIMEOUT)
 
 
+def _fmt_resolve_candidate(m: Dict[str, Any]) -> str:
+    """Render one resolveTarget candidate as a single readable clause."""
+    name = m.get("name") or m.get("jid") or "unknown"
+    mtype = m.get("type") or "contact"
+    ident = m.get("phone") or m.get("jid") or "?"
+    confidence = m.get("confidence")
+    conf_str = f"{confidence:.2f}" if isinstance(confidence, (int, float)) else "unknown"
+    return f"{name} ({mtype}, {ident}, confidence {conf_str})"
+
+
+def _render_resolve_entity(payload: Dict[str, Any]) -> str:
+    """Render a resolveTarget response as an unambiguous string for the LLM.
+
+    Issue #35: the failure mode was an agent treating an unranked list of
+    candidates as if the first one were "the" contact. This renderer is
+    deliberately conservative:
+
+    - ``best`` non-null (server positively identified one winner) ->
+      leads with "Best match: ...".
+    - ``best`` null but candidates exist (ambiguous/weak) -> leads with
+      "NO single match -- ask the user which one they mean:" and NEVER
+      says "Best match" anywhere in the string.
+    - no candidates at all (or explicit ``reason == "no_match"``) -> says
+      so and points at chatlytics_directory as the fallback.
+    - Older server (payload has none of best/ambiguous/reason -- ships
+      only ``matches``): only ever derive a best match when there is
+      exactly one candidate AND its confidence is >= 0.85. Otherwise the
+      list is treated as ambiguous, never guessed.
+    """
+    matches = payload.get("matches")
+    if not isinstance(matches, list):
+        matches = []
+
+    has_new_fields = any(k in payload for k in ("best", "ambiguous", "reason"))
+    best: Optional[Dict[str, Any]] = payload.get("best") if has_new_fields else None
+    reason = payload.get("reason")
+
+    if reason == "no_match" or not matches:
+        return (
+            "NO MATCH for the query. Try chatlytics_directory with "
+            "search=<name or phone fragment> to browse the directory instead."
+        )
+
+    if not has_new_fields and len(matches) == 1:
+        confidence = matches[0].get("confidence")
+        if isinstance(confidence, (int, float)) and confidence >= 0.85:
+            best = matches[0]
+
+    if best is not None:
+        others = [m for m in matches if m is not best]
+        lines = [f"Best match: {_fmt_resolve_candidate(best)}."]
+        if others:
+            lines.append(
+                f"{len(others)} other candidate(s): "
+                + "; ".join(_fmt_resolve_candidate(m) for m in others[:5])
+                + "."
+            )
+        return " ".join(lines)
+
+    lines = ["NO single match -- ask the user which one they mean:"]
+    for i, m in enumerate(matches[:10], start=1):
+        lines.append(f"{i}. {_fmt_resolve_candidate(m)}")
+    return "\n".join(lines)
+
+
+async def chatlytics_resolve_entity(
+    client: ChatlyticsClient,
+    *,
+    query: str,
+    type: Optional[str] = None,  # noqa: A002 -- matches chatlytics_directory field name
+) -> Dict[str, Any]:
+    """Resolve a fuzzy name/phone to a WhatsApp entity via the server's
+    ``resolveTarget`` action (v4.0+ contract; see docstring on
+    :func:`_render_resolve_entity`). Adds a ``message`` field carrying the
+    decisive natural-language render on success -- callers should read
+    that field rather than re-deriving their own verdict from ``matches``.
+    """
+    params: Dict[str, Any] = {"query": query}
+    if type:
+        params["type"] = type
+    body = {"action": "resolveTarget", "params": params}
+    # Same rationale as chatlytics_search (Bug 3): a fuzzy resolve can hit
+    # the same cold-cache search path server-side.
+    result = await _post(client, "/api/v1/actions", body, timeout=_SEARCH_TIMEOUT)
+    if not result.get("success"):
+        return result
+    result["message"] = _render_resolve_entity(result)
+    return result
+
+
 async def chatlytics_actions(client: ChatlyticsClient) -> Dict[str, Any]:
     """List the Chatlytics action catalog."""
     return await _get(client, "/api/v1/actions")
@@ -1161,7 +1303,9 @@ TOOLS: Tuple[Tuple[str, Dict[str, Any], Handler], ...] = (
     ("chatlytics_send_video",      SEND_VIDEO_SCHEMA,      chatlytics_send_video),
     ("chatlytics_send_file",       SEND_FILE_SCHEMA,       chatlytics_send_file),
     ("chatlytics_send_animation",  SEND_ANIMATION_SCHEMA,  chatlytics_send_animation),
-    # Directory / search (3)
+    # Directory / search (4) -- resolve_entity listed first: it is the
+    # preferred entry point for "find a contact" (issue #35).
+    ("chatlytics_resolve_entity", RESOLVE_ENTITY_SCHEMA, chatlytics_resolve_entity),
     ("chatlytics_directory",    DIRECTORY_SCHEMA,    chatlytics_directory),
     ("chatlytics_search",       SEARCH_SCHEMA,       chatlytics_search),
     ("chatlytics_actions",      ACTIONS_SCHEMA,      chatlytics_actions),
@@ -1171,10 +1315,11 @@ TOOLS: Tuple[Tuple[str, Dict[str, Any], Handler], ...] = (
     ("chatlytics_dispatch",     DISPATCH_SCHEMA,     chatlytics_dispatch),
 )
 
-# Locked count for HERMES-05.  The registration test fails loudly if this
-# drifts -- adding tools is a design decision, not a typo.
-assert len(TOOLS) == 21, (
-    f"Chatlytics tool surface drift: expected 21 tools, got {len(TOOLS)}"
+# Locked count -- bumped 21 -> 22 in v4.7.0 for chatlytics_resolve_entity
+# (issue #35). The registration test fails loudly if this drifts --
+# adding tools is a design decision, not a typo.
+assert len(TOOLS) == 22, (
+    f"Chatlytics tool surface drift: expected 22 tools, got {len(TOOLS)}"
 )
 
 

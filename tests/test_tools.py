@@ -27,6 +27,7 @@ from chatlytics_hermes.client import ChatlyticsClient
 from chatlytics_hermes.tools import (
     TOOLS,
     chatlytics_react,
+    chatlytics_resolve_entity,
     chatlytics_search,
     chatlytics_send,
 )
@@ -169,7 +170,194 @@ async def test_tool_returns_success_false_on_400(
 
 
 def test_tool_count_matches_claude_code_plugin_baseline() -> None:
-    """``len(TOOLS) >= 13`` and exactly ``21`` for HERMES-05."""
+    """``len(TOOLS) >= 13`` and exactly ``22`` (v4.7.0, issue #35)."""
     n = len(TOOLS)
     assert n >= 13, f"Expected at least 13 tools; got {n}"
-    assert n == 21, f"HERMES-05 locks the count at 21; got {n}"
+    assert n == 22, f"Tool count is locked at 22 (v4.7.0); got {n}"
+
+
+# --- issue #35: chatlytics_resolve_entity renders a decisive verdict --
+
+
+async def test_resolve_entity_calls_resolve_target_action(
+    client: ChatlyticsClient, mock_router: respx.MockRouter
+) -> None:
+    route = mock_router.post("/api/v1/actions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True,
+                "query": "Nesher",
+                "searchedTypes": ["contact"],
+                "matches": [],
+                "best": None,
+                "ambiguous": False,
+                "reason": "no_match",
+            },
+        )
+    )
+    result = await chatlytics_resolve_entity(client, query="Nesher")
+    assert result["success"] is True
+
+    body = _json.loads(route.calls.last.request.content)
+    assert body == {"action": "resolveTarget", "params": {"query": "Nesher"}}
+
+
+async def test_resolve_entity_passes_type_when_given(
+    client: ChatlyticsClient, mock_router: respx.MockRouter
+) -> None:
+    route = mock_router.post("/api/v1/actions").mock(
+        return_value=httpx.Response(
+            200, json={"success": True, "matches": [], "best": None, "reason": "no_match"}
+        )
+    )
+    await chatlytics_resolve_entity(client, query="Nesher", type="contact")
+    body = _json.loads(route.calls.last.request.content)
+    assert body["params"] == {"query": "Nesher", "type": "contact"}
+
+
+async def test_resolve_entity_best_match_renders_decisively(
+    client: ChatlyticsClient, mock_router: respx.MockRouter
+) -> None:
+    """``best`` non-null -> the message leads with "Best match" and does
+    not tell the caller to ask the user."""
+    mock_router.post("/api/v1/actions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True,
+                "matches": [
+                    {
+                        "jid": "9725001@c.us",
+                        "name": "Alice",
+                        "type": "contact",
+                        "confidence": 0.95,
+                        "phone": "+9725001",
+                    }
+                ],
+                "best": {
+                    "jid": "9725001@c.us",
+                    "name": "Alice",
+                    "type": "contact",
+                    "confidence": 0.95,
+                    "phone": "+9725001",
+                },
+                "ambiguous": False,
+                "reason": "single_best",
+            },
+        )
+    )
+    result = await chatlytics_resolve_entity(client, query="Alice")
+    assert result["success"] is True
+    assert "Best match: Alice" in result["message"]
+    assert "ask the user" not in result["message"]
+
+
+async def test_resolve_entity_ambiguous_asks_the_user(
+    client: ChatlyticsClient, mock_router: respx.MockRouter
+) -> None:
+    """``best`` null with candidates -> message must say "ask the user"
+    and must NEVER say "Best match" (issue #35's exact failure mode)."""
+    mock_router.post("/api/v1/actions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True,
+                "matches": [
+                    {"jid": "9725001@c.us", "name": "Alice", "type": "contact", "confidence": 0.6},
+                    {"jid": "9725002@c.us", "name": "Alicia", "type": "contact", "confidence": 0.55},
+                ],
+                "best": None,
+                "ambiguous": True,
+                "reason": "ambiguous",
+            },
+        )
+    )
+    result = await chatlytics_resolve_entity(client, query="Ali")
+    assert result["success"] is True
+    assert "ask the user" in result["message"]
+    assert "Best match" not in result["message"]
+    assert "Alice" in result["message"] and "Alicia" in result["message"]
+
+
+async def test_resolve_entity_no_match_suggests_directory(
+    client: ChatlyticsClient, mock_router: respx.MockRouter
+) -> None:
+    mock_router.post("/api/v1/actions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True,
+                "matches": [],
+                "best": None,
+                "ambiguous": False,
+                "reason": "no_match",
+            },
+        )
+    )
+    result = await chatlytics_resolve_entity(client, query="Nobody")
+    assert result["success"] is True
+    assert "chatlytics_directory" in result["message"]
+    assert "Best match" not in result["message"]
+
+
+async def test_resolve_entity_older_server_missing_new_fields_single_high_confidence(
+    client: ChatlyticsClient, mock_router: respx.MockRouter
+) -> None:
+    """Older server: no best/ambiguous/reason fields at all. Exactly one
+    match with confidence >= 0.85 is still safe to call "best"."""
+    mock_router.post("/api/v1/actions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True,
+                "matches": [
+                    {"jid": "9725001@c.us", "name": "Alice", "type": "contact", "confidence": 0.9}
+                ],
+            },
+        )
+    )
+    result = await chatlytics_resolve_entity(client, query="Alice")
+    assert "Best match: Alice" in result["message"]
+
+
+async def test_resolve_entity_older_server_low_confidence_is_ambiguous(
+    client: ChatlyticsClient, mock_router: respx.MockRouter
+) -> None:
+    """Older server, single match but confidence below the 0.85 bar ->
+    still treated as ambiguous, never guessed."""
+    mock_router.post("/api/v1/actions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True,
+                "matches": [
+                    {"jid": "9725001@c.us", "name": "Alice", "type": "contact", "confidence": 0.5}
+                ],
+            },
+        )
+    )
+    result = await chatlytics_resolve_entity(client, query="Alice")
+    assert "ask the user" in result["message"]
+    assert "Best match" not in result["message"]
+
+
+async def test_resolve_entity_older_server_multiple_matches_is_ambiguous(
+    client: ChatlyticsClient, mock_router: respx.MockRouter
+) -> None:
+    """Older server, multiple matches, no confidence contract -> ambiguous."""
+    mock_router.post("/api/v1/actions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True,
+                "matches": [
+                    {"jid": "9725001@c.us", "name": "Alice", "type": "contact"},
+                    {"jid": "9725002@c.us", "name": "Alicia", "type": "contact"},
+                ],
+            },
+        )
+    )
+    result = await chatlytics_resolve_entity(client, query="Ali")
+    assert "ask the user" in result["message"]
+    assert "Best match" not in result["message"]

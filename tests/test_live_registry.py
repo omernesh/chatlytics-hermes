@@ -104,6 +104,42 @@ async def test_health_and_login_work_on_longpoll_only_gateway() -> None:
     assert "not connected" in stale["error"]
 
 
+# --- v4.5.7 regression guard: connect() tolerates the framework's ----------
+# --- is_reconnect keyword (and any future kwarg) ----------------------------
+
+
+async def test_connect_accepts_is_reconnect_keyword() -> None:
+    """The Hermes gateway framework calls ``adapter.connect(*,
+    is_reconnect=...)`` on every (re)connect. Before v4.5.7 the signature
+    was ``connect(self)`` with no such parameter: cold boot worked (no
+    kwarg passed), but the FIRST reconnect raised ``TypeError:
+    ChatlyticsAdapter.connect() got an unexpected keyword argument
+    'is_reconnect'`` -- which the framework could not recover from, so the
+    inbound longpoll consumer stayed dead until a full gateway restart
+    (observed in production: 55h dead consumer -> bot_longpoll_queue_undrained
+    alert). This locks in the fix so a future edit to connect()'s signature
+    cannot silently reintroduce the crash-loop.
+    """
+    adapter = _make_adapter("longpoll")
+    with respx.mock(base_url=BASE_URL, assert_all_called=False) as router:
+        _mock_gateway(router)
+        # The literal call shape the gateway framework issues on reconnect.
+        assert await adapter.connect(is_reconnect=True) is True
+        await adapter.disconnect()
+
+    # Defensive: connect() must also swallow any kwarg NOT literally named
+    # is_reconnect, so a future framework addition doesn't reopen this bug.
+    import inspect
+
+    sig = inspect.signature(ChatlyticsAdapter.connect)
+    assert any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    ), (
+        "connect() must accept **kwargs so future framework-injected "
+        "keywords cannot reintroduce the v4.5.6 reconnect TypeError"
+    )
+
+
 async def test_bare_ctx_without_live_adapter_still_reports_not_connected() -> None:
     """No connect() ever happened: the registry fallback returns None and
     the canonical not-connected failure shape is preserved."""
