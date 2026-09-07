@@ -43,6 +43,7 @@ test guards against accidental growth or shrinkage.  Sources:
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
@@ -1033,6 +1034,61 @@ def _fmt_resolve_candidate(m: Dict[str, Any]) -> str:
     return f"{name} ({mtype}, {ident}, confidence {conf_str})"
 
 
+def _unwrap_resolve_target_result(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Unwrap the server's dispatch envelope for the ``resolveTarget`` action.
+
+    Bug (found live on hpg6, 2026-09-07): the real server's
+    ``POST /api/v1/actions`` response for ``resolveTarget`` is NOT the flat
+    ``{matches, best, ambiguous, reason, ...}`` shape this module was
+    written against. It is a dispatch envelope::
+
+        {"success": true, "session_used": "...",
+         "result": {"content": [{"type": "text", "text": "<JSON string>"}],
+                     "details": {}}}
+
+    ...where the actual ``ResolveTargetResult`` payload is JSON-encoded
+    inside ``result.content[0].text``. Reading ``matches``/``best`` at the
+    top level (the pre-fix behavior) silently found nothing and always
+    rendered "NO MATCH", even for a query with real candidates.
+
+    No prior unwrap helper existed anywhere in this package or in the
+    sibling Claude Code MCP bundle (``chatlytics-mcp.js``) to reuse --
+    every existing ``/api/v1/actions`` caller here only reads the
+    top-level ``success`` flag, so this is genuinely the first caller
+    that needs the payload's structured content.
+
+    Returns the flat matches/best/... dict on success. Tolerates a
+    server that already returns the flat shape directly (checked first,
+    so this stays forward/backward compatible if the server contract
+    changes). Returns ``None`` -- never raises -- when the envelope is
+    present but its content can't be parsed as JSON, so a malformed
+    response degrades to a diagnostic message instead of a crash.
+    """
+    if any(k in payload for k in ("matches", "best", "reason")):
+        return payload
+
+    result_obj = payload.get("result")
+    if not isinstance(result_obj, dict):
+        return None
+    content = result_obj.get("content")
+    if not isinstance(content, list):
+        return None
+
+    for item in content:
+        if not (isinstance(item, dict) and item.get("type") == "text"):
+            continue
+        text = item.get("text")
+        if not isinstance(text, str):
+            continue
+        try:
+            parsed = json.loads(text)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
 def _render_resolve_entity(payload: Dict[str, Any]) -> str:
     """Render a resolveTarget response as an unambiguous string for the LLM.
 
@@ -1099,6 +1155,12 @@ async def chatlytics_resolve_entity(
     :func:`_render_resolve_entity`). Adds a ``message`` field carrying the
     decisive natural-language render on success -- callers should read
     that field rather than re-deriving their own verdict from ``matches``.
+
+    The server wraps the actual payload in a dispatch envelope (see
+    :func:`_unwrap_resolve_target_result`); this unwraps it before
+    rendering and surfaces the unwrapped fields (``matches``, ``best``,
+    ``ambiguous``, ``reason``, ``searchedTypes``, ``query``) at the top
+    level of the returned dict alongside ``message``.
     """
     params: Dict[str, Any] = {"query": query}
     if type:
@@ -1109,7 +1171,18 @@ async def chatlytics_resolve_entity(
     result = await _post(client, "/api/v1/actions", body, timeout=_SEARCH_TIMEOUT)
     if not result.get("success"):
         return result
-    result["message"] = _render_resolve_entity(result)
+    unwrapped = _unwrap_resolve_target_result(result)
+    if unwrapped is None:
+        result["message"] = (
+            "Could not read the server's resolveTarget response (unexpected "
+            "shape). Try chatlytics_directory with search=<name or phone "
+            "fragment> instead."
+        )
+        return result
+    for key in ("matches", "best", "ambiguous", "reason", "searchedTypes", "query"):
+        if key in unwrapped:
+            result[key] = unwrapped[key]
+    result["message"] = _render_resolve_entity(unwrapped)
     return result
 
 

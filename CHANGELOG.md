@@ -1,3 +1,21 @@
+## [4.7.1] - 2026-09-07
+
+### Fixed
+
+- **fix: resolve_entity read the server response at the wrong level and
+  always reported no match.** The real server's `POST /api/v1/actions`
+  response for `resolveTarget` is a dispatch envelope
+  (`{success, session_used, result: {content: [{type:"text", text:
+  "<JSON>"}], details: {}}}`), not the flat `{matches, best, ...}` shape
+  `chatlytics_resolve_entity` was written against -- the actual candidate
+  list is JSON-encoded inside `result.content[0].text`. Confirmed live on
+  hpg6 (Sammie's real token, query "Nesher"): the tool always rendered "NO
+  MATCH" even though the server had real candidates. Added
+  `_unwrap_resolve_target_result` to parse the envelope (tolerating a
+  future server that returns the flat shape directly, and degrading to a
+  clear diagnostic message -- never a crash -- if the envelope's content
+  isn't valid JSON).
+
 ## [4.7.0] - 2026-09-07
 
 ### Added

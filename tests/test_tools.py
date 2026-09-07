@@ -361,3 +361,95 @@ async def test_resolve_entity_older_server_multiple_matches_is_ambiguous(
     result = await chatlytics_resolve_entity(client, query="Ali")
     assert "ask the user" in result["message"]
     assert "Best match" not in result["message"]
+
+
+# --- live-bug regression (found on hpg6, 2026-09-07): the real server -----
+# --- wraps the resolveTarget payload in a dispatch envelope --------------
+
+
+def _wrapped_response(inner: Dict[str, Any]) -> httpx.Response:
+    """Build the real server's dispatch-envelope response shape."""
+    return httpx.Response(
+        200,
+        json={
+            "success": True,
+            "session_used": "3cf11776_logan",
+            "result": {
+                "content": [{"type": "text", "text": _json.dumps(inner)}],
+                "details": {},
+            },
+        },
+    )
+
+
+async def test_resolve_entity_unwraps_dispatch_envelope_ambiguous(
+    client: ChatlyticsClient, mock_router: respx.MockRouter
+) -> None:
+    """2 matches at confidence 0.8 inside the envelope -> ambiguous render."""
+    mock_router.post("/api/v1/actions").mock(
+        return_value=_wrapped_response(
+            {
+                "query": "Nesher",
+                "searchedTypes": ["contact"],
+                "matches": [
+                    {"jid": "9725001@c.us", "name": "Nesher A", "type": "contact", "confidence": 0.8},
+                    {"jid": "9725002@c.us", "name": "Nesher B", "type": "contact", "confidence": 0.8},
+                ],
+                "best": None,
+                "ambiguous": True,
+                "reason": "ambiguous",
+            }
+        )
+    )
+    result = await chatlytics_resolve_entity(client, query="Nesher")
+    assert result["success"] is True
+    assert "ask the user" in result["message"]
+    assert "Best match" not in result["message"]
+    assert len(result["matches"]) == 2
+
+
+async def test_resolve_entity_unwraps_dispatch_envelope_best_match(
+    client: ChatlyticsClient, mock_router: respx.MockRouter
+) -> None:
+    """``best`` set inside the envelope -> "Best match" render."""
+    mock_router.post("/api/v1/actions").mock(
+        return_value=_wrapped_response(
+            {
+                "query": "Nesher",
+                "matches": [
+                    {"jid": "9725001@c.us", "name": "Nesher A", "type": "contact", "confidence": 0.95}
+                ],
+                "best": {"jid": "9725001@c.us", "name": "Nesher A", "type": "contact", "confidence": 0.95},
+                "ambiguous": False,
+                "reason": "single_best",
+            }
+        )
+    )
+    result = await chatlytics_resolve_entity(client, query="Nesher")
+    assert result["success"] is True
+    assert "Best match: Nesher A" in result["message"]
+    assert result["best"]["name"] == "Nesher A"
+
+
+async def test_resolve_entity_envelope_with_non_json_text_does_not_crash(
+    client: ChatlyticsClient, mock_router: respx.MockRouter
+) -> None:
+    """Envelope present but content[0].text is not valid JSON -> a clear
+    diagnostic message, never a raised exception."""
+    mock_router.post("/api/v1/actions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True,
+                "session_used": "3cf11776_logan",
+                "result": {
+                    "content": [{"type": "text", "text": "not json at all"}],
+                    "details": {},
+                },
+            },
+        )
+    )
+    result = await chatlytics_resolve_entity(client, query="Nesher")
+    assert result["success"] is True
+    assert "Could not read" in result["message"]
+    assert "Best match" not in result["message"]
