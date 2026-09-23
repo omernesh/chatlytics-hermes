@@ -946,6 +946,16 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         ).strip().lower()
         self.inject_sender_ids: bool = _ids_raw in ("1", "true", "yes", "on")
 
+        # Media markers (opt-in): append a machine-readable "[media: <type> |
+        # id: <message_id>]" marker to inbound messages that carry media, so
+        # agent sessions know a file arrived (the envelope carries has_media /
+        # media_type / message_id; the media itself is fetched out-of-band).
+        _markers_raw = (
+            os.getenv("CHATLYTICS_INJECT_MEDIA_MARKERS")
+            or str(extra.get("inject_media_markers") or "")
+        ).strip().lower()
+        self.inject_media_markers: bool = _markers_raw in ("1", "true", "yes", "on")
+
         # HTTP client is constructed lazily on ``connect()`` so that
         # misconfigured adapters (empty base_url/api_key) raise only at
         # connect time, never at registration time.
@@ -1889,6 +1899,22 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     import dataclasses as _dc
 
                     event = _dc.replace(event, text=f"[{_sid}] {_txt}")
+
+        # Media markers (opt-in): make "this message carried a file" visible to
+        # the agent. Appended at the END so the sender-id prefix stays first.
+        # The media bytes stay out-of-band (envelope carries no URL by design).
+        if getattr(self, "inject_media_markers", False) and env.get("has_media"):
+            _mtype = str(env.get("media_type") or "media")
+            _mid = env.get("message_id")
+            _marker = f"[media: {_mtype}" + (f" | id: {_mid}" if _mid else "") + "]"
+            _cur = getattr(event, "text", "") or ""
+            _new = (f"{_cur}\n{_marker}" if _cur else _marker)
+            try:
+                event.text = _new
+            except Exception:  # frozen MessageEvent — rebuild a copy
+                import dataclasses as _dc2
+
+                event = _dc2.replace(event, text=_new)
 
         # v4.5.0 (chatlytics v5.4 P8): per-channel prompt injection.
         # ``MessageEvent.channel_prompt`` is the harness's NATIVE per-turn
