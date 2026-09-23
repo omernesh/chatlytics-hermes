@@ -52,6 +52,7 @@ first):
 | `CHATLYTICS_STATUS_BUBBLE_AFTER_S` | no | Seconds an agent turn must run before the "working…" bubble fires (default `8`). Values `<= 0` disable the bubble. |
 | `CHATLYTICS_STATUS_BUBBLE_TEXT` | no | Text of the progress bubble (default `⏳ working…`). |
 | `CHATLYTICS_UPLOAD_ALLOWED_ROOTS` | no | OS-pathsep-separated absolute paths that media tools may read from disk. **Default-deny when unset.** See below. |
+| `CHATLYTICS_INJECT_SENDER_IDS` | no | When truthy (`1`/`true`/`yes`/`on`), prefixes every inbound message's text with the sender's platform id — `[972544329000@c.us] hello` — so agent sessions can identify WHO is speaking (display names are absent/spoofable on WhatsApp; the envelope `sender_jid` is the platform truth). Per-profile opt-in; `extra.inject_sender_ids` equivalent. |
 
 \* One of `CHATLYTICS_BOT_TOKEN` / `CHATLYTICS_API_KEY` must be set for the
 plugin to do anything useful.

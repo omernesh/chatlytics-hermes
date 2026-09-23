@@ -323,6 +323,23 @@ _MEDIA_TYPE_MAP: Dict[str, str] = {
 # {text,image,video,file}; voice (a true push-to-talk bubble) is NOT reachable
 # through proxy-send, so it degrades to ``file`` (best available — the audio
 # still delivers as a downloadable attachment) and animation rides ``video``.
+_HEBREW_RE = re.compile(r"[\u0590-\u05FF]")
+
+
+def _rtl_align(text: str) -> str:
+    """Prepend an RLM (U+200F) so Hebrew-bearing texts render RTL-aligned.
+
+    Omer directive (2026-09-23): Hebrew replies must ALWAYS be right-aligned
+    in WhatsApp. The invisible Right-to-Left Mark forces the paragraph
+    direction to RTL even when the text leads with Latin/digits/emoji that
+    would otherwise resolve the paragraph LTR. English-only texts are
+    untouched; already-prefixed texts are not double-marked.
+    """
+    if text and _HEBREW_RE.search(text) and not text.startswith("\u200f"):
+        return "\u200f" + text
+    return text
+
+
 _MEDIA_KIND_TO_SEND_TYPE: Dict[str, str] = {
     "image": "image",
     "image_file": "image",
@@ -918,6 +935,17 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                         exc,
                     )
 
+        # Identity bridge (opt-in): prefix inbound message text with the
+        # sender's authoritative platform id so an agent session always sees
+        # WHO is speaking (display names are absent on WhatsApp; the envelope
+        # sender_jid is the platform truth). Env CHATLYTICS_INJECT_SENDER_IDS
+        # or extra.inject_sender_ids.
+        _ids_raw = (
+            os.getenv("CHATLYTICS_INJECT_SENDER_IDS")
+            or str(extra.get("inject_sender_ids") or "")
+        ).strip().lower()
+        self.inject_sender_ids: bool = _ids_raw in ("1", "true", "yes", "on")
+
         # HTTP client is constructed lazily on ``connect()`` so that
         # misconfigured adapters (empty base_url/api_key) raise only at
         # connect time, never at registration time.
@@ -1248,7 +1276,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         """
         body: Dict[str, Any] = {
             "chatId": chat_id,
-            "text": text,
+            "text": _rtl_align(text),
         }
         # P-19 fix (carried forward): Chatlytics gateway's /api/v1/send
         # REQUIRES `session` (the WAHA session name) in legacy (api_key) mode.
@@ -1846,6 +1874,22 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         self.register_chat_session(body["chatId"], body["session"])
         event = normalize_payload(body, self.platform)
 
+        # Identity bridge (opt-in): prefix the message text with the sender's
+        # authoritative platform id so the agent always sees WHO is speaking —
+        # the envelope's sender_jid is the platform truth (display names are
+        # spoofable and often absent). Gated by CHATLYTICS_INJECT_SENDER_IDS /
+        # extra.inject_sender_ids so only opted-in profiles change behavior.
+        if getattr(self, "inject_sender_ids", False):
+            _sid = body.get("senderId")
+            _txt = getattr(event, "text", "") or ""
+            if _sid and _txt:
+                try:
+                    event.text = f"[{_sid}] {_txt}"
+                except Exception:  # frozen MessageEvent — rebuild a copy
+                    import dataclasses as _dc
+
+                    event = _dc.replace(event, text=f"[{_sid}] {_txt}")
+
         # v4.5.0 (chatlytics v5.4 P8): per-channel prompt injection.
         # ``MessageEvent.channel_prompt`` is the harness's NATIVE per-turn
         # ephemeral system-prompt channel — the runner combines it into the
@@ -2325,7 +2369,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             return _QPOST_FAILED
         body: Dict[str, Any] = {
             "type": qtype,
-            "text": text,
+            "text": _rtl_align(text),
             "request_id": request_id,
             "chat_id": chat_id,
         }
@@ -3959,7 +4003,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         body["type"] = send_type
         body["file"] = file_field
         if caption:
-            body["caption"] = caption
+            body["caption"] = _rtl_align(caption)
         # A caller-supplied display filename overrides the file-field default
         # for documents (the recipient sees this name on the attachment).
         if filename and media_kind in {"document", "image_file"}:
@@ -4411,7 +4455,7 @@ async def _standalone_send(text: str, **kwargs: Any) -> Dict[str, Any]:
         ) as client:
             response = await client.post(
                 "/api/v1/send",
-                json={"chatId": home_channel, "text": text},
+                json={"chatId": home_channel, "text": _rtl_align(text)},
             )
     except httpx.RequestError as exc:
         return {"success": False, "error": f"Transport error: {exc}"}
