@@ -582,7 +582,12 @@ def _envelope_to_body(
     """
     return {
         "chatId": env["entity_jid"],          # required by normalize_payload
-        "text": env.get("text", "") if text is None else text,
+        # Prefer the server's agent-facing copy (`agent_text`) — it carries the
+        # data-framing directive + the media fold (`[media] mime=.. url=<bot
+        # media proxy>` for file messages). `text` is the raw ROUTING body
+        # (may be empty for captionless media); the server intends agent_text
+        # as "the copy the agent receives" (v4.2 INJ-08 / CR-01).
+        "text": (env.get("agent_text") or env.get("text", "")) if text is None else text,
         "senderId": env.get("sender_jid"),
         "chatType": (
             "channel"
