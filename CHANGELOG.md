@@ -1,3 +1,20 @@
+## [4.7.3] - 2026-10-05
+
+### Fixed
+
+- **fix: progress bubble could leak past its turn and be edited by a
+  later reply (the reply surfaced "before" the user's message).** If the
+  bubble timer fired in the window AFTER the turn's final `send()` (so
+  nothing consumed it) but BEFORE typing teardown, the sent "working…"
+  bubble stayed pending in `_progress_bubbles`; the next turn for that
+  chat — within the 600 s TTL — was then (a) blocked from sending its own
+  bubble by the one-bubble-per-turn guard and (b) consumed the STALE id
+  as `edit_message_id`, editing the OLD bubble in place, so the reply
+  appeared above its triggering message, marked "Edited" (confirmed live
+  on WhatsApp 2026-10-05). Bubbles are now dropped at every turn boundary
+  (start and end of `_keep_typing`), so a stale bubble can never be
+  consumed by a later turn.
+
 ## [4.7.2] - 2026-09-07
 
 ### Fixed

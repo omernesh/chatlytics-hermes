@@ -169,7 +169,9 @@ _UNKNOWN_CONTROL_WARN_CAP: int = 64
 # the ONE un-consumed "working…" bubble per chat. LRU-evicted past the cap;
 # entries older than the TTL are treated as stale (the turn they belonged to
 # is long gone — editing a 10-minute-old bubble into a fresh reply would be
-# confusing, so the reply falls back to a plain send).
+# confusing, so the reply falls back to a plain send). v4.7.3: turn-boundary
+# drops in ``_keep_typing`` (start + end) mean a bubble can never survive to
+# a later turn — the TTL remains only as a hard bound for the send-time pop.
 _PROGRESS_BUBBLE_MAX: int = 100
 _PROGRESS_BUBBLE_TTL_S: float = 600.0
 
@@ -1362,6 +1364,24 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             self._progress_bubbles.pop(chat_id, None)
             return False
         return True
+
+    def _drop_leftover_progress_bubble(self, chat_id: str) -> None:
+        """Drop any still-pending bubble for ``chat_id`` unconditionally.
+
+        v4.7.3 fix: called at turn boundaries (start and end of
+        :meth:`_keep_typing`). A bubble still pending when its own turn is
+        over can never be legitimately consumed — the turn's ``send()``
+        already ran before typing teardown — and a bubble left over from a
+        previous turn must never be edited by a newer reply (editing it in
+        place makes the reply appear "before" the user's triggering
+        message). No TTL check: at a turn boundary every entry is a
+        leftover by definition.
+        """
+        if self._progress_bubbles.pop(chat_id, None) is not None:
+            logger.debug(
+                "leftover progress bubble for chat %s dropped (turn boundary)",
+                chat_id,
+            )
 
     @staticmethod
     def _extract_message_id(payload: Any) -> Optional[str]:
@@ -4309,6 +4329,14 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # the SAME stop_event and posts the ONE "working…" bubble only if
         # the turn outlives the threshold. Fast turns ⇒ timer exits on
         # stop_event ⇒ zero new requests (byte-identical to v4.3.0).
+        #
+        # v4.7.3 fix: turn boundary (START) — a bubble still pending from
+        # a PREVIOUS turn is a leftover (its own turn's send() already ran,
+        # so it can never be consumed legitimately). Drop it now so the
+        # one-per-turn guard cannot suppress THIS turn's bubble, and so
+        # this turn's send() can never edit the stale bubble in place
+        # (the live "reply appears BEFORE the user's message" bug).
+        self._drop_leftover_progress_bubble(chat_id)
         progress_task: Optional[asyncio.Task] = None
         if self.status_edit_in_place and self.status_bubble_after_s > 0:
             progress_task = asyncio.create_task(
@@ -4363,6 +4391,14 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 progress_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await progress_task
+            # v4.7.3 fix: turn boundary (END). AFTER the cancel/await above
+            # (so no in-flight store can race this). The turn's send()
+            # already ran before this finally, so a still-pending bubble is
+            # a race leak — the timer fired in the send→teardown window and
+            # nothing consumed it. Left behind, the NEXT turn within the
+            # TTL would edit it in place and the reply would surface above
+            # the user's triggering message.
+            self._drop_leftover_progress_bubble(chat_id)
 
     @contextlib.asynccontextmanager
     async def _typing_scope(self, chat_id: str, interval: float = 30.0):

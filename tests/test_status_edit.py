@@ -13,7 +13,11 @@ Covers the gateway half of the P7 feature:
   ``edit_message_id``;
 - ``status_edit_in_place: False`` ⇒ no bubble, no edit (v4.3.0 behavior);
 - reserved-key rejection for ``edit_message_id`` / ``progress`` metadata;
-- bounded LRU eviction + staleness TTL of the per-chat bubble memo.
+- bounded LRU eviction + staleness TTL of the per-chat bubble memo;
+- v4.7.3 turn-boundary drops: a leftover bubble from a previous turn is
+  dropped at the next turn's start, and a bubble leaked by the
+  send→teardown race is dropped at turn end — in both cases the next
+  ``send()`` is a plain send (never edits a stale bubble).
 
 respx-mocked like tests/test_outbound.py; asyncio_mode = auto.
 """
@@ -178,8 +182,16 @@ async def test_slow_turn_sends_one_bubble_then_edits_reply(
     )
 
     await adapter.connect()
-    # Turn outlives the 0.05 s threshold -> exactly one bubble.
-    await run_turn(adapter, turn_duration=FAST_THRESHOLD * 6)
+    # Turn outlives the 0.05 s threshold -> exactly one bubble. The base
+    # class delivers the reply BEFORE it stops the typing task (see
+    # gateway/platforms/base.py), so send() below happens while the turn
+    # is still live — v4.7.3's turn-boundary drops must not disturb this
+    # consume path.
+    stop = asyncio.Event()
+    task = asyncio.create_task(
+        adapter._keep_typing(CHAT_ID, interval=60.0, stop_event=stop)
+    )
+    await asyncio.sleep(FAST_THRESHOLD * 6)
 
     bodies = send_bodies(send_route)
     assert len(bodies) == 1, "exactly ONE bubble POST per turn"
@@ -202,6 +214,14 @@ async def test_slow_turn_sends_one_bubble_then_edits_reply(
     final_body = send_bodies(send_route)[-1]
     assert final_body["edit_message_id"] == "true_chat_bubble-1"
     assert "progress" not in final_body
+
+    # Turn teardown (the base class stops the typing task after delivery).
+    stop.set()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
     # Pending entry was POPPED — a second send is plain.
     assert CHAT_ID not in adapter._progress_bubbles
@@ -227,6 +247,92 @@ async def test_no_second_bubble_when_one_is_pending(
     assert len(send_route.calls) == 1
     await adapter._send_progress_bubble(CHAT_ID)
     assert len(send_route.calls) == 1, "second bubble suppressed"
+    await adapter.disconnect()
+
+
+# --- v4.7.3: turn-boundary drops (cross-turn + race leak) -------------------
+
+
+async def test_leftover_bubble_dropped_at_next_turn_start(
+    mock_router: respx.MockRouter,
+) -> None:
+    """A bubble still pending when a NEW turn starts belongs to an older
+    turn (the live leak: the timer fired after that turn's send). The new
+    turn must drop it: the one-per-turn guard no longer suppresses the new
+    turn, and the new turn's send() must NOT edit the stale bubble — that
+    is what made a reply surface "before" the user's message."""
+    adapter = make_adapter()
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    mock_router.post("/api/v1/typing").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    send_route = mock_router.post("/api/v1/send").mock(
+        return_value=httpx.Response(
+            200, json={"success": True, "message_id": "bub-x"}
+        )
+    )
+    await adapter.connect()
+
+    # Simulate the leak: a bubble from a finished earlier turn is pending.
+    adapter._store_progress_bubble(CHAT_ID, "stale-bubble")
+    assert adapter._has_pending_progress_bubble(CHAT_ID) is True
+
+    # Next turn (fast) — the drop happens at the turn boundary.
+    await run_turn(adapter, turn_duration=0.0)
+
+    assert CHAT_ID not in adapter._progress_bubbles
+
+    result = await adapter.send(CHAT_ID, "fresh reply")
+    assert result.success is True
+    assert all(
+        "edit_message_id" not in body for body in send_bodies(send_route)
+    )
+    await adapter.disconnect()
+
+
+async def test_race_leak_dropped_at_turn_end(
+    mock_router: respx.MockRouter,
+) -> None:
+    """The race: the bubble timer fires after the turn's send() already
+    ran (nothing consumed it) but before typing teardown. The turn-end
+    drop must remove the leaked bubble so no later reply can edit it."""
+    adapter = make_adapter()
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    mock_router.post("/api/v1/typing").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    send_route = mock_router.post("/api/v1/send").mock(
+        return_value=httpx.Response(
+            200, json={"success": True, "message_id": "bub-race"}
+        )
+    )
+    await adapter.connect()
+
+    stop = asyncio.Event()
+    task = asyncio.create_task(
+        adapter._keep_typing(CHAT_ID, interval=60.0, stop_event=stop)
+    )
+    # Let the timer fire the bubble (turn "outlives" the threshold) while
+    # simulating that the turn's send already happened.
+    await asyncio.sleep(FAST_THRESHOLD * 6)
+    assert len(send_route.calls) == 1
+    assert _json.loads(send_route.calls[0].request.content)["progress"] is True
+    assert CHAT_ID in adapter._progress_bubbles, "bubble should have fired"
+
+    # Turn ends: stop + cancel/reap exactly like the base class does.
+    stop.set()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    # Turn-end drop removed the leaked bubble; the next send is plain.
+    assert CHAT_ID not in adapter._progress_bubbles
+
+    result = await adapter.send(CHAT_ID, "next answer")
+    assert result.success is True
+    assert "edit_message_id" not in send_bodies(send_route)[-1]
     await adapter.disconnect()
 
 
