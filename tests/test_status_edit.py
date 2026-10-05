@@ -723,3 +723,138 @@ def test_has_pending_progress_bubble_evicts_stale() -> None:
     )
     assert adapter._has_pending_progress_bubble(CHAT_ID) is False
     assert CHAT_ID not in adapter._progress_bubbles
+
+
+# --- v4.7.4: delete on drop, shielded post, per-turn ownership -------------
+
+
+def _mock_basics(mock_router, mid="bub-1", actions_status=200):
+    mock_router.get("/health").mock(return_value=httpx.Response(200, json={}))
+    mock_router.post("/api/v1/typing").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    send_route = mock_router.post("/api/v1/send").mock(
+        return_value=httpx.Response(200, json={"success": True, "message_id": mid})
+    )
+    actions_route = mock_router.post("/api/v1/actions").mock(
+        return_value=httpx.Response(actions_status, json={"success": True})
+    )
+    return send_route, actions_route
+
+
+def _unsends(actions_route):
+    bodies = [_json.loads(c.request.content) for c in actions_route.calls]
+    return [b for b in bodies if b.get("action") == "unsend"]
+
+
+async def test_start_of_turn_drop_removes_and_deletes_leftover(mock_router) -> None:
+    """Goes RED if the start-of-turn drop is removed: the stale bubble would
+    still be pending (and never unsent) after the next turn starts."""
+    adapter = make_adapter()
+    _, actions = _mock_basics(mock_router)
+    await adapter.connect()
+    adapter._store_progress_bubble(CHAT_ID, "stale-bubble", owner="dead-turn")
+
+    stop = asyncio.Event()
+    task = asyncio.create_task(
+        adapter._keep_typing(CHAT_ID, interval=60.0, stop_event=stop)
+    )
+    await asyncio.sleep(0.01)  # well before FAST_THRESHOLD: no new bubble
+    assert CHAT_ID not in adapter._progress_bubbles
+    unsends = _unsends(actions)
+    assert [u["messageId"] for u in unsends] == ["stale-bubble"]
+    assert unsends[0]["chatId"] == CHAT_ID
+    stop.set()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    await adapter.disconnect()
+
+
+async def test_turn_end_drop_deletes_race_leaked_bubble(mock_router) -> None:
+    adapter = make_adapter()
+    send_route, actions = _mock_basics(mock_router, mid="bub-race")
+    await adapter.connect()
+    await run_turn(adapter, turn_duration=FAST_THRESHOLD * 6)
+    assert len(send_route.calls) == 1
+    assert [u["messageId"] for u in _unsends(actions)] == ["bub-race"]
+    assert CHAT_ID not in adapter._progress_bubbles
+    await adapter.disconnect()
+
+
+async def test_delete_failure_never_raises_or_blocks(mock_router, caplog) -> None:
+    adapter = make_adapter()
+    _mock_basics(mock_router, actions_status=500)
+    await adapter.connect()
+    adapter._store_progress_bubble(CHAT_ID, "stale-bubble")
+    with caplog.at_level(logging.WARNING):
+        await adapter._drop_leftover_progress_bubble(CHAT_ID, "t")
+    assert CHAT_ID not in adapter._progress_bubbles
+    assert any("could not be deleted" in r.message for r in caplog.records)
+
+    mock_router.post("/api/v1/actions").mock(side_effect=httpx.ConnectError("x"))
+    adapter._store_progress_bubble(CHAT_ID, "stale-2")
+    await adapter._drop_leftover_progress_bubble(CHAT_ID, "t")  # no raise
+    assert CHAT_ID not in adapter._progress_bubbles
+    await adapter.disconnect()
+
+
+async def test_cancel_during_inflight_bubble_post_records_then_deletes(
+    mock_router,
+) -> None:
+    """Turn ends while the bubble POST is in flight: the id must still be
+    recorded (shielded post) so the turn-end drop can delete it."""
+    adapter = make_adapter()
+    _, actions = _mock_basics(mock_router, mid="bub-inflight")
+
+    async def slow_send(request):
+        await asyncio.sleep(0.3)
+        return httpx.Response(
+            200, json={"success": True, "message_id": "bub-inflight"}
+        )
+
+    mock_router.post("/api/v1/send").mock(side_effect=slow_send)
+    await adapter.connect()
+
+    stop = asyncio.Event()
+    task = asyncio.create_task(
+        adapter._keep_typing(CHAT_ID, interval=60.0, stop_event=stop)
+    )
+    await asyncio.sleep(FAST_THRESHOLD + 0.1)  # timer is inside the POST now
+    task.cancel()  # no stop_event set: finally cancels the timer mid-POST
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert CHAT_ID not in adapter._progress_bubbles
+    assert [u["messageId"] for u in _unsends(actions)] == ["bub-inflight"]
+    await adapter.disconnect()
+
+
+async def test_overlapping_turn_does_not_drop_live_bubble(mock_router) -> None:
+    adapter = make_adapter()
+    send_route, actions = _mock_basics(mock_router, mid="bub-A")
+    await adapter.connect()
+
+    stop_a, stop_b = asyncio.Event(), asyncio.Event()
+    task_a = asyncio.create_task(
+        adapter._keep_typing(CHAT_ID, interval=60.0, stop_event=stop_a)
+    )
+    await asyncio.sleep(FAST_THRESHOLD * 4)  # A's bubble fires
+    assert adapter._progress_bubbles[CHAT_ID][0] == "bub-A"
+
+    # Overlapping turn B on the same chat starts and ends; A is still live.
+    task_b = asyncio.create_task(
+        adapter._keep_typing(CHAT_ID, interval=60.0, stop_event=stop_b)
+    )
+    await asyncio.sleep(0.01)
+    stop_b.set()
+    task_b.cancel()
+    await asyncio.gather(task_b, return_exceptions=True)
+    assert adapter._progress_bubbles[CHAT_ID][0] == "bub-A"
+    assert _unsends(actions) == []
+
+    # A ends: now its own bubble is dropped and deleted.
+    stop_a.set()
+    task_a.cancel()
+    await asyncio.gather(task_a, return_exceptions=True)
+    assert CHAT_ID not in adapter._progress_bubbles
+    assert [u["messageId"] for u in _unsends(actions)] == ["bub-A"]
+    await adapter.disconnect()

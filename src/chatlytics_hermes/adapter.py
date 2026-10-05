@@ -880,6 +880,13 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # than _PROGRESS_BUBBLE_TTL_S are stale and ignored on pop. Exactly
         # ONE pending bubble per chat (turn) — see _send_progress_bubble.
         self._progress_bubbles: "OrderedDict[str, Tuple[str, float]]" = OrderedDict()
+        # v4.7.4: per-turn ownership. chat_id -> owning turn token of the
+        # pending bubble, and chat_id -> tokens of turns whose
+        # ``_keep_typing`` is still live (overlapping turns on one chat are
+        # possible: the base class serializes per SESSION key, and group
+        # chats can carry several session keys).
+        self._progress_bubble_owner: Dict[str, str] = {}
+        self._live_typing_turns: Dict[str, set] = {}
 
         # v4.5.0 (chatlytics v5.4 P8): pending owner-DM questions. request_id
         # -> {"kind": "approval"|"clarify"|"future", "session_key": str|None,
@@ -1325,12 +1332,19 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
     # --- Progress bubbles (v4.4.0 — chatlytics v5.4 P7) ---------------------
 
-    def _store_progress_bubble(self, chat_id: str, message_id: str) -> None:
+    def _store_progress_bubble(
+        self, chat_id: str, message_id: str, owner: Optional[str] = None
+    ) -> None:
         """Record the un-consumed bubble id for ``chat_id`` (LRU-bounded)."""
         self._progress_bubbles[chat_id] = (message_id, time.monotonic())
         self._progress_bubbles.move_to_end(chat_id)
+        if owner is not None:
+            self._progress_bubble_owner[chat_id] = owner
+        else:
+            self._progress_bubble_owner.pop(chat_id, None)
         while len(self._progress_bubbles) > _PROGRESS_BUBBLE_MAX:
-            self._progress_bubbles.popitem(last=False)
+            evicted, _ = self._progress_bubbles.popitem(last=False)
+            self._progress_bubble_owner.pop(evicted, None)
 
     def _pop_progress_bubble(self, chat_id: str) -> Optional[str]:
         """Pop and return the fresh pending bubble id for ``chat_id``.
@@ -1341,6 +1355,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         be consumed twice).
         """
         entry = self._progress_bubbles.pop(chat_id, None)
+        self._progress_bubble_owner.pop(chat_id, None)
         if entry is None:
             return None
         message_id, ts = entry
@@ -1365,22 +1380,79 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             return False
         return True
 
-    def _drop_leftover_progress_bubble(self, chat_id: str) -> None:
-        """Drop any still-pending bubble for ``chat_id`` unconditionally.
+    async def _drop_leftover_progress_bubble(
+        self, chat_id: str, turn_token: Optional[str] = None
+    ) -> None:
+        """Remove a leftover bubble for ``chat_id`` and delete it on WhatsApp.
 
         v4.7.3 fix: called at turn boundaries (start and end of
         :meth:`_keep_typing`). A bubble still pending when its own turn is
-        over can never be legitimately consumed — the turn's ``send()``
-        already ran before typing teardown — and a bubble left over from a
+        over can never be legitimately consumed - the turn's ``send()``
+        already ran before typing teardown - and a bubble left over from a
         previous turn must never be edited by a newer reply (editing it in
         place makes the reply appear "before" the user's triggering
         message). No TTL check: at a turn boundary every entry is a
         leftover by definition.
+
+        v4.7.4: (a) the message is also DELETED server-side (best effort),
+        otherwise the "working" text stays visible forever; (b) ownership:
+        a bubble owned by ANOTHER still-live turn on the same chat is left
+        alone. Start of turn: drops only bubbles whose owner is no longer
+        live. End of turn: drops the bubble this turn owns (or an
+        unowned/legacy one).
         """
-        if self._progress_bubbles.pop(chat_id, None) is not None:
-            logger.debug(
-                "leftover progress bubble for chat %s dropped (turn boundary)",
+        entry = self._progress_bubbles.get(chat_id)
+        if entry is None:
+            return
+        owner = self._progress_bubble_owner.get(chat_id)
+        if owner is not None and owner != turn_token:
+            if owner in self._live_typing_turns.get(chat_id, ()):
+                logger.debug(
+                    "progress bubble for chat %s belongs to a live "
+                    "overlapping turn; not dropping",
+                    chat_id,
+                )
+                return
+        self._progress_bubbles.pop(chat_id, None)
+        self._progress_bubble_owner.pop(chat_id, None)
+        logger.debug(
+            "leftover progress bubble for chat %s dropped (turn boundary)",
+            chat_id,
+        )
+        await self._delete_progress_bubble(chat_id, entry[0])
+
+    async def _delete_progress_bubble(self, chat_id: str, message_id: str) -> None:
+        """Best-effort unsend of a dropped bubble. Never raises, bounded to 5 s."""
+        try:
+            if self._client is None or self._no_credential or not self._auth_token:
+                return
+            body, err = self._build_send_body(chat_id, "")
+            if body is None:
+                logger.debug("bubble delete skipped: %s", err)
+                return
+            body.pop("text", None)
+            body["action"] = "unsend"
+            body["messageId"] = message_id
+            _client = self._client_for_chat(chat_id) or self._client
+            response = await asyncio.wait_for(
+                _client.post("/api/v1/actions", json=body), timeout=5.0
+            )
+            if response.status_code >= 400:
+                logger.warning(
+                    "progress bubble %s for chat %s could not be deleted "
+                    "(HTTP %d); working text may remain visible",
+                    message_id,
+                    chat_id,
+                    response.status_code,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- UX cleanup, never propagate
+            logger.warning(
+                "progress bubble %s for chat %s delete failed: %s",
+                message_id,
                 chat_id,
+                exc,
             )
 
     @staticmethod
@@ -1416,7 +1488,9 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     return kid
         return None
 
-    async def _send_progress_bubble(self, chat_id: str) -> None:
+    async def _send_progress_bubble(
+        self, chat_id: str, owner: Optional[str] = None
+    ) -> None:
         """POST the ONE "working…" bubble for ``chat_id`` and memo its id.
 
         Failure philosophy mirrors :meth:`_send_typing_once`: the bubble is
@@ -1444,13 +1518,40 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             return
         body["progress"] = True
         _client = self._client_for_chat(chat_id) or self._client
+        # v4.7.4: shield the in-flight POST. If the timer is cancelled while
+        # the server is posting the bubble, we must still learn its id -
+        # otherwise it is an orphan nobody can ever drop/delete. On
+        # cancellation we wait the POST out, record the id, THEN re-raise.
+        post_task = asyncio.ensure_future(
+            _client.post("/api/v1/send", json=body)
+        )
+        cancelled = False
         try:
-            response = await _client.post("/api/v1/send", json=body)
+            try:
+                response = await asyncio.shield(post_task)
+            except asyncio.CancelledError:
+                cancelled = True
+                response = await post_task
         except httpx.RequestError as exc:
             logger.debug(
                 "progress bubble transport error for chat %s: %s", chat_id, exc
             )
+            if cancelled:
+                raise asyncio.CancelledError()
             return
+        except Exception:  # noqa: BLE001
+            if cancelled:
+                raise asyncio.CancelledError()
+            raise
+        try:
+            await self._record_bubble_response(chat_id, owner, response)
+        finally:
+            if cancelled:
+                raise asyncio.CancelledError()
+
+    async def _record_bubble_response(
+        self, chat_id: str, owner: Optional[str], response: httpx.Response
+    ) -> None:
         if response.status_code != 200:
             logger.debug(
                 "progress bubble send returned HTTP %d for chat %s",
@@ -1470,7 +1571,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 chat_id,
             )
             return
-        self._store_progress_bubble(chat_id, message_id)
+        self._store_progress_bubble(chat_id, message_id, owner)
         logger.debug(
             "progress bubble sent for chat %s (message_id=%s)",
             chat_id,
@@ -1478,7 +1579,10 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         )
 
     async def _progress_bubble_timer(
-        self, chat_id: str, stop_event: Optional[asyncio.Event]
+        self,
+        chat_id: str,
+        stop_event: Optional[asyncio.Event],
+        owner: Optional[str] = None,
     ) -> None:
         """Wait ``status_bubble_after_s``; if the turn is still running, bubble.
 
@@ -1498,7 +1602,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     pass
             else:
                 await asyncio.sleep(self.status_bubble_after_s)
-            await self._send_progress_bubble(chat_id)
+            await self._send_progress_bubble(chat_id, owner)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 -- UX affordance, never propagate
@@ -4336,11 +4440,13 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # one-per-turn guard cannot suppress THIS turn's bubble, and so
         # this turn's send() can never edit the stale bubble in place
         # (the live "reply appears BEFORE the user's message" bug).
-        self._drop_leftover_progress_bubble(chat_id)
+        turn_token = uuid.uuid4().hex
+        await self._drop_leftover_progress_bubble(chat_id, turn_token)
+        self._live_typing_turns.setdefault(chat_id, set()).add(turn_token)
         progress_task: Optional[asyncio.Task] = None
         if self.status_edit_in_place and self.status_bubble_after_s > 0:
             progress_task = asyncio.create_task(
-                self._progress_bubble_timer(chat_id, stop_event)
+                self._progress_bubble_timer(chat_id, stop_event, turn_token)
             )
         try:
             try:
@@ -4398,7 +4504,12 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             # nothing consumed it. Left behind, the NEXT turn within the
             # TTL would edit it in place and the reply would surface above
             # the user's triggering message.
-            self._drop_leftover_progress_bubble(chat_id)
+            live = self._live_typing_turns.get(chat_id)
+            if live is not None:
+                live.discard(turn_token)
+                if not live:
+                    self._live_typing_turns.pop(chat_id, None)
+            await self._drop_leftover_progress_bubble(chat_id, turn_token)
 
     @contextlib.asynccontextmanager
     async def _typing_scope(self, chat_id: str, interval: float = 30.0):
