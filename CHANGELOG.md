@@ -1,3 +1,27 @@
+## [4.7.4] - 2026-10-05
+
+### Fixed
+
+- **fix: a dropped "working..." progress bubble is now actually deleted.**
+  v4.7.3 only forgot the bubble id; in the race case the message stayed
+  visible on WhatsApp forever. Dropped bubbles are now unsent via the
+  Chatlytics actions API (best effort: never raises, logs a warning on
+  failure, bounded to 5 s).
+- **fix: no orphan bubble when the turn ends mid-POST.** The bubble POST is
+  now shielded from cancellation; if the turn finishes while the server is
+  posting it, the id is still recorded and then dropped and deleted.
+- **fix: overlapping turns on one chat no longer drop each other's live
+  bubble.** Bubbles carry the owning turn; a turn boundary only drops
+  bubbles whose owner is finished.
+- Version strings aligned (pyproject.toml and plugin.yaml were still 4.7.2).
+- **fix: actions-API request body.** `/api/v1/actions` accepts only
+  `action`, `params`, `parameters` and `session`; the bubble unsend and the
+  `chatlytics_react` / `edit` / `unsend` / `pin` / `unpin` / `delete` / `poll`
+  tools sent flat fields and got 400 UNKNOWN_FIELD. Arguments now go in
+  `params` (`chatlytics_dispatch` `target` too).
+- **fix: a reply never edits another overlapping turn's bubble.** `send()`
+  only consumes a bubble whose owning turn is the sole live turn on the chat.
+
 ## [4.7.3] - 2026-10-05
 
 ### Fixed

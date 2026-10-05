@@ -26,10 +26,17 @@ import respx
 from chatlytics_hermes.client import ChatlyticsClient
 from chatlytics_hermes.tools import (
     TOOLS,
+    chatlytics_delete,
+    chatlytics_dispatch,
+    chatlytics_edit,
+    chatlytics_pin,
+    chatlytics_poll,
     chatlytics_react,
     chatlytics_resolve_entity,
     chatlytics_search,
     chatlytics_send,
+    chatlytics_unpin,
+    chatlytics_unsend,
 )
 
 
@@ -112,8 +119,8 @@ async def test_chatlytics_react_calls_react_action(
 
     body = _json.loads(route.calls.last.request.content)
     assert body["action"] == "react"
-    assert body["messageId"] == "m-001"
-    assert body["emoji"] == "\U0001f44d"
+    assert body["params"]["messageId"] == "m-001"
+    assert body["params"]["emoji"] == "\U0001f44d"
 
 
 # --- AC-5: chatlytics_search returns results list ---------------------
@@ -495,3 +502,123 @@ async def test_resolve_entity_envelope_with_non_json_text_does_not_crash(
     assert result["success"] is True
     assert "Could not read" in result["message"]
     assert "Best match" not in result["message"]
+
+
+# --- hub /api/v1/actions is .strict(): only action/params/parameters/session ---
+
+_HUB_ACTION_KEYS = {"action", "params", "parameters", "session"}
+
+
+def _strict_hub(request):
+    body = _json.loads(request.content)
+    extra = sorted(set(body) - _HUB_ACTION_KEYS)
+    if extra:
+        return httpx.Response(
+            400,
+            json={
+                "success": False,
+                "code": "UNKNOWN_FIELD",
+                "error": f"Unknown field: {', '.join(extra)}",
+            },
+        )
+    return httpx.Response(200, json={"success": True})
+
+
+@pytest.mark.parametrize(
+    "call, action, expected",
+    [
+        (
+            lambda c: chatlytics_react(c, messageId="m1", emoji="x", chatId=CHAT_ID),
+            "react",
+            {"messageId": "m1", "emoji": "x", "chatId": CHAT_ID},
+        ),
+        (
+            lambda c: chatlytics_edit(c, messageId="m1", text="t", chatId=CHAT_ID),
+            "edit",
+            {"messageId": "m1", "text": "t", "chatId": CHAT_ID},
+        ),
+        (
+            lambda c: chatlytics_unsend(c, messageId="m1", chatId=CHAT_ID),
+            "unsend",
+            {"messageId": "m1", "chatId": CHAT_ID},
+        ),
+        (
+            lambda c: chatlytics_pin(c, messageId="m1", chatId=CHAT_ID, duration=5),
+            "pin",
+            {"messageId": "m1", "chatId": CHAT_ID, "duration": 5},
+        ),
+        (
+            lambda c: chatlytics_unpin(c, messageId="m1", chatId=CHAT_ID),
+            "unpin",
+            {"messageId": "m1", "chatId": CHAT_ID},
+        ),
+        (
+            lambda c: chatlytics_delete(c, messageId="m1", chatId=CHAT_ID),
+            "delete",
+            {"messageId": "m1", "chatId": CHAT_ID, "forEveryone": False},
+        ),
+        (
+            lambda c: chatlytics_poll(
+                c, chatId=CHAT_ID, question="q", options=["a", "b"]
+            ),
+            "poll",
+            {"chatId": CHAT_ID, "pollQuestion": "q", "pollOption": ["a", "b"],
+             "multipleAnswers": False},
+        ),
+        (
+            lambda c: chatlytics_dispatch(
+                c, action="kick", target="t@g.us", parameters={"x": 1}
+            ),
+            "kick",
+            {"chatId": "t@g.us", "x": 1},
+        ),
+    ],
+)
+async def test_actions_tools_post_hub_strict_shape(
+    client: ChatlyticsClient, mock_router: respx.MockRouter, call, action, expected
+) -> None:
+    route = mock_router.post("/api/v1/actions").mock(side_effect=_strict_hub)
+    result = await call(client)
+    assert result["success"] is True, result
+    body = _json.loads(route.calls.last.request.content)
+    assert body["action"] == action
+    assert body["params"] == expected
+
+
+# Hub FIELD NAMES (channel.ts): poll reads pollQuestion/pollOption/multipleAnswers,
+# send-path actions read chatId/to only. A body can pass the strict top-level
+# check and still be ignored -- pin the names.
+_BANNED_POLL_KEYS = {"question", "options", "multiple"}
+
+
+async def test_poll_uses_hub_field_names(
+    client: ChatlyticsClient, mock_router: respx.MockRouter
+) -> None:
+    route = mock_router.post("/api/v1/actions").mock(side_effect=_strict_hub)
+    await chatlytics_poll(client, chatId=CHAT_ID, question="q", options=["a", "b"], multiple=True)
+    params = _json.loads(route.calls.last.request.content)["params"]
+    assert not (set(params) & _BANNED_POLL_KEYS), params
+    assert params["pollQuestion"] == "q"
+    assert params["pollOption"] == ["a", "b"]
+    assert params["multipleAnswers"] is True
+
+
+async def test_dispatch_target_maps_to_chatid_never_bare_target(
+    client: ChatlyticsClient, mock_router: respx.MockRouter
+) -> None:
+    route = mock_router.post("/api/v1/actions").mock(side_effect=_strict_hub)
+    await chatlytics_dispatch(client, action="sendSeen", target="t@g.us")
+    params = _json.loads(route.calls.last.request.content)["params"]
+    assert params == {"chatId": "t@g.us"}
+    assert "target" not in params
+
+
+async def test_dispatch_caller_chatid_not_clobbered_by_target(
+    client: ChatlyticsClient, mock_router: respx.MockRouter
+) -> None:
+    route = mock_router.post("/api/v1/actions").mock(side_effect=_strict_hub)
+    await chatlytics_dispatch(
+        client, action="kick", target="t@g.us", parameters={"chatId": "own@g.us"}
+    )
+    params = _json.loads(route.calls.last.request.content)["params"]
+    assert params["chatId"] == "own@g.us"
