@@ -24,12 +24,18 @@ tests/test_owner_tagging.py, including mutation checks):
 
 - Fail closed: no admin list for the scope, no sender, an unauthenticated
   webhook, a channel/broadcast chat, or any error → NOT owner.
-- Spoof resistance: while tagging is active, a typed lookalike marker at the
-  start of ANY line (``[owner reply]``, ``[owner]``, any case, fullwidth
-  brackets, zero-width padding) is stripped from EVERY sender's text before the
-  real marker is applied. A non-owner therefore can never present the marker,
-  and an owner's own typed copy collapses into the single real prefix (the
-  upstream "no double prefix" behavior).
+- Spoof resistance: the FLAG can only come from the delivered sender id.
+  For the TEXT, while tagging is active a typed lookalike marker at the start
+  of any line (any Unicode line break; any bracket pair; case, fullwidth,
+  common Cyrillic/Greek confusables, combining marks and zero-width padding
+  folded) is cut from EVERY sender's text before the real marker is applied.
+  This is best-effort hardening, not a proof: an exotic glyph outside the
+  fold table can still survive as text, but it can never set the flag and it
+  is never the leading token of an owner's message. An owner's own typed copy
+  collapses into the single real prefix (upstream "no double prefix").
+- On hermes-agent 0.14 the flag is also mirrored onto ``raw_message`` because
+  ``metadata`` is not a dataclass field there and a pre_gateway_dispatch
+  rewrite hook's ``dataclasses.replace`` drops it.
 - Idempotent: neutralize-then-prefix is a fixed point, so retry/replay paths
   that re-run dispatch never double-tag.
 
@@ -59,9 +65,41 @@ WHATSAPP_FROM_OWNER_KEY = "whatsapp_from_owner"
 #: chatlytics-specific alias of the same flag.
 CHATLYTICS_FROM_OWNER_KEY = "chatlytics_from_owner"
 
-# Leading lookalike marker, matched on an NFKC-normalized, format-char-stripped
-# line (NFKC folds fullwidth ［］ to []). Case-insensitive.
-_LOOKALIKE_RE = re.compile(r"^\s*\[\s*owner(?:\s+reply)?\s*\]\s*", re.IGNORECASE)
+# Leading lookalike marker, matched on the folded MATCH VIEW of a line (see
+# _match_view): every opening bracket is "[", every closing one "]", letters
+# are NFKD-decomposed, stripped of combining marks, confusable-folded and
+# lowercased. "owner" and "reply" may be joined by space / _ - . :
+_LOOKALIKE_RE = re.compile(r"^\s*\[\s*owner(?:[\s_\-.:]*reply)?\s*\]\s*")
+
+# Common Latin lookalikes for the letters of "owner reply" (Cyrillic, Greek,
+# Armenian, small capitals, IPA, digit zero). NFKD already folds fullwidth,
+# mathematical and circled forms; this covers what it does not.
+_CONFUSABLES = {
+    # o
+    "о": "o", "О": "o", "ο": "o", "Ο": "o", "օ": "o",
+    "ᴏ": "o", "೦": "o", "ഠ": "o", "0": "o", "ø": "o",
+    # w
+    "ԝ": "w", "Ԝ": "w", "ѡ": "w", "ᴡ": "w", "ɯ": "w",
+    "ω": "w",
+    # n
+    "ո": "n", "ɴ": "n", "п": "n", "η": "n",
+    # e
+    "е": "e", "Е": "e", "Ε": "e", "ᴇ": "e", "є": "e",
+    "ҽ": "e", "℮": "e",
+    # r
+    "г": "r", "ʀ": "r", "ᴦ": "r", "ⲅ": "r",
+    # p
+    "р": "p", "Р": "p", "ρ": "p", "Ρ": "p", "ᴘ": "p",
+    # l
+    "ӏ": "l", "І": "l", "і": "l", "Ι": "l", "ʟ": "l",
+    "ǀ": "l", "|": "l", "1": "l", "ı": "l",
+    # y
+    "у": "y", "У": "y", "ү": "y", "γ": "y", "ʏ": "y",
+    "Υ": "y",
+}
+_OPEN_BRACKET_CATS = ("Ps", "Pi")
+_CLOSE_BRACKET_CATS = ("Pe", "Pf")
+_SKIP_CATS = ("Cf", "Mn", "Me")
 
 _DM_CHAT_TYPES = frozenset({"dm", "direct", "private", ""})
 _GROUP_CHAT_TYPES = frozenset({"group"})
@@ -155,26 +193,77 @@ def is_owner(sender_id: Any, chat_type: Any, extra: Any) -> bool:
     return ident in owner_ids_for_chat_type(extra, chat_type)
 
 
-def _strip_format_chars(s: str) -> str:
-    return "".join(ch for ch in s if unicodedata.category(ch) != "Cf")
+def _fold_char(ch: str) -> str:
+    """Match-view form of ONE original character (may be empty)."""
+    out = []
+    for x in unicodedata.normalize("NFKD", ch):
+        cat = unicodedata.category(x)
+        if cat in _SKIP_CATS:
+            continue
+        if x in "<" or cat in _OPEN_BRACKET_CATS:
+            out.append("[")
+        elif x in ">" or cat in _CLOSE_BRACKET_CATS:
+            out.append("]")
+        else:
+            x = x.lower()
+            out.append(_CONFUSABLES.get(x, x))
+    return "".join(out)
+
+
+def _marker_end(line: str) -> int:
+    """Length of the leading lookalike marker(s) in ``line`` (0 if none).
+
+    Matches on a folded view but returns an index into the ORIGINAL line, so
+    the caller cuts only the marker span and every other character
+    (fullwidth digits, ZWJ emoji, RLM/LRM) survives byte-for-byte.
+    """
+    view = []
+    owner_idx = []  # owner_idx[k] = original index of view[k]
+    for i, ch in enumerate(line):
+        for v in _fold_char(ch):
+            view.append(v)
+            owner_idx.append(i)
+    view_s = "".join(view)
+    end = 0
+    pos = 0
+    while True:
+        m = _LOOKALIKE_RE.match(view_s, pos)
+        if not m or m.end() == pos:
+            break
+        pos = m.end()
+        end = owner_idx[pos - 1] + 1
+    # Invisible characters AFTER the marker are left alone: they belong to
+    # the user's text (e.g. an RLM opening a Hebrew line).
+    return end
+
+
+# Visible stand-in used when cutting a marker would turn the text into a
+# slash command the sender never typed ("[owner reply] /approve").
+_DEFANGED = "[marker removed] "
 
 
 def neutralize_owner_markers(text: str) -> str:
-    """Remove typed lookalike markers from the start of every line."""
+    """Remove typed lookalike markers from the start of every line.
+
+    Every Unicode line boundary counts (str.splitlines: \r, \u2028, \x85,
+    ...), not just \n. Only the marker span is cut from the original line.
+    """
     if not text:
         return text
     out = []
-    for line in text.split("\n"):
-        norm = unicodedata.normalize("NFKC", _strip_format_chars(line))
-        if _LOOKALIKE_RE.match(norm):
-            while True:
-                m = _LOOKALIKE_RE.match(norm)
-                if not m:
-                    break
-                norm = norm[m.end():]
-            line = norm
-        out.append(line)
-    return "\n".join(out)
+    for piece in text.splitlines(keepends=True):
+        body = piece.splitlines()[0] if piece.splitlines() else ""
+        ending = piece[len(body):]
+        end = _marker_end(body)
+        if end:
+            rest = body[end:]
+            # Never manufacture a leading slash command out of a message
+            # whose original text did not start with "/".
+            if not out and rest.lstrip().startswith("/"):
+                rest = _DEFANGED + rest
+            body = rest
+        out.append(body + ending)
+    return "".join(out)
 
 
 def _set_text(event: Any, text: str) -> Any:
@@ -185,6 +274,43 @@ def _set_text(event: Any, text: str) -> Any:
         import dataclasses
 
         return dataclasses.replace(event, text=text)
+
+
+def _mirror_raw_flag(event: Any, owner: bool) -> None:
+    """Mirror the flag onto ``raw_message`` (a real dataclass field).
+
+    On hermes-agent 0.14 ``metadata`` is NOT a MessageEvent field, so a
+    ``pre_gateway_dispatch`` "rewrite" hook (gateway/run.py
+    ``dataclasses.replace(event, text=...)``) drops it; ``raw_message`` is
+    carried over. Non-owner events get the keys REMOVED, so a payload that
+    arrived already claiming them can never pass them through.
+    """
+    raw = getattr(event, "raw_message", None)
+    if not isinstance(raw, dict):
+        return
+    for key in (WHATSAPP_FROM_OWNER_KEY, CHATLYTICS_FROM_OWNER_KEY):
+        if owner:
+            raw[key] = True
+        else:
+            raw.pop(key, None)
+
+
+def neutralize_event_text(event: Any, extra: Any) -> Any:
+    """Strip typed markers from the RAW text, before any plugin prefix.
+
+    Callers that add their own leading prefix (the ``[<sender id>]`` identity
+    bridge) must run this first: once a prefix sits in front, a typed marker is
+    no longer at the start of its line and the anchored match cannot see it.
+    """
+    try:
+        if not tagging_enabled(extra):
+            return event
+        text = getattr(event, "text", "") or ""
+        new = neutralize_owner_markers(text)
+        return _set_text(event, new) if new != text else event
+    except Exception:  # noqa: BLE001 -- must never break dispatch
+        logger.debug("owner marker neutralization raised", exc_info=True)
+        return event
 
 
 def _set_owner_metadata(event: Any) -> None:
@@ -227,6 +353,7 @@ def apply_owner_tagging(event: Any, extra: Any, *, sender_authenticated: bool) -
         event = _set_text(event, text)
         if owner:
             _set_owner_metadata(event)
+        _mirror_raw_flag(event, owner)
         return event
     except Exception:  # noqa: BLE001 -- tagging must never break dispatch
         logger.debug("owner tagging raised; dispatching untagged", exc_info=True)

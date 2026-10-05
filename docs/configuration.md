@@ -164,11 +164,22 @@ resolved phone on the envelope.)
 delivered on an authenticated transport: longpoll (bot bearer) or a webhook
 whose `X-Chatlytics-Signature` verified. **Without
 `CHATLYTICS_WEBHOOK_SECRET`, webhook senders are unauthenticated and never
-tagged** (a warning is logged once). While tagging is active, a typed
-`[owner reply]` / `[owner]` at the start of any line (any case, fullwidth
-brackets, zero-width padding) is stripped from every message before the real
-marker is applied, so nobody can fake it and an owner's own typed copy never
-doubles it. Replays (`/retry`) produce the same single tag.
+tagged** (a warning is logged once). Message text never sets the flag. On
+top of that, while tagging is active a typed `[owner reply]` / `[owner]` at
+the start of any line is cut from every message before the real marker is
+applied. Matching folds case, any bracket pair, fullwidth and common
+Cyrillic/Greek lookalike letters, combining marks and zero-width padding, and
+treats every Unicode line break as a line start. This text scrub is
+best-effort: an exotic glyph outside the fold table can survive as plain
+text, but it never sets the flag and never leads an owner's message. An
+owner's own typed copy never doubles the prefix; replays (`/retry`) produce
+the same single tag. If cutting a marker would leave a slash command the
+sender did not type, the marker is replaced by `[marker removed] ` instead.
+
+On hermes-agent 0.14 the flag is also mirrored onto `event.raw_message`
+(`whatsapp_from_owner` / `chatlytics_from_owner`): `metadata` is not a real
+field there, so a `pre_gateway_dispatch` rewrite hook drops it, while
+`raw_message` survives. The keys are removed from non-owner events.
 
 **Slash commands** from an owner keep their leading `/` (no text prefix, so
 Hermes still sees a command); the metadata flag is still set.
