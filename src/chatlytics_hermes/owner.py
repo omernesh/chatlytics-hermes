@@ -69,7 +69,27 @@ CHATLYTICS_FROM_OWNER_KEY = "chatlytics_from_owner"
 # _match_view): every opening bracket is "[", every closing one "]", letters
 # are NFKD-decomposed, stripped of combining marks, confusable-folded and
 # lowercased. "owner" and "reply" may be joined by space / _ - . :
-_LOOKALIKE_RE = re.compile(r"^\s*\[\s*owner(?:[\s_\-.:]*reply)?\s*\]\s*")
+# Leading markdown wrappers (bold/italic/strike/code marks, a blockquote ">"
+# which the view folds to "]", "- " / "+ " / bullet list markers) and doubled
+# brackets ("[[owner reply]]") are part of the cut span.
+# NO "^" ANCHOR: re.match() already anchors. (d0f9051 used "^" together
+# with match(view, pos); "^" never matches at pos > 0, so only ONE marker was
+# cut per call — review BLOCKER. _marker_end now re-slices the window and
+# matches at 0, but keep the pattern anchor-free so a future match(s, pos)
+# cannot reintroduce that bug.)
+_LOOKALIKE_RE = re.compile(
+    r"\s*(?:[*_~`\]]+\s*|[-+\u2022]\s+)*"
+    r"\[+\s*owner(?:[\s_\-.:]*reply)?\s*\]+[*_~`]*\s*"
+)
+
+# Characters that render as blank but are letters/symbols (so neither Cf nor
+# a combining mark): braille blank, Hangul fillers. Folded to nothing.
+_INVISIBLE_FOLD = frozenset("\u2800\u115f\u1160\u3164\uffa0")
+
+# Only this many FOLDED characters past the current cut point are examined
+# per marker: a marker can only sit at the start of a line, so a huge line
+# costs a bounded amount of work instead of a full fold.
+_MATCH_WINDOW = 256
 
 # Common Latin lookalikes for the letters of "owner reply" (Cyrillic, Greek,
 # Armenian, small capitals, IPA, digit zero). NFKD already folds fullwidth,
@@ -99,7 +119,7 @@ _CONFUSABLES = {
 }
 _OPEN_BRACKET_CATS = ("Ps", "Pi")
 _CLOSE_BRACKET_CATS = ("Pe", "Pf")
-_SKIP_CATS = ("Cf", "Mn", "Me")
+_SKIP_CATS = ("Cf", "Mn", "Me", "Mc")
 
 _DM_CHAT_TYPES = frozenset({"dm", "direct", "private", ""})
 _GROUP_CHAT_TYPES = frozenset({"group"})
@@ -193,12 +213,25 @@ def is_owner(sender_id: Any, chat_type: Any, extra: Any) -> bool:
     return ident in owner_ids_for_chat_type(extra, chat_type)
 
 
+# ASCII fast path for _fold_char: same result as the general path (ASCII is
+# NFKD-stable; ()[]{}<> are the ASCII brackets), without the unicodedata
+# calls. Built once from the general path itself so the two cannot drift.
+_ASCII_FOLD: dict = {}
+
+
 def _fold_char(ch: str) -> str:
     """Match-view form of ONE original character (may be empty)."""
+    hit = _ASCII_FOLD.get(ch)
+    if hit is not None:
+        return hit
+    return _fold_char_slow(ch)
+
+
+def _fold_char_slow(ch: str) -> str:
     out = []
     for x in unicodedata.normalize("NFKD", ch):
         cat = unicodedata.category(x)
-        if cat in _SKIP_CATS:
+        if cat in _SKIP_CATS or x in _INVISIBLE_FOLD:
             continue
         if x in "<" or cat in _OPEN_BRACKET_CATS:
             out.append("[")
@@ -210,6 +243,14 @@ def _fold_char(ch: str) -> str:
     return "".join(out)
 
 
+_ASCII_FOLD.update({chr(c): _fold_char_slow(chr(c)) for c in range(128)})
+
+# View characters that may precede the marker's opening "[" (whitespace and
+# the markdown wrappers in _LOOKALIKE_RE). Used for a cheap pre-check so an
+# ordinary line is rejected after folding one or two characters.
+_LEAD_CHARS = frozenset("*_~`]-+\u2022")
+
+
 def _marker_end(line: str) -> int:
     """Length of the leading lookalike marker(s) in ``line`` (0 if none).
 
@@ -217,20 +258,37 @@ def _marker_end(line: str) -> int:
     the caller cuts only the marker span and every other character
     (fullwidth digits, ZWJ emoji, RLM/LRM) survives byte-for-byte.
     """
-    view = []
-    owner_idx = []  # owner_idx[k] = original index of view[k]
-    for i, ch in enumerate(line):
-        for v in _fold_char(ch):
-            view.append(v)
-            owner_idx.append(i)
-    view_s = "".join(view)
+    view: list = []
+    owner_idx: list = []  # owner_idx[k] = original index of view[k]
+    folded = 0  # original characters folded so far (lazy, incremental)
+    n = len(line)
     end = 0
     pos = 0
+    def _ensure(k: int) -> None:
+        nonlocal folded
+        while len(view) < k and folded < n:
+            for v in _fold_char(line[folded]):
+                view.append(v)
+                owner_idx.append(folded)
+            folded += 1
+
     while True:
-        m = _LOOKALIKE_RE.match(view_s, pos)
-        if not m or m.end() == pos:
+        # Cheap pre-check: skip whitespace / wrapper chars; the next view
+        # char must be "[" or there is no marker here.
+        k = pos
+        limit = pos + _MATCH_WINDOW
+        while k < limit:
+            _ensure(k + 1)
+            if k >= len(view) or not (view[k].isspace() or view[k] in _LEAD_CHARS):
+                break
+            k += 1
+        if k >= len(view) or view[k] != "[":
             break
-        pos = m.end()
+        _ensure(pos + _MATCH_WINDOW)
+        m = _LOOKALIKE_RE.match("".join(view[pos:pos + _MATCH_WINDOW]))
+        if not m or m.end() == 0:
+            break
+        pos += m.end()
         end = owner_idx[pos - 1] + 1
     # Invisible characters AFTER the marker are left alone: they belong to
     # the user's text (e.g. an RLM opening a Hebrew line).
@@ -284,15 +342,25 @@ def _mirror_raw_flag(event: Any, owner: bool) -> None:
     ``dataclasses.replace(event, text=...)``) drops it; ``raw_message`` is
     carried over. Non-owner events get the keys REMOVED, so a payload that
     arrived already claiming them can never pass them through.
+
+    The hub envelope / webhook payload is NEVER mutated in place: the event
+    gets a shallow copy (the memoized retry_last envelope and any other holder
+    of the original dict stay untouched).
     """
     raw = getattr(event, "raw_message", None)
     if not isinstance(raw, dict):
         return
-    for key in (WHATSAPP_FROM_OWNER_KEY, CHATLYTICS_FROM_OWNER_KEY):
-        if owner:
-            raw[key] = True
-        else:
-            raw.pop(key, None)
+    keys = (WHATSAPP_FROM_OWNER_KEY, CHATLYTICS_FROM_OWNER_KEY)
+    if not owner and not any(k in raw for k in keys):
+        return
+    new = {k: v for k, v in raw.items() if k not in keys}
+    if owner:
+        for k in keys:
+            new[k] = True
+    try:
+        event.raw_message = new
+    except Exception:  # noqa: BLE001 -- frozen event: leave as is
+        logger.debug("could not replace raw_message", exc_info=True)
 
 
 def neutralize_event_text(event: Any, extra: Any) -> Any:
@@ -332,29 +400,40 @@ def apply_owner_tagging(event: Any, extra: Any, *, sender_authenticated: bool) -
     """Neutralize typed markers, then tag the event if its sender is an owner.
 
     Returns the (possibly rebuilt) event. Never raises: on any error the event
-    is returned untagged (fail closed) with the text it had.
+    is returned untagged (fail closed) with the text it had. Payload-supplied
+    ``*_from_owner`` keys on ``raw_message`` are stripped on EVERY path —
+    tagging off, non-owner, or error — and set only for a completed owner tag.
     """
+    tagged = False
     try:
-        if not tagging_enabled(extra):
-            return event
-        text = getattr(event, "text", "") or ""
-        text = neutralize_owner_markers(text)
-        source = getattr(event, "source", None)
-        owner = bool(sender_authenticated) and is_owner(
-            getattr(source, "user_id", None),
-            getattr(source, "chat_type", None),
-            extra,
-        )
-        # Slash commands stay commands: Hermes detects them by a leading "/",
-        # and owners are exactly the users allowed to run them
-        # (slash_access). They still get the metadata flag.
-        if owner and not text.startswith("/"):
-            text = OWNER_REPLY_PREFIX + text
-        event = _set_text(event, text)
-        if owner:
-            _set_owner_metadata(event)
-        _mirror_raw_flag(event, owner)
-        return event
+        event, tagged = _tag(event, extra, sender_authenticated)
     except Exception:  # noqa: BLE001 -- tagging must never break dispatch
         logger.debug("owner tagging raised; dispatching untagged", exc_info=True)
-        return event
+    try:
+        _mirror_raw_flag(event, tagged)
+    except Exception:  # noqa: BLE001
+        logger.debug("raw_message flag scrub raised", exc_info=True)
+    return event
+
+
+def _tag(event: Any, extra: Any, sender_authenticated: bool) -> Tuple[Any, bool]:
+    """apply_owner_tagging's body; returns (event, owner_tag_completed)."""
+    if not tagging_enabled(extra):
+        return event, False
+    text = getattr(event, "text", "") or ""
+    text = neutralize_owner_markers(text)
+    source = getattr(event, "source", None)
+    owner = bool(sender_authenticated) and is_owner(
+        getattr(source, "user_id", None),
+        getattr(source, "chat_type", None),
+        extra,
+    )
+    # Slash commands stay commands: Hermes detects them by a leading "/",
+    # and owners are exactly the users allowed to run them
+    # (slash_access). They still get the metadata flag.
+    if owner and not text.startswith("/"):
+        text = OWNER_REPLY_PREFIX + text
+    event = _set_text(event, text)
+    if owner:
+        _set_owner_metadata(event)
+    return event, owner
