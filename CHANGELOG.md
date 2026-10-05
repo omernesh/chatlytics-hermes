@@ -14,6 +14,13 @@
   bubble.** Bubbles carry the owning turn; a turn boundary only drops
   bubbles whose owner is finished.
 - Version strings aligned (pyproject.toml and plugin.yaml were still 4.7.2).
+- **fix: actions-API request body.** `/api/v1/actions` accepts only
+  `action`, `params`, `parameters` and `session`; the bubble unsend and the
+  `chatlytics_react` / `edit` / `unsend` / `pin` / `unpin` / `delete` / `poll`
+  tools sent flat fields and got 400 UNKNOWN_FIELD. Arguments now go in
+  `params` (`chatlytics_dispatch` `target` too).
+- **fix: a reply never edits another overlapping turn's bubble.** `send()`
+  only consumes a bubble whose owning turn is the sole live turn on the chat.
 
 ## [4.7.3] - 2026-10-05
 

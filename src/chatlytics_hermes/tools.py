@@ -732,9 +732,10 @@ async def chatlytics_react(
     emoji: str,
     chatId: Optional[str] = None,
 ) -> Dict[str, Any]:
-    body: Dict[str, Any] = {"action": "react", "messageId": messageId, "emoji": emoji}
+    params: Dict[str, Any] = {"messageId": messageId, "emoji": emoji}
     if chatId:
-        body["chatId"] = chatId
+        params["chatId"] = chatId
+    body: Dict[str, Any] = {"action": "react", "params": params}
     return await _post(client, "/api/v1/actions", body)
 
 
@@ -745,9 +746,10 @@ async def chatlytics_edit(
     text: str,
     chatId: Optional[str] = None,
 ) -> Dict[str, Any]:
-    body: Dict[str, Any] = {"action": "edit", "messageId": messageId, "text": text}
+    params: Dict[str, Any] = {"messageId": messageId, "text": text}
     if chatId:
-        body["chatId"] = chatId
+        params["chatId"] = chatId
+    body: Dict[str, Any] = {"action": "edit", "params": params}
     return await _post(client, "/api/v1/actions", body)
 
 
@@ -757,9 +759,10 @@ async def chatlytics_unsend(
     messageId: str,
     chatId: Optional[str] = None,
 ) -> Dict[str, Any]:
-    body: Dict[str, Any] = {"action": "unsend", "messageId": messageId}
+    params: Dict[str, Any] = {"messageId": messageId}
     if chatId:
-        body["chatId"] = chatId
+        params["chatId"] = chatId
+    body: Dict[str, Any] = {"action": "unsend", "params": params}
     return await _post(client, "/api/v1/actions", body)
 
 
@@ -770,11 +773,12 @@ async def chatlytics_pin(
     chatId: Optional[str] = None,
     duration: Optional[int] = None,
 ) -> Dict[str, Any]:
-    body: Dict[str, Any] = {"action": "pin", "messageId": messageId}
+    params: Dict[str, Any] = {"messageId": messageId}
     if chatId:
-        body["chatId"] = chatId
+        params["chatId"] = chatId
     if duration is not None:
-        body["duration"] = duration
+        params["duration"] = duration
+    body: Dict[str, Any] = {"action": "pin", "params": params}
     return await _post(client, "/api/v1/actions", body)
 
 
@@ -784,9 +788,10 @@ async def chatlytics_unpin(
     messageId: str,
     chatId: Optional[str] = None,
 ) -> Dict[str, Any]:
-    body: Dict[str, Any] = {"action": "unpin", "messageId": messageId}
+    params: Dict[str, Any] = {"messageId": messageId}
     if chatId:
-        body["chatId"] = chatId
+        params["chatId"] = chatId
+    body: Dict[str, Any] = {"action": "unpin", "params": params}
     return await _post(client, "/api/v1/actions", body)
 
 
@@ -810,13 +815,13 @@ async def chatlytics_delete(
     chatId: Optional[str] = None,
     forEveryone: bool = False,
 ) -> Dict[str, Any]:
-    body: Dict[str, Any] = {
-        "action": "delete",
+    params: Dict[str, Any] = {
         "messageId": messageId,
         "forEveryone": bool(forEveryone),
     }
     if chatId:
-        body["chatId"] = chatId
+        params["chatId"] = chatId
+    body: Dict[str, Any] = {"action": "delete", "params": params}
     return await _post(client, "/api/v1/actions", body)
 
 
@@ -830,10 +835,12 @@ async def chatlytics_poll(
 ) -> Dict[str, Any]:
     body: Dict[str, Any] = {
         "action": "poll",
-        "chatId": chatId,
-        "question": question,
-        "options": list(options),
-        "multiple": bool(multiple),
+        "params": {
+            "chatId": chatId,
+            "question": question,
+            "options": list(options),
+            "multiple": bool(multiple),
+        },
     }
     return await _post(client, "/api/v1/actions", body)
 
@@ -1292,11 +1299,16 @@ async def chatlytics_dispatch(
     parameters: Optional[Dict[str, Any]] = None,
     session: Optional[str] = None,
 ) -> Dict[str, Any]:
-    body: Dict[str, Any] = {"action": action}
+    # Hub /api/v1/actions is .strict(): a top-level `target` is UNKNOWN_FIELD.
+    # Carry it inside params (caller-supplied params win).
+    merged: Dict[str, Any] = {}
     if target is not None:
-        body["target"] = target
+        merged["target"] = target
     if parameters is not None:
-        body["params"] = parameters
+        merged.update(parameters)
+    body: Dict[str, Any] = {"action": action}
+    if merged:
+        body["params"] = merged
     if session is not None:
         body["session"] = session
     return await _post(client, "/api/v1/actions", body)

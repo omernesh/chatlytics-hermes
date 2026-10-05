@@ -1354,10 +1354,30 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         to is long gone; the entry is dropped either way so it can never
         be consumed twice).
         """
-        entry = self._progress_bubbles.pop(chat_id, None)
-        self._progress_bubble_owner.pop(chat_id, None)
+        entry = self._progress_bubbles.get(chat_id)
         if entry is None:
             return None
+        # v4.7.4 ownership gate. send() runs in the handler task, while the
+        # turn token lives in the _keep_typing task (a ContextVar set there
+        # never reaches send()), so ownership is decided from the live set:
+        # a bubble with an owner is consumed ONLY when its owner is the
+        # single live turn on this chat. Overlapping turns (owner not live,
+        # or >1 live) make the sender ambiguous -> leave the bubble alone
+        # (the turn-boundary drops clean it up) and send a fresh message.
+        # Un-owned bubbles (no typing scope) keep the legacy consume.
+        owner = self._progress_bubble_owner.get(chat_id)
+        if owner is not None:
+            live = self._live_typing_turns.get(chat_id) or set()
+            if not (owner in live and len(live) == 1):
+                logger.debug(
+                    "progress bubble for chat %s not consumed: owner %s "
+                    "ambiguous/not sole live turn",
+                    chat_id,
+                    owner,
+                )
+                return None
+        self._progress_bubbles.pop(chat_id, None)
+        self._progress_bubble_owner.pop(chat_id, None)
         message_id, ts = entry
         if time.monotonic() - ts > _PROGRESS_BUBBLE_TTL_S:
             logger.debug(
@@ -1426,13 +1446,19 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         try:
             if self._client is None or self._no_credential or not self._auth_token:
                 return
-            body, err = self._build_send_body(chat_id, "")
-            if body is None:
+            base, err = self._build_send_body(chat_id, "")
+            if base is None:
                 logger.debug("bubble delete skipped: %s", err)
                 return
-            body.pop("text", None)
-            body["action"] = "unsend"
-            body["messageId"] = message_id
+            # Hub /api/v1/actions is .strict(): only action/params/parameters/
+            # session are accepted (anything else -> 400 UNKNOWN_FIELD).
+            # Top-level `session` is legacy-mode only; never `accountId`.
+            body: Dict[str, Any] = {
+                "action": "unsend",
+                "params": {"chatId": chat_id, "messageId": message_id},
+            }
+            if "session" in base:
+                body["session"] = base["session"]
             _client = self._client_for_chat(chat_id) or self._client
             response = await asyncio.wait_for(
                 _client.post("/api/v1/actions", json=body), timeout=5.0

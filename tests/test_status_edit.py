@@ -737,14 +737,42 @@ def _mock_basics(mock_router, mid="bub-1", actions_status=200):
         return_value=httpx.Response(200, json={"success": True, "message_id": mid})
     )
     actions_route = mock_router.post("/api/v1/actions").mock(
-        return_value=httpx.Response(actions_status, json={"success": True})
+        side_effect=_strict_actions(actions_status)
     )
     return send_route, actions_route
 
 
+# Mirrors the hub's ActionRequestSchema (src/api-v1.ts, `.strict()` since
+# hub #103): any other top-level key is a 400 UNKNOWN_FIELD.
+_HUB_ACTION_KEYS = {"action", "params", "parameters", "session"}
+
+
+def _strict_actions(status=200):
+    def _handler(request):
+        body = _json.loads(request.content)
+        extra = sorted(set(body) - _HUB_ACTION_KEYS)
+        if extra:
+            return httpx.Response(
+                400,
+                json={
+                    "success": False,
+                    "code": "UNKNOWN_FIELD",
+                    "error": f"Unknown field: {', '.join(extra)}",
+                },
+            )
+        return httpx.Response(status, json={"success": True})
+
+    return _handler
+
+
 def _unsends(actions_route):
-    bodies = [_json.loads(c.request.content) for c in actions_route.calls]
-    return [b for b in bodies if b.get("action") == "unsend"]
+    """Unsend calls that the strict hub mock ACCEPTED, as their params."""
+    out = []
+    for c in actions_route.calls:
+        body = _json.loads(c.request.content)
+        if body.get("action") == "unsend" and c.response.status_code < 400:
+            out.append(body["params"])
+    return out
 
 
 async def test_start_of_turn_drop_removes_and_deletes_leftover(mock_router) -> None:
@@ -857,4 +885,73 @@ async def test_overlapping_turn_does_not_drop_live_bubble(mock_router) -> None:
     await asyncio.gather(task_a, return_exceptions=True)
     assert CHAT_ID not in adapter._progress_bubbles
     assert [u["messageId"] for u in _unsends(actions)] == ["bub-A"]
+    await adapter.disconnect()
+
+
+async def test_drop_leftover_unsend_body_matches_hub_schema(mock_router) -> None:
+    """Flat body (chatId/messageId top-level) is 400 UNKNOWN_FIELD at the hub;
+    the strict mock makes that bubble-never-deleted case go RED."""
+    adapter = make_adapter()
+    _, actions = _mock_basics(mock_router)
+    await adapter.connect()
+    adapter._store_progress_bubble(CHAT_ID, "stale-bubble")
+    await adapter._drop_leftover_progress_bubble(CHAT_ID, "t")
+    body = _json.loads(actions.calls.last.request.content)
+    assert set(body) <= _HUB_ACTION_KEYS
+    assert "accountId" not in body
+    assert body["params"] == {"chatId": CHAT_ID, "messageId": "stale-bubble"}
+    assert actions.calls.last.response.status_code == 200
+    await adapter.disconnect()
+
+
+async def test_send_does_not_consume_bubble_of_overlapping_turn(
+    mock_router,
+) -> None:
+    """Turn B's send() must not edit turn A's live bubble (A and B both live
+    on the chat). Goes RED if _pop_progress_bubble ignores ownership."""
+    adapter = make_adapter()
+    send_route, _ = _mock_basics(mock_router)
+    await adapter.connect()
+    adapter._store_progress_bubble(CHAT_ID, "bub-A", owner="turn-A")
+    adapter._live_typing_turns[CHAT_ID] = {"turn-A", "turn-B"}
+    await adapter.send(CHAT_ID, "reply from B")
+    assert "edit_message_id" not in send_bodies(send_route)[-1]
+    assert adapter._progress_bubbles[CHAT_ID][0] == "bub-A"  # untouched
+
+    # Owner not live at all (stale from a dead turn, another turn live):
+    adapter._live_typing_turns[CHAT_ID] = {"turn-B"}
+    await adapter.send(CHAT_ID, "reply from B again")
+    assert "edit_message_id" not in send_bodies(send_route)[-1]
+
+    # Sole live turn IS the owner: consumed as an edit.
+    adapter._live_typing_turns[CHAT_ID] = {"turn-A"}
+    await adapter.send(CHAT_ID, "reply from A")
+    assert send_bodies(send_route)[-1]["edit_message_id"] == "bub-A"
+    assert CHAT_ID not in adapter._progress_bubbles
+    await adapter.disconnect()
+
+
+async def test_live_set_empty_after_turns_end_incl_exception(mock_router) -> None:
+    """live.discard(turn_token) cleanup: no leaked tokens after normal end,
+    cancel, or an exception inside the typing heartbeat."""
+    adapter = make_adapter()
+    _mock_basics(mock_router)
+    await adapter.connect()
+    await run_turn(adapter, turn_duration=0.02)
+    assert adapter._live_typing_turns.get(CHAT_ID, set()) == set()
+
+    async def boom(*a, **k):
+        raise RuntimeError("heartbeat exploded")
+
+    adapter.send_typing = boom  # type: ignore[assignment]
+    stop = asyncio.Event()
+    task = asyncio.create_task(
+        adapter._keep_typing(CHAT_ID, interval=0.01, stop_event=stop)
+    )
+    await asyncio.sleep(0.03)
+    assert len(adapter._live_typing_turns[CHAT_ID]) == 1  # live mid-turn
+    stop.set()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert adapter._live_typing_turns.get(CHAT_ID, set()) == set()
     await adapter.disconnect()
