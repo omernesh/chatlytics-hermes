@@ -160,6 +160,7 @@ Quick reference (full table + per-profile YAML examples in
 | `CHATLYTICS_EXTRA_BOT_TOKENS` | no | **v4.6.0.** Additional `sk_bot_...` bearers this one platform instance also serves, comma-separated (config: `extra.extra_bot_tokens`, a YAML list). Requires `longpoll` inbound mode. |
 | `CHATLYTICS_STATUS_EDIT_IN_PLACE` | no | Progress-bubble edit-in-place (default `true`). |
 | `CHATLYTICS_UPLOAD_ALLOWED_ROOTS` | no | Default-deny allowlist for local-file media uploads. |
+| `CHATLYTICS_OWNER_TAGGING` | no | Owner tagging (default on when `allow_admin_from` / `group_allow_admin_from` is set); `false` disables. |
 
 \* One of `CHATLYTICS_BOT_TOKEN` / `CHATLYTICS_API_KEY`. Since v4.1.5 a
 token-less gateway still boots (degraded): data tools return a
@@ -224,6 +225,13 @@ See [docs/features.md](docs/features.md) for the full behavior contracts.
   may carry an additive `channel_prompt` field, applied per-turn via
   `MessageEvent.channel_prompt` (never persisted to transcript); falls back
   to the local `channel_prompts` config map.
+- **Owner tagging (#3)**: messages from the gateway's own admins
+  (`allow_admin_from` in DMs, `group_allow_admin_from` in groups) reach the
+  agent prefixed `[owner reply] ` with `metadata["whatsapp_from_owner"]`, the
+  same contract as the official Hermes WhatsApp integration. Decided in code
+  from the hub-delivered sender id (never the text); typed lookalike markers
+  are stripped from everyone. See
+  [docs/configuration.md](docs/configuration.md#owner-tagging).
 - **Tools work everywhere (v4.5.2/v4.5.3)** — a module-level live-adapter
   registry fixed "adapter is not connected" on hermes 0.16 longpoll
   gateways, and host-injected kwargs (e.g. `task_id`) are now filtered to

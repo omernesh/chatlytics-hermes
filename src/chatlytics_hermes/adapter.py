@@ -79,6 +79,7 @@ from .diagnostics import (
     map_connect_error,
 )
 from .inbound import make_health_handler, make_webhook_handler, normalize_payload
+from .owner import apply_owner_tagging
 
 
 # HERMES-V2 (Phase 336): chatlytics v4.0 introduces per-bot bearer tokens
@@ -2070,6 +2071,19 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 import dataclasses as _dc2
 
                 event = _dc2.replace(event, text=_new)
+
+        # #3 OWNER TAGGING — keep in sync with inbound.make_webhook_handler.
+        # Runs AFTER the sender-id / media-marker blocks so "[owner reply] "
+        # is the leading token. The decision reads ONLY the hub-delivered
+        # sender_jid (authenticated: this envelope arrived under the bot
+        # bearer) — never the text. retry_last replays re-run this on the
+        # memoized raw envelope, and the transform is idempotent, so no
+        # double tag. See owner.py for the full contract.
+        event = apply_owner_tagging(
+            event,
+            getattr(self.config, "extra", None) or {},
+            sender_authenticated=True,
+        )
 
         # v4.5.0 (chatlytics v5.4 P8): per-channel prompt injection.
         # ``MessageEvent.channel_prompt`` is the harness's NATIVE per-turn

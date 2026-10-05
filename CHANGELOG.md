@@ -1,3 +1,16 @@
+## [Unreleased]
+
+### Added
+
+- **Owner tagging (#3), parity with the official Hermes WhatsApp
+  integration.** Messages from `allow_admin_from` (DMs) /
+  `group_allow_admin_from` (groups) senders are prefixed `[owner reply] ` and
+  flagged `metadata["whatsapp_from_owner"]` (+ `chatlytics_from_owner`) on
+  both the longpoll and webhook paths. Decided from the authenticated sender
+  id only; typed lookalike markers are stripped from every sender; unsigned
+  webhooks never tag; replays never double-tag. On by default when an admin
+  list is configured; `CHATLYTICS_OWNER_TAGGING=false` disables.
+
 ## [4.7.4] - 2026-10-05
 
 ### Fixed
