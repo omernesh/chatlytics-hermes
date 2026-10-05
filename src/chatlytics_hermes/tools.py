@@ -472,7 +472,11 @@ READ_SCHEMA: Dict[str, Any] = {
 DELETE_SCHEMA: Dict[str, Any] = {
     "$schema": _DRAFT,
     "title": "chatlytics_delete",
-    "description": "Delete a message (local-only or for everyone, gateway-dependent).",
+    "description": (
+        "Delete a message (local-only or for everyone, gateway-dependent). "
+        "Bot-token callers may be refused: delete is not in the hub's "
+        "bot-dispatchable action set."
+    ),
     "type": "object",
     "properties": {
         "messageId": _message_id_field(),
@@ -487,7 +491,10 @@ DELETE_SCHEMA: Dict[str, Any] = {
 POLL_SCHEMA: Dict[str, Any] = {
     "$schema": _DRAFT,
     "title": "chatlytics_poll",
-    "description": "Create a WhatsApp poll in a chat.",
+    "description": (
+        "Create a WhatsApp poll in a chat. Bot-token callers may be refused: "
+        "poll is a send-class action, so the hub redirects bots to POST /api/v1/send."
+    ),
     "type": "object",
     "properties": {
         "chatId": _chat_id_field(),
@@ -837,9 +844,11 @@ async def chatlytics_poll(
         "action": "poll",
         "params": {
             "chatId": chatId,
-            "question": question,
-            "options": list(options),
-            "multiple": bool(multiple),
+            # Hub poll reader (channel.ts) takes pollQuestion / pollOption /
+            # multipleAnswers; `question`/`options`/`multiple` are ignored.
+            "pollQuestion": question,
+            "pollOption": list(options),
+            "multipleAnswers": bool(multiple),
         },
     }
     return await _post(client, "/api/v1/actions", body)
@@ -1300,10 +1309,12 @@ async def chatlytics_dispatch(
     session: Optional[str] = None,
 ) -> Dict[str, Any]:
     # Hub /api/v1/actions is .strict(): a top-level `target` is UNKNOWN_FIELD.
-    # Carry it inside params (caller-supplied params win).
+    # Carry it inside params as `chatId` -- send-path actions read only
+    # chatId/to, and getGroup/getContact/react also fall back to chatId.
+    # Caller-supplied params win (an explicit chatId is never clobbered).
     merged: Dict[str, Any] = {}
     if target is not None:
-        merged["target"] = target
+        merged["chatId"] = target
     if parameters is not None:
         merged.update(parameters)
     body: Dict[str, Any] = {"action": action}
