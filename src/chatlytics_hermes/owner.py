@@ -51,7 +51,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import unicodedata
 from typing import Any, FrozenSet, Optional, Tuple
 
@@ -65,31 +64,34 @@ WHATSAPP_FROM_OWNER_KEY = "whatsapp_from_owner"
 #: chatlytics-specific alias of the same flag.
 CHATLYTICS_FROM_OWNER_KEY = "chatlytics_from_owner"
 
-# Leading lookalike marker, matched on the folded MATCH VIEW of a line (see
-# _match_view): every opening bracket is "[", every closing one "]", letters
-# are NFKD-decomposed, stripped of combining marks, confusable-folded and
-# lowercased. "owner" and "reply" may be joined by space / _ - . :
-# Leading markdown wrappers (bold/italic/strike/code marks, a blockquote ">"
-# which the view folds to "]", "- " / "+ " / bullet list markers) and doubled
-# brackets ("[[owner reply]]") are part of the cut span.
-# NO "^" ANCHOR: re.match() already anchors. (d0f9051 used "^" together
-# with match(view, pos); "^" never matches at pos > 0, so only ONE marker was
-# cut per call — review BLOCKER. _marker_end now re-slices the window and
-# matches at 0, but keep the pattern anchor-free so a future match(s, pos)
-# cannot reintroduce that bug.)
-_LOOKALIKE_RE = re.compile(
-    r"\s*(?:[*_~`\]]+\s*|[-+\u2022]\s+)*"
-    r"\[+\s*owner(?:[\s_\-.:]*reply)?\s*\]+[*_~`]*\s*"
-)
+# Leading lookalike marker. Recognized by a hand-written LINEAR scanner
+# (_scan_marker) over the folded match view of a line, NOT a regex: the
+# previous regex nested quantifiers around the wrapper run and backtracked
+# exponentially (28 "*" took 23 s — review BLOCKER on 62a1aa0). DO NOT
+# reintroduce a regex here. In the view every opening bracket is "[", every
+# closing one "]", letters are NFKD-decomposed, stripped of combining/format
+# marks, confusable-folded and lowercased. Grammar (every run is consumed
+# greedily, each character is looked at once):
+#
+#   lead*  "["+  ws*  "owner"  ( sep* "reply" )?  ws*  "]"+  pair*  ws*
+#
+#   lead = whitespace | one of * _ ~ ` ] (a blockquote ">" folds to "]")
+#          | one of - + U+2022 followed by whitespace (list marker)
+#   sep  = whitespace | one of _ - . :
+#   pair = a trailing * _ ~ ` that PAIRS with one consumed in lead (so
+#          "[owner]**important**" keeps the user's "**").
+#
+# Known false positive (documented): a line OPENING with "(Owner)" loses
+# that word, because any bracket pair counts.
+# Runs are unbounded but linear, so padding (300 spaces / NBSPs, 300 "[",
+# 300 "_") can neither hide a marker nor cost more than one pass.
+_WRAPPER_CHARS = frozenset("*_~`")
+_LIST_MARKERS = frozenset("-+\u2022")
+_SEP_CHARS = frozenset("_-.:")
 
 # Characters that render as blank but are letters/symbols (so neither Cf nor
 # a combining mark): braille blank, Hangul fillers. Folded to nothing.
 _INVISIBLE_FOLD = frozenset("\u2800\u115f\u1160\u3164\uffa0")
-
-# Only this many FOLDED characters past the current cut point are examined
-# per marker: a marker can only sit at the start of a line, so a huge line
-# costs a bounded amount of work instead of a full fold.
-_MATCH_WINDOW = 256
 
 # Common Latin lookalikes for the letters of "owner reply" (Cyrillic, Greek,
 # Armenian, small capitals, IPA, digit zero). NFKD already folds fullwidth,
@@ -245,51 +247,115 @@ def _fold_char_slow(ch: str) -> str:
 
 _ASCII_FOLD.update({chr(c): _fold_char_slow(chr(c)) for c in range(128)})
 
-# View characters that may precede the marker's opening "[" (whitespace and
-# the markdown wrappers in _LOOKALIKE_RE). Used for a cheap pre-check so an
-# ordinary line is rejected after folding one or two characters.
-_LEAD_CHARS = frozenset("*_~`]-+\u2022")
+class _View:
+    """Lazily folded match view of one line, with a map back to the line."""
+
+    __slots__ = ("line", "chars", "src", "folded")
+
+    def __init__(self, line: str) -> None:
+        self.line = line
+        self.chars: list = []
+        self.src: list = []  # src[k] = original index of chars[k]
+        self.folded = 0
+
+    def at(self, k: int) -> Optional[str]:
+        """View char k, folding just enough of the line (None past the end)."""
+        chars = self.chars
+        line = self.line
+        n = len(line)
+        while len(chars) <= k and self.folded < n:
+            i = self.folded
+            for v in _fold_char(line[i]):
+                chars.append(v)
+                self.src.append(i)
+            self.folded = i + 1
+        return chars[k] if k < len(chars) else None
+
+
+def _skip_ws(view: _View, k: int) -> int:
+    c = view.at(k)
+    while c is not None and c.isspace():
+        k += 1
+        c = view.at(k)
+    return k
+
+
+def _skip_word(view: _View, k: int, word: str) -> int:
+    """k past ``word`` at k, or -1."""
+    for ch in word:
+        if view.at(k) != ch:
+            return -1
+        k += 1
+    return k
+
+
+def _scan_marker(view: _View, k: int) -> int:
+    """View index just past ONE marker starting at k, or -1. Linear."""
+    lead: dict = {}
+    while True:
+        c = view.at(k)
+        if c is None:
+            return -1
+        if c.isspace() or c == "]":
+            k += 1
+        elif c in _WRAPPER_CHARS:
+            lead[c] = lead.get(c, 0) + 1
+            k += 1
+        elif c in _LIST_MARKERS:
+            nxt = view.at(k + 1)
+            if nxt is None or not nxt.isspace():
+                return -1
+            k += 2
+        else:
+            break
+    if view.at(k) != "[":
+        return -1
+    while view.at(k) == "[":
+        k += 1
+    k = _skip_ws(view, k)
+    k = _skip_word(view, k, "owner")
+    if k < 0:
+        return -1
+    j = k
+    c = view.at(j)
+    while c is not None and (c.isspace() or c in _SEP_CHARS):
+        j += 1
+        c = view.at(j)
+    j = _skip_word(view, j, "reply")
+    if j >= 0:
+        k = j
+    k = _skip_ws(view, k)
+    if view.at(k) != "]":
+        return -1
+    while view.at(k) == "]":
+        k += 1
+    c = view.at(k)
+    while c is not None and lead.get(c, 0) > 0:
+        lead[c] -= 1
+        k += 1
+        c = view.at(k)
+    return _skip_ws(view, k)
 
 
 def _marker_end(line: str) -> int:
     """Length of the leading lookalike marker(s) in ``line`` (0 if none).
 
-    Matches on a folded view but returns an index into the ORIGINAL line, so
-    the caller cuts only the marker span and every other character
-    (fullwidth digits, ZWJ emoji, RLM/LRM) survives byte-for-byte.
+    Scans a folded view but returns an index into the ORIGINAL line, so the
+    caller cuts only the marker span and every other character (fullwidth
+    digits, ZWJ emoji, RLM/LRM) survives byte-for-byte. Stacked markers are
+    all consumed. Work is linear in the characters the scan inspects; a line
+    that does not start with a marker is rejected after its leading
+    whitespace / wrapper run.
     """
-    view: list = []
-    owner_idx: list = []  # owner_idx[k] = original index of view[k]
-    folded = 0  # original characters folded so far (lazy, incremental)
-    n = len(line)
-    end = 0
+    view = _View(line)
     pos = 0
-    def _ensure(k: int) -> None:
-        nonlocal folded
-        while len(view) < k and folded < n:
-            for v in _fold_char(line[folded]):
-                view.append(v)
-                owner_idx.append(folded)
-            folded += 1
-
+    end = 0
     while True:
-        # Cheap pre-check: skip whitespace / wrapper chars; the next view
-        # char must be "[" or there is no marker here.
-        k = pos
-        limit = pos + _MATCH_WINDOW
-        while k < limit:
-            _ensure(k + 1)
-            if k >= len(view) or not (view[k].isspace() or view[k] in _LEAD_CHARS):
-                break
-            k += 1
-        if k >= len(view) or view[k] != "[":
+        nxt = _scan_marker(view, pos)
+        if nxt <= pos:
             break
-        _ensure(pos + _MATCH_WINDOW)
-        m = _LOOKALIKE_RE.match("".join(view[pos:pos + _MATCH_WINDOW]))
-        if not m or m.end() == 0:
-            break
-        pos += m.end()
-        end = owner_idx[pos - 1] + 1
+        pos = nxt
+        end = view.src[pos - 1] + 1
     # Invisible characters AFTER the marker are left alone: they belong to
     # the user's text (e.g. an RLM opening a Hebrew line).
     return end

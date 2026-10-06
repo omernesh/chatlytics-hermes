@@ -176,6 +176,11 @@ owner's own typed copy never doubles the prefix; replays (`/retry`) produce
 the same single tag. If cutting a marker would leave a slash command the
 sender did not type, the marker is replaced by `[marker removed] ` instead.
 
+Known false positive: because any bracket pair counts, a line that *opens*
+with a bracketed "owner" word, e.g. `(Owner) said hi`, loses that word
+(`said hi`). Mid-line occurrences are never touched. This is accepted so
+that `(owner reply)` / `【owner】` lookalikes are caught.
+
 On hermes-agent 0.14 the flag is also mirrored onto `event.raw_message`
 (`whatsapp_from_owner` / `chatlytics_from_owner`): `metadata` is not a real
 field there, so a `pre_gateway_dispatch` rewrite hook drops it, while
