@@ -16,8 +16,9 @@
   unsigned webhook means no tag. Replayed deliveries are never tagged twice.
 - **Typed markers are neutralized:** a lookalike `[owner reply]` / `[owner]`
   typed by any sender (including bracket, markdown, Unicode-confusable and
-  invisible-character variants) is stripped before the real tag is decided,
-  so nobody can impersonate the owner by typing the marker.
+  invisible-character variants) is stripped from the start of every line.
+  This text scrub is best effort; the authoritative signal is the
+  `whatsapp_from_owner` flag, which is set from the sender id only.
 - No-op unless `allow_admin_from` / `group_allow_admin_from` is configured.
   `CHATLYTICS_OWNER_TAGGING=false` disables it entirely.
 
