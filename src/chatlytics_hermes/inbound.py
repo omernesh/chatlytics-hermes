@@ -27,6 +27,8 @@ from typing import Any, Callable, Dict, Optional
 
 from aiohttp import web
 
+from .owner import apply_owner_tagging, tagging_enabled
+
 try:
     from gateway.platforms.base import MessageEvent, MessageType
     from gateway.session import SessionSource
@@ -236,6 +238,26 @@ def make_webhook_handler(adapter: Any) -> Callable[[web.Request], Any]:
                     register(event.source.chat_id, inbound_session)
         except Exception:  # noqa: BLE001 -- never let session bookkeeping break dispatch
             logger.debug("inbound session bookkeeping raised; continuing")
+
+        # #3 OWNER TAGGING — same block as adapter._dispatch_envelope (keep
+        # the two in sync). The sender identity on a webhook is authenticated
+        # ONLY when the HMAC signature was verified above (a configured
+        # secret + mismatch already returned 401). Without a secret anyone
+        # who can reach this port can claim any senderId, so the owner flag
+        # fails closed — lookalike markers are still neutralized.
+        _owner_extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
+        if not secret and tagging_enabled(_owner_extra):
+            _warn_once(
+                "owner_tagging:webhook_unsigned",
+                "owner tagging is configured (allow_admin_from / "
+                "group_allow_admin_from) but CHATLYTICS_WEBHOOK_SECRET is "
+                "unset — webhook sender ids are unauthenticated, so NO "
+                "message will be tagged as from the owner. Set the secret or "
+                "use CHATLYTICS_INBOUND_MODE=longpoll",
+            )
+        event = apply_owner_tagging(
+            event, _owner_extra, sender_authenticated=bool(secret)
+        )
 
         # v4.5.0 (chatlytics v5.4 P8): per-channel prompt injection — same
         # pattern as adapter._dispatch_envelope (keep the two in sync).

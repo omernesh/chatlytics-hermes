@@ -79,6 +79,7 @@ from .diagnostics import (
     map_connect_error,
 )
 from .inbound import make_health_handler, make_webhook_handler, normalize_payload
+from .owner import apply_owner_tagging, neutralize_event_text
 
 
 # HERMES-V2 (Phase 336): chatlytics v4.0 introduces per-bot bearer tokens
@@ -2038,6 +2039,14 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # it. InboundEnvelope always carries session_id under longpoll.
         self.register_chat_session(body["chatId"], body["session"])
         event = normalize_payload(body, self.platform)
+        # #3 OWNER TAGGING step 1 — cut typed lookalike markers from the RAW
+        # text NOW, before the "[<sender id>] " prefix below is added (after
+        # it, a typed marker is no longer at the start of line 1 and the
+        # anchored match misses it). Step 2 (apply_owner_tagging) runs after
+        # the media block.
+        event = neutralize_event_text(
+            event, getattr(self.config, "extra", None) or {}
+        )
 
         # Identity bridge (opt-in): prefix the message text with the sender's
         # authoritative platform id so the agent always sees WHO is speaking —
@@ -2070,6 +2079,21 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 import dataclasses as _dc2
 
                 event = _dc2.replace(event, text=_new)
+
+        # #3 OWNER TAGGING step 2 — keep in sync with
+        # inbound.make_webhook_handler. Runs AFTER the sender-id /
+        # media-marker blocks so "[owner reply] " is the leading token (raw
+        # text was already neutralized in step 1; re-neutralizing here is a
+        # no-op on our own prefixes). The decision reads ONLY the hub-delivered
+        # sender_jid (authenticated: this envelope arrived under the bot
+        # bearer) — never the text. retry_last replays re-run this on the
+        # memoized raw envelope, and the transform is idempotent, so no
+        # double tag. See owner.py for the full contract.
+        event = apply_owner_tagging(
+            event,
+            getattr(self.config, "extra", None) or {},
+            sender_authenticated=True,
+        )
 
         # v4.5.0 (chatlytics v5.4 P8): per-channel prompt injection.
         # ``MessageEvent.channel_prompt`` is the harness's NATIVE per-turn

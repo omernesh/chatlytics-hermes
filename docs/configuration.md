@@ -52,8 +52,9 @@ first):
 | `CHATLYTICS_STATUS_BUBBLE_AFTER_S` | no | Seconds an agent turn must run before the "working…" bubble fires (default `8`). Values `<= 0` disable the bubble. |
 | `CHATLYTICS_STATUS_BUBBLE_TEXT` | no | Text of the progress bubble (default `⏳ working…`). |
 | `CHATLYTICS_UPLOAD_ALLOWED_ROOTS` | no | OS-pathsep-separated absolute paths that media tools may read from disk. **Default-deny when unset.** See below. |
-| `CHATLYTICS_INJECT_SENDER_IDS` | no | When truthy (`1`/`true`/`yes`/`on`), prefixes every inbound message's text with the sender's platform id — `[972544329000@c.us] hello` — so agent sessions can identify WHO is speaking (display names are absent/spoofable on WhatsApp; the envelope `sender_jid` is the platform truth). Per-profile opt-in; `extra.inject_sender_ids` equivalent. |
+| `CHATLYTICS_INJECT_SENDER_IDS` | no | When truthy (`1`/`true`/`yes`/`on`), prefixes every inbound message's text with the sender's platform id — `[15550001111@c.us] hello` — so agent sessions can identify WHO is speaking (display names are absent/spoofable on WhatsApp; the envelope `sender_jid` is the platform truth). Per-profile opt-in; `extra.inject_sender_ids` equivalent. |
 | `CHATLYTICS_INJECT_MEDIA_MARKERS` | no | When truthy, appends `[media: document \| id: <message_id>]` to inbound messages that carry media (`has_media` on the envelope), so agent sessions know a file arrived even though the envelope carries no media URL. Per-profile opt-in; `extra.inject_media_markers` equivalent. |
+| `CHATLYTICS_OWNER_TAGGING` | no | Owner tagging (default **on** whenever `allow_admin_from` or `group_allow_admin_from` is configured). `0`/`false`/`no`/`off` disables; `extra.owner_tagging` equivalent. See [Owner tagging](#owner-tagging). |
 
 \* One of `CHATLYTICS_BOT_TOKEN` / `CHATLYTICS_API_KEY` must be set for the
 plugin to do anything useful.
@@ -128,6 +129,65 @@ Longpoll is the transport that carries **control envelopes** (`/new` `/stop`
 `/retry` conversation commands) and **owner-DM question resolutions** — see
 [features.md](features.md) and [approvals.md](approvals.md). It is also
 self-healing: see "Durable longpoll" in [features.md](features.md).
+
+## Owner tagging
+
+Same contract as the official Hermes WhatsApp integration. A message from
+an owner reaches the agent with
+
+- its text prefixed `[owner reply] ` (exactly once), and
+- `MessageEvent.metadata["whatsapp_from_owner"] = True` (plus the alias
+  `chatlytics_from_owner`). hermes-agent 0.14 has no `metadata` field on
+  `MessageEvent`; the plugin attaches one, so hooks reading
+  `event.metadata` see the flag on any version.
+
+**Who is an owner**: the gateway's own slash-command admin lists, per
+scope, exactly as Hermes scopes them: `allow_admin_from` for DMs,
+`group_allow_admin_from` for groups. A DM admin is not an owner in groups
+unless listed there too. Channels and broadcasts never have owners.
+
+```yaml
+platforms:
+  chatlytics:
+    extra:
+      allow_admin_from: ["15550001111@c.us", "123456789012345@lid"]
+      group_allow_admin_from: ["15550001111@c.us"]
+```
+
+**Identity forms**: `@c.us`, `@s.whatsapp.net`, `+`/bare digits and `:N`
+device suffixes all match the same phone. `@lid` is a separate namespace,
+so an owner WhatsApp may deliver as a LID must be listed in **both** forms.
+(The chatlytics hub resolves LIDs internally but does not yet send the
+resolved phone on the envelope.)
+
+**Spoof resistance**: the decision uses only the sender id the hub
+delivered on an authenticated transport: longpoll (bot bearer) or a webhook
+whose `X-Chatlytics-Signature` verified. **Without
+`CHATLYTICS_WEBHOOK_SECRET`, webhook senders are unauthenticated and never
+tagged** (a warning is logged once). Message text never sets the flag. On
+top of that, while tagging is active a typed `[owner reply]` / `[owner]` at
+the start of any line is cut from every message before the real marker is
+applied. Matching folds case, any bracket pair, fullwidth and common
+Cyrillic/Greek lookalike letters, combining marks and zero-width padding, and
+treats every Unicode line break as a line start. This text scrub is
+best-effort: an exotic glyph outside the fold table can survive as plain
+text, but it never sets the flag and never leads an owner's message. An
+owner's own typed copy never doubles the prefix; replays (`/retry`) produce
+the same single tag. If cutting a marker would leave a slash command the
+sender did not type, the marker is replaced by `[marker removed] ` instead.
+
+Known false positive: because any bracket pair counts, a line that *opens*
+with a bracketed "owner" word, e.g. `(Owner) said hi`, loses that word
+(`said hi`). Mid-line occurrences are never touched. This is accepted so
+that `(owner reply)` / `【owner】` lookalikes are caught.
+
+On hermes-agent 0.14 the flag is also mirrored onto `event.raw_message`
+(`whatsapp_from_owner` / `chatlytics_from_owner`): `metadata` is not a real
+field there, so a `pre_gateway_dispatch` rewrite hook drops it, while
+`raw_message` survives. The keys are removed from non-owner events.
+
+**Slash commands** from an owner keep their leading `/` (no text prefix, so
+Hermes still sees a command); the metadata flag is still set.
 
 ## Security: filePath upload allowlist (`CHATLYTICS_UPLOAD_ALLOWED_ROOTS`)
 
