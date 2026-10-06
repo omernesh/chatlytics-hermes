@@ -1,15 +1,30 @@
-## [Unreleased]
+## [4.8.0] - 2026-10-06
 
 ### Added
 
-- **Owner tagging (#3), parity with the official Hermes WhatsApp
-  integration.** Messages from `allow_admin_from` (DMs) /
-  `group_allow_admin_from` (groups) senders are prefixed `[owner reply] ` and
-  flagged `metadata["whatsapp_from_owner"]` (+ `chatlytics_from_owner`) on
-  both the longpoll and webhook paths. Decided from the authenticated sender
-  id only; typed lookalike markers are stripped from every sender; unsigned
-  webhooks never tag; replays never double-tag. On by default when an admin
-  list is configured; `CHATLYTICS_OWNER_TAGGING=false` disables.
+- **Owner tagging (#3), following the official Hermes WhatsApp pattern.**
+  When the sender of an inbound message is one of the bot's owners, the
+  message text is prefixed `[owner reply] ` and the message carries
+  `metadata["whatsapp_from_owner"] = True` (plus the alias
+  `chatlytics_from_owner`), on both the longpoll and webhook paths, so the
+  agent can tell its owner's instructions apart from everyone else's.
+- **Who counts as the owner:** decided only from the hub's authenticated
+  sender id, matched against `allow_admin_from` (DMs) and
+  `group_allow_admin_from` (groups). Never from message text or display
+  names.
+- **Fail closed:** no admin list configured, an unresolvable sender, or an
+  unsigned webhook means no tag. Replayed deliveries are never tagged twice.
+- **Typed markers are neutralized:** a lookalike `[owner reply]` / `[owner]`
+  typed by any sender (including bracket, markdown, Unicode-confusable and
+  invisible-character variants) is stripped before the real tag is decided,
+  so nobody can impersonate the owner by typing the marker.
+- No-op unless `allow_admin_from` / `group_allow_admin_from` is configured.
+  `CHATLYTICS_OWNER_TAGGING=false` disables it entirely.
+
+### Known issues
+
+- A message line that opens with `(Owner)` loses that word, because the
+  marker neutralizer treats any bracket pair as a marker wrapper.
 
 ## [4.7.4] - 2026-10-05
 
