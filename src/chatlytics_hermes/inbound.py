@@ -27,7 +27,12 @@ from typing import Any, Callable, Dict, Optional
 
 from aiohttp import web
 
-from .owner import apply_owner_tagging, tagging_enabled
+from .owner import (
+    apply_owner_access,
+    apply_owner_tagging,
+    report_gateway_refusal,
+    tagging_enabled,
+)
 
 try:
     from gateway.platforms.base import MessageEvent, MessageType
@@ -90,6 +95,25 @@ def _derive_message_type(payload: Dict[str, Any]) -> "MessageType":
     return MessageType.TEXT
 
 
+def derive_chat_type(chat_id: Any, declared: Any, is_group: Any = None) -> str:
+    """Chat type for a SessionSource — the chat JID and ``isGroup`` win.
+
+    #5 review: the chatlytics "hermes" webhook transform
+    (chatlytics.ai src/webhook-forwarder.ts) sends ``isGroup: true`` and NO
+    ``chatType``, so the old ``chatType or "dm"`` default labelled every group
+    message a DM — and a DM admin got owner rights in groups. A ``@g.us``
+    chat or ``isGroup is True`` is ALWAYS a group, whatever was declared.
+    DO NOT reintroduce a bare "dm" default ahead of these checks.
+    """
+    cid = str(chat_id or "").strip().lower()
+    if cid.endswith("@g.us") or is_group is True:
+        return "group"
+    if cid.endswith("@newsletter"):
+        return "channel"
+    d = str(declared or "").strip()
+    return d if d else "dm"
+
+
 def normalize_payload(
     body: Dict[str, Any],
     platform: Any,
@@ -140,7 +164,7 @@ def normalize_payload(
         platform=platform,
         chat_id=chat_id,
         user_id=str(sender_id) if sender_id is not None else None,
-        chat_type=str(body.get("chatType") or "dm"),
+        chat_type=derive_chat_type(chat_id, body.get("chatType"), body.get("isGroup")),
         message_id=str(message_id) if message_id is not None else None,
     )
 
@@ -167,6 +191,12 @@ def verify_hmac(
     mismatched signature does not leak per-byte timing information.
     Returns False on any malformed input (missing signature, wrong
     length, non-hex characters).
+
+    TODO(#6): body-only HMAC is replayable — chatlytics signs v1 only
+    (no timestamp / v2 header exists today). Once it sends a timestamped v2
+    signature, verify it within ±5 min and apply the owner pin only on a
+    fresh v2. TODO(#7): chatlytics sends ``sha256=<hex>``; this compare
+    expects bare hex.
     """
     if not provided_signature:
         return False
@@ -258,6 +288,11 @@ def make_webhook_handler(adapter: Any) -> Callable[[web.Request], Any]:
         event = apply_owner_tagging(
             event, _owner_extra, sender_authenticated=bool(secret)
         )
+        # #5 OWNER ACCESS — same block as adapter._dispatch_envelope (keep in
+        # sync). Unsigned webhook → no pin (fail closed).
+        _owner_pinned = apply_owner_access(
+            event, _owner_extra, sender_authenticated=bool(secret)
+        )
 
         # v4.5.0 (chatlytics v5.4 P8): per-channel prompt injection — same
         # pattern as adapter._dispatch_envelope (keep the two in sync).
@@ -309,6 +344,14 @@ def make_webhook_handler(adapter: Any) -> Callable[[web.Request], Any]:
         except Exception:  # noqa: BLE001 -- prompt injection must never break dispatch
             logger.debug("channel_prompt injection raised; continuing")
 
+        # #5: never a silent refusal — WARN with the reason (advisory only).
+        report_gateway_refusal(
+            adapter,
+            event,
+            _owner_extra,
+            sender_authenticated=bool(secret),
+            pinned=_owner_pinned,
+        )
         try:
             await adapter.handle_message(event)
         except Exception:  # noqa: BLE001 -- never let dispatch errors crash the server

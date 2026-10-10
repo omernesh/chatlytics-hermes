@@ -49,8 +49,11 @@ phone form of an ``@lid`` sender on the envelope.
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import logging
 import os
+import time
 import unicodedata
 from typing import Any, FrozenSet, Optional, Tuple
 
@@ -176,14 +179,43 @@ def _coerce_ids(raw: Any) -> FrozenSet[Tuple[str, str]]:
     return frozenset(out)
 
 
-def owner_ids_for_chat_type(extra: Any, chat_type: Any) -> FrozenSet[Tuple[str, str]]:
-    """The owner set for one scope. Channels/broadcasts have no owners."""
+_NOT_GIVEN: Any = object()
+
+
+def chat_kind(chat_id: Any) -> str:
+    """``"group"`` / ``"channel"`` / ``"dm"`` / ``"unknown"`` from the chat JID alone."""
+    s = str(chat_id or "").strip().lower()
+    if s.endswith("@g.us"):
+        return "group"
+    if s.endswith("@newsletter") or s.endswith("@broadcast"):
+        return "channel"
+    if canonical_identity(s) is not None:
+        return "dm"
+    return "unknown"
+
+
+def owner_ids_for_chat_type(
+    extra: Any, chat_type: Any, chat_id: Any = _NOT_GIVEN
+) -> FrozenSet[Tuple[str, str]]:
+    """The owner set for one scope. Channels/broadcasts have no owners.
+
+    When ``chat_id`` is supplied (every dispatch path does), the declared
+    ``chat_type`` must AGREE with the chat JID — a DM scope needs a user JID,
+    a group scope a ``@g.us`` JID. Any mismatch or unrecognized chat id fails
+    closed (#5 review: a group message mislabelled ``dm`` must never be judged
+    against the DM admin list).
+    """
     if not isinstance(extra, dict):
         return frozenset()
     ct = str(chat_type or "").strip().lower()
+    kind = None if chat_id is _NOT_GIVEN else chat_kind(chat_id)
     if ct in _DM_CHAT_TYPES:
+        if kind is not None and kind != "dm":
+            return frozenset()
         return _coerce_ids(extra.get("allow_admin_from"))
     if ct in _GROUP_CHAT_TYPES:
+        if kind is not None and kind != "group":
+            return frozenset()
         return _coerce_ids(extra.get("group_allow_admin_from"))
     return frozenset()
 
@@ -207,12 +239,22 @@ def tagging_enabled(extra: Any) -> bool:
     )
 
 
-def is_owner(sender_id: Any, chat_type: Any, extra: Any) -> bool:
+def is_owner(sender_id: Any, chat_type: Any, extra: Any, chat_id: Any = _NOT_GIVEN) -> bool:
     """Deterministic owner decision from the delivered sender identity."""
     ident = canonical_identity(sender_id)
     if ident is None:
         return False
-    return ident in owner_ids_for_chat_type(extra, chat_type)
+    return ident in owner_ids_for_chat_type(extra, chat_type, chat_id)
+
+
+def _source_is_owner(source: Any, extra: Any) -> bool:
+    """is_owner for a SessionSource — always cross-checks the chat JID."""
+    return is_owner(
+        getattr(source, "user_id", None),
+        getattr(source, "chat_type", None),
+        extra,
+        getattr(source, "chat_id", None),
+    )
 
 
 # ASCII fast path for _fold_char: same result as the general path (ASCII is
@@ -482,6 +524,197 @@ def apply_owner_tagging(event: Any, extra: Any, *, sender_authenticated: bool) -
     return event
 
 
+# --- #5 owner ACCESS pin + refusal visibility --------------------------------
+#
+# Owner TAGGING (above) only labels a message. Whether the gateway lets it in
+# at all is decided by hermes ``_is_user_authorized``, whose allow-all rung
+# (``GATEWAY_ALLOW_ALL_USERS``) is read through ``platform_gate_env``. Under
+# ``gateway.multiplex_profiles`` that reader returns the PROFILE scope's value
+# and never falls back to ``os.environ``, so an allow-all set on the systemd
+# unit silently stopped applying and the owner was dropped + asked to pair
+# (2026-10-10 incident, #5).
+#
+# The pin uses the per-message, adapter-verified grant hermes already has:
+# ``SessionSource.role_authorized`` (checked BEFORE pairing and the env
+# allowlists; ``is True`` only). It is set ONLY for a sender that is an owner
+# by the same deterministic rule as tagging (authenticated transport + the
+# gateway's own ``allow_admin_from`` / ``group_allow_admin_from``). Every
+# other sender is left exactly as hermes would judge it — no widening.
+# DO NOT key this off message text, an unauthenticated webhook, or the
+# tagging opt-out (that opt-out is about the TEXT prefix, not access).
+
+_ALLOW_ALL_TRUTHY = frozenset({"true", "1", "yes"})
+
+
+def _source_supports_access_pin(source: Any) -> bool:
+    """True when this hermes-agent's SessionSource declares ``role_authorized``."""
+    try:
+        return dataclasses.is_dataclass(source) and any(
+            f.name == "role_authorized" for f in dataclasses.fields(source)
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
+#: warn-once keys (fixed literals only — bounded by construction).
+_WARNED: set = set()
+
+
+def _warn_once(key: str, msg: str, *args: Any) -> None:
+    if key in _WARNED:
+        logger.debug(msg, *args)
+        return
+    _WARNED.add(key)
+    logger.warning(msg, *args)
+
+
+def apply_owner_access(event: Any, extra: Any, *, sender_authenticated: bool) -> bool:
+    """Pin gateway access for an authenticated owner. Returns True when pinned.
+
+    Never raises and never touches a non-owner's source.
+    """
+    try:
+        if not sender_authenticated:
+            return False
+        source = getattr(event, "source", None)
+        if source is None or not _source_is_owner(source, extra):
+            return False
+        if not _source_supports_access_pin(source):
+            # Older hermes-agent: no multiplexing there either, so the
+            # process-env gates still apply. Say so once; set nothing.
+            _warn_once(
+                "owner_access:unsupported",
+                "owner access pin unavailable: this hermes-agent's SessionSource "
+                "has no role_authorized field, so owners (allow_admin_from) are "
+                "admitted only by the gateway's own allowlist / pairing / "
+                "GATEWAY_ALLOW_ALL_USERS (#5)",
+            )
+            return False
+        source.role_authorized = True
+        return True
+    except Exception:  # noqa: BLE001 -- must never break dispatch
+        logger.debug("owner access pin raised", exc_info=True)
+        return False
+
+
+def _refusal_reason(event: Any, extra: Any, *, sender_authenticated: bool, pinned: bool) -> str:
+    source = getattr(event, "source", None)
+    sender = getattr(source, "user_id", None)
+    owner = _source_is_owner(source, extra)
+    if owner and pinned:
+        return (
+            "sender is an owner and was pinned (role_authorized), yet the gateway "
+            "still refused — check pre_gateway_dispatch hooks / hermes-agent version"
+        )
+    if owner and not sender_authenticated:
+        return (
+            "sender matches allow_admin_from but the webhook is unsigned "
+            "(CHATLYTICS_WEBHOOK_SECRET unset), so the owner pin was NOT applied"
+        )
+    if owner:
+        return (
+            "sender matches allow_admin_from but this hermes-agent cannot pin "
+            "owner access (no SessionSource.role_authorized)"
+        )
+    if str(os.environ.get("GATEWAY_ALLOW_ALL_USERS", "")).strip().lower() in _ALLOW_ALL_TRUTHY:
+        return (
+            "GATEWAY_ALLOW_ALL_USERS is set in the gateway PROCESS env but is not "
+            "visible to this profile: under gateway.multiplex_profiles the gate is "
+            "read from the profile's own .env only (#5). Put it in the profile .env, "
+            "list the sender in allow_admin_from, or approve the pairing code"
+        )
+    return (
+        "sender is not an owner (allow_admin_from), not paired and not in any "
+        "allowlist — the gateway will pair / decline / ignore per "
+        "unauthorized_dm_behavior"
+    )
+
+
+#: One WARNING per (sender, chat) per this many seconds; DEBUG in between.
+REFUSAL_WARN_TTL_S = 600.0
+#: Bound on remembered (sender, chat) pairs; oldest evicted first.
+_REFUSAL_WARN_MAX = 1024
+_REFUSAL_WARNED: "dict[Tuple[str, str], float]" = {}
+
+
+def _refusal_should_warn(sender: Any, chat: Any, now: Optional[float] = None) -> bool:
+    now = time.monotonic() if now is None else now
+    key = (str(sender), str(chat))
+    last = _REFUSAL_WARNED.get(key)
+    if last is not None and now - last < REFUSAL_WARN_TTL_S:
+        return False
+    _REFUSAL_WARNED.pop(key, None)
+    _REFUSAL_WARNED[key] = now  # re-insert → dict order = age order
+    while len(_REFUSAL_WARNED) > _REFUSAL_WARN_MAX:
+        _REFUSAL_WARNED.pop(next(iter(_REFUSAL_WARNED)))
+    return True
+
+
+def mask_id(value: Any) -> str:
+    """Mask a WhatsApp id for logs: keep the last 4 digits and the domain.
+
+    ``972544329000@c.us`` → ``***9000@c.us``; ids of 4 chars or fewer are
+    fully masked.
+    """
+    if value is None:
+        return "None"
+    s = str(value)
+    local, sep, domain = s.partition("@")
+    local = local.split(":", 1)[0]
+    tail = local[-4:] if len(local) > 4 else ""
+    return f"***{tail}{sep}{domain}"
+
+
+def report_gateway_refusal(
+    adapter: Any, event: Any, extra: Any, *, sender_authenticated: bool, pinned: bool
+) -> Optional[bool]:
+    """Ask the gateway's own authorization check (read-only) whether ``event``
+    will be admitted; on a refusal log ONE WARNING with the reason.
+
+    Advisory only: the gateway still makes and enforces the decision. Returns
+    the verdict, or None when no runner / check is available.
+    """
+    try:
+        runner = getattr(adapter, "gateway_runner", None)
+        if runner is None and callable(getattr(adapter, "_gateway_runner", None)):
+            runner = adapter._gateway_runner()  # bound _message_handler.__self__
+        check = getattr(runner, "_is_user_authorized_for_source", None)
+        if not callable(check):
+            check = getattr(runner, "_is_user_authorized", None)
+        if not callable(check):
+            return None
+        source = getattr(event, "source", None)
+        if source is None or getattr(source, "user_id", None) is None:
+            return None
+        canon = getattr(adapter, "_canonicalize", None)
+        if callable(canon):  # same identity-first step handle_message runs
+            with contextlib.suppress(Exception):
+                canon(source)
+        verdict = check(source)
+        if verdict is not True and verdict is not False:
+            return None  # duck-typed / mocked runner: no real verdict
+        if verdict is False:
+            sender = getattr(source, "user_id", None)
+            chat = getattr(source, "chat_id", None)
+            # WARNING once per (sender, chat) per TTL, DEBUG in between: a
+            # stranger spamming the bot must not flood the log.
+            log = logger.warning if _refusal_should_warn(sender, chat) else logger.debug
+            log(
+                "inbound from %s (chat_type=%s, chat=%s) will be REFUSED by the "
+                "gateway's authorization: %s",
+                mask_id(sender),
+                getattr(source, "chat_type", None),
+                mask_id(chat),
+                _refusal_reason(
+                    event, extra, sender_authenticated=sender_authenticated, pinned=pinned
+                ),
+            )
+        return verdict
+    except Exception:  # noqa: BLE001 -- advisory; never break dispatch
+        logger.debug("gateway authorization preflight raised", exc_info=True)
+        return None
+
+
 def _tag(event: Any, extra: Any, sender_authenticated: bool) -> Tuple[Any, bool]:
     """apply_owner_tagging's body; returns (event, owner_tag_completed)."""
     if not tagging_enabled(extra):
@@ -489,11 +722,7 @@ def _tag(event: Any, extra: Any, sender_authenticated: bool) -> Tuple[Any, bool]
     text = getattr(event, "text", "") or ""
     text = neutralize_owner_markers(text)
     source = getattr(event, "source", None)
-    owner = bool(sender_authenticated) and is_owner(
-        getattr(source, "user_id", None),
-        getattr(source, "chat_type", None),
-        extra,
-    )
+    owner = bool(sender_authenticated) and _source_is_owner(source, extra)
     # Slash commands stay commands: Hermes detects them by a leading "/",
     # and owners are exactly the users allowed to run them
     # (slash_access). They still get the metadata flag.

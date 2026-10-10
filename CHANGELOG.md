@@ -1,3 +1,37 @@
+## [4.8.2] - 2026-10-10
+
+### Fixed
+
+- **fix: the owner is no longer refused after gateway multiplexing (#5).**
+  With `gateway.multiplex_profiles: true`, hermes reads `GATEWAY_ALLOW_ALL_USERS`
+  from the profile's own scope only, so a value set on the gateway process
+  stopped applying. Owner messages were then refused as `Unauthorized user`,
+  dropped without notice, and answered with pairing prompts. An authenticated
+  owner (a longpoll envelope, or a webhook with a verified signature, whose
+  sender is in `allow_admin_from` for DMs or `group_allow_admin_from` for
+  groups) is now marked `SessionSource.role_authorized`. That is hermes' own
+  adapter-verified grant, and it is checked before pairing and the env
+  allowlists. Other senders are judged exactly as before; access is not widened.
+- **Refusals are no longer silent.** Before dispatch, the plugin asks the
+  gateway's own authorization check (read-only) whether the message will be
+  admitted. If not, it logs one WARNING with the sender and the reason, for
+  example a process-level `GATEWAY_ALLOW_ALL_USERS` that the profile cannot
+  see, an unsigned webhook, or a sender who is not an owner and not paired. The
+  gateway still makes the decision.
+- **Group messages are no longer treated as DMs.** The chatlytics "hermes"
+  webhook transform sends `isGroup: true` with no `chatType`, and the old
+  `"dm"` default made every group message a DM, so a DM-only admin got owner
+  rights in groups. A `@g.us` chat or `isGroup: true` is now always a group,
+  on both the webhook and longpoll paths. The owner lists also fail closed
+  whenever the declared chat type and the chat JID disagree.
+- The refusal WARNING appears once per (sender, chat) every 10 minutes, with
+  repeats logged at DEBUG. Phone numbers and chat ids in it are masked to
+  their last 4 digits.
+- On a hermes-agent too old to have `role_authorized` (it also has no
+  multiplexing), the pin is skipped and a single WARNING says so.
+- Troubleshooting: added a section on profile scope versus process scope for
+  gate variables under multiplexing.
+
 ## [4.8.1] - 2026-10-10
 
 ### Fixed

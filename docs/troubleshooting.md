@@ -72,6 +72,18 @@ unreachable base_url, plugin dir missing after a botched update, or the
 plugin was pip-installed and a hermes-agent update wiped the venv
 (reinstall as a directory plugin — see [install.md](install.md)).
 
+### Messages refused as `Unauthorized user` / pairing prompts after enabling multiplexing
+
+With `gateway.multiplex_profiles: true`, hermes reads gate variables such as
+`GATEWAY_ALLOW_ALL_USERS` from each **profile's own `.env`** only. A value set
+on the systemd unit (process env) no longer applies, so senders it used to
+admit are refused and DMs get pairing codes (#5). Put the variable in the
+profile's `.env`, list the sender in `allow_admin_from`, or approve the
+pairing code. Since v4.8.2 an owner listed in `allow_admin_from` /
+`group_allow_admin_from` is always admitted (authenticated longpoll, or a
+signed webhook), and every refused message is logged at WARNING with
+`will be REFUSED by the gateway's authorization: <reason>`.
+
 ### hermes-agent got DOWNGRADED after installing the plugin
 
 A plain `pip install` of plugin v4.1.1 (pinned `hermes-agent==0.14.0`) once
