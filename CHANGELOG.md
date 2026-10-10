@@ -1,3 +1,28 @@
+## [4.8.2] - 2026-10-10
+
+### Fixed
+
+- **fix: the owner is no longer refused after gateway multiplexing (#5).**
+  With `gateway.multiplex_profiles: true`, hermes reads `GATEWAY_ALLOW_ALL_USERS`
+  from the profile's own scope only, so a value set on the gateway process
+  stopped applying. Owner messages were then refused as `Unauthorized user`,
+  dropped without notice, and answered with pairing prompts. An authenticated
+  owner (a longpoll envelope, or a webhook with a verified signature, whose
+  sender is in `allow_admin_from` for DMs or `group_allow_admin_from` for
+  groups) is now marked `SessionSource.role_authorized`. That is hermes' own
+  adapter-verified grant, and it is checked before pairing and the env
+  allowlists. Other senders are judged exactly as before; access is not widened.
+- **Refusals are no longer silent.** Before dispatch, the plugin asks the
+  gateway's own authorization check (read-only) whether the message will be
+  admitted. If not, it logs one WARNING with the sender and the reason, for
+  example a process-level `GATEWAY_ALLOW_ALL_USERS` that the profile cannot
+  see, an unsigned webhook, or a sender who is not an owner and not paired. The
+  gateway still makes the decision.
+- On a hermes-agent too old to have `role_authorized` (it also has no
+  multiplexing), the pin is skipped and a single WARNING says so.
+- Troubleshooting: added a section on profile scope versus process scope for
+  gate variables under multiplexing.
+
 ## [4.8.1] - 2026-10-10
 
 ### Fixed

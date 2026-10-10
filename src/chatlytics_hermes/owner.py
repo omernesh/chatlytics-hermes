@@ -49,6 +49,8 @@ phone form of an ``@lid`` sender on the envelope.
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import logging
 import os
 import unicodedata
@@ -480,6 +482,159 @@ def apply_owner_tagging(event: Any, extra: Any, *, sender_authenticated: bool) -
     except Exception:  # noqa: BLE001
         logger.debug("raw_message flag scrub raised", exc_info=True)
     return event
+
+
+# --- #5 owner ACCESS pin + refusal visibility --------------------------------
+#
+# Owner TAGGING (above) only labels a message. Whether the gateway lets it in
+# at all is decided by hermes ``_is_user_authorized``, whose allow-all rung
+# (``GATEWAY_ALLOW_ALL_USERS``) is read through ``platform_gate_env``. Under
+# ``gateway.multiplex_profiles`` that reader returns the PROFILE scope's value
+# and never falls back to ``os.environ``, so an allow-all set on the systemd
+# unit silently stopped applying and the owner was dropped + asked to pair
+# (2026-10-10 incident, #5).
+#
+# The pin uses the per-message, adapter-verified grant hermes already has:
+# ``SessionSource.role_authorized`` (checked BEFORE pairing and the env
+# allowlists; ``is True`` only). It is set ONLY for a sender that is an owner
+# by the same deterministic rule as tagging (authenticated transport + the
+# gateway's own ``allow_admin_from`` / ``group_allow_admin_from``). Every
+# other sender is left exactly as hermes would judge it — no widening.
+# DO NOT key this off message text, an unauthenticated webhook, or the
+# tagging opt-out (that opt-out is about the TEXT prefix, not access).
+
+_ALLOW_ALL_TRUTHY = frozenset({"true", "1", "yes"})
+
+
+def _source_supports_access_pin(source: Any) -> bool:
+    """True when this hermes-agent's SessionSource declares ``role_authorized``."""
+    try:
+        return dataclasses.is_dataclass(source) and any(
+            f.name == "role_authorized" for f in dataclasses.fields(source)
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
+#: warn-once keys (fixed literals only — bounded by construction).
+_WARNED: set = set()
+
+
+def _warn_once(key: str, msg: str, *args: Any) -> None:
+    if key in _WARNED:
+        logger.debug(msg, *args)
+        return
+    _WARNED.add(key)
+    logger.warning(msg, *args)
+
+
+def apply_owner_access(event: Any, extra: Any, *, sender_authenticated: bool) -> bool:
+    """Pin gateway access for an authenticated owner. Returns True when pinned.
+
+    Never raises and never touches a non-owner's source.
+    """
+    try:
+        if not sender_authenticated:
+            return False
+        source = getattr(event, "source", None)
+        if source is None or not is_owner(
+            getattr(source, "user_id", None), getattr(source, "chat_type", None), extra
+        ):
+            return False
+        if not _source_supports_access_pin(source):
+            # Older hermes-agent: no multiplexing there either, so the
+            # process-env gates still apply. Say so once; set nothing.
+            _warn_once(
+                "owner_access:unsupported",
+                "owner access pin unavailable: this hermes-agent's SessionSource "
+                "has no role_authorized field, so owners (allow_admin_from) are "
+                "admitted only by the gateway's own allowlist / pairing / "
+                "GATEWAY_ALLOW_ALL_USERS (#5)",
+            )
+            return False
+        source.role_authorized = True
+        return True
+    except Exception:  # noqa: BLE001 -- must never break dispatch
+        logger.debug("owner access pin raised", exc_info=True)
+        return False
+
+
+def _refusal_reason(event: Any, extra: Any, *, sender_authenticated: bool, pinned: bool) -> str:
+    source = getattr(event, "source", None)
+    sender = getattr(source, "user_id", None)
+    owner = is_owner(sender, getattr(source, "chat_type", None), extra)
+    if owner and pinned:
+        return (
+            "sender is an owner and was pinned (role_authorized), yet the gateway "
+            "still refused — check pre_gateway_dispatch hooks / hermes-agent version"
+        )
+    if owner and not sender_authenticated:
+        return (
+            "sender matches allow_admin_from but the webhook is unsigned "
+            "(CHATLYTICS_WEBHOOK_SECRET unset), so the owner pin was NOT applied"
+        )
+    if owner:
+        return (
+            "sender matches allow_admin_from but this hermes-agent cannot pin "
+            "owner access (no SessionSource.role_authorized)"
+        )
+    if str(os.environ.get("GATEWAY_ALLOW_ALL_USERS", "")).strip().lower() in _ALLOW_ALL_TRUTHY:
+        return (
+            "GATEWAY_ALLOW_ALL_USERS is set in the gateway PROCESS env but is not "
+            "visible to this profile: under gateway.multiplex_profiles the gate is "
+            "read from the profile's own .env only (#5). Put it in the profile .env, "
+            "list the sender in allow_admin_from, or approve the pairing code"
+        )
+    return (
+        "sender is not an owner (allow_admin_from), not paired and not in any "
+        "allowlist — the gateway will pair / decline / ignore per "
+        "unauthorized_dm_behavior"
+    )
+
+
+def report_gateway_refusal(
+    adapter: Any, event: Any, extra: Any, *, sender_authenticated: bool, pinned: bool
+) -> Optional[bool]:
+    """Ask the gateway's own authorization check (read-only) whether ``event``
+    will be admitted; on a refusal log ONE WARNING with the reason.
+
+    Advisory only: the gateway still makes and enforces the decision. Returns
+    the verdict, or None when no runner / check is available.
+    """
+    try:
+        runner = getattr(adapter, "gateway_runner", None)
+        if runner is None and callable(getattr(adapter, "_gateway_runner", None)):
+            runner = adapter._gateway_runner()  # bound _message_handler.__self__
+        check = getattr(runner, "_is_user_authorized_for_source", None)
+        if not callable(check):
+            check = getattr(runner, "_is_user_authorized", None)
+        if not callable(check):
+            return None
+        source = getattr(event, "source", None)
+        if source is None or getattr(source, "user_id", None) is None:
+            return None
+        canon = getattr(adapter, "_canonicalize", None)
+        if callable(canon):  # same identity-first step handle_message runs
+            with contextlib.suppress(Exception):
+                canon(source)
+        verdict = check(source)
+        if verdict is not True and verdict is not False:
+            return None  # duck-typed / mocked runner: no real verdict
+        if verdict is False:
+            logger.warning(
+                "inbound from %s (chat_type=%s, chat=%s) will be REFUSED by the "
+                "gateway's authorization: %s",
+                getattr(source, "user_id", None),
+                getattr(source, "chat_type", None),
+                getattr(source, "chat_id", None),
+                _refusal_reason(
+                    event, extra, sender_authenticated=sender_authenticated, pinned=pinned
+                ),
+            )
+        return verdict
+    except Exception:  # noqa: BLE001 -- advisory; never break dispatch
+        logger.debug("gateway authorization preflight raised", exc_info=True)
+        return None
 
 
 def _tag(event: Any, extra: Any, sender_authenticated: bool) -> Tuple[Any, bool]:

@@ -79,7 +79,12 @@ from .diagnostics import (
     map_connect_error,
 )
 from .inbound import make_health_handler, make_webhook_handler, normalize_payload
-from .owner import apply_owner_tagging, neutralize_event_text
+from .owner import (
+    apply_owner_access,
+    apply_owner_tagging,
+    neutralize_event_text,
+    report_gateway_refusal,
+)
 
 
 # HERMES-V2 (Phase 336): chatlytics v4.0 introduces per-bot bearer tokens
@@ -2095,6 +2100,15 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             getattr(self.config, "extra", None) or {},
             sender_authenticated=True,
         )
+        # #5 OWNER ACCESS — same identity decision as tagging, applied to the
+        # gateway's admission: an owner can no longer be dropped because a
+        # process-level GATEWAY_ALLOW_ALL_USERS is invisible to a multiplexed
+        # profile. Non-owners are untouched. Keep in sync with inbound.py.
+        _owner_pinned = apply_owner_access(
+            event,
+            getattr(self.config, "extra", None) or {},
+            sender_authenticated=True,
+        )
 
         # v4.5.0 (chatlytics v5.4 P8): per-channel prompt injection.
         # ``MessageEvent.channel_prompt`` is the harness's NATIVE per-turn
@@ -2145,6 +2159,15 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     body["chatId"],
                 )
 
+        # #5: a refusal must never be silent — WARN with the reason before the
+        # gateway (which logs only "Unauthorized user") drops it.
+        report_gateway_refusal(
+            self,
+            event,
+            getattr(self.config, "extra", None) or {},
+            sender_authenticated=True,
+            pinned=_owner_pinned,
+        )
         await self.handle_message(event)
 
     # --- Control envelopes (v4.3.0 — chatlytics v5.4 P6) -------------------

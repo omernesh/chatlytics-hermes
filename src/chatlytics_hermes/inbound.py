@@ -27,7 +27,12 @@ from typing import Any, Callable, Dict, Optional
 
 from aiohttp import web
 
-from .owner import apply_owner_tagging, tagging_enabled
+from .owner import (
+    apply_owner_access,
+    apply_owner_tagging,
+    report_gateway_refusal,
+    tagging_enabled,
+)
 
 try:
     from gateway.platforms.base import MessageEvent, MessageType
@@ -258,6 +263,11 @@ def make_webhook_handler(adapter: Any) -> Callable[[web.Request], Any]:
         event = apply_owner_tagging(
             event, _owner_extra, sender_authenticated=bool(secret)
         )
+        # #5 OWNER ACCESS — same block as adapter._dispatch_envelope (keep in
+        # sync). Unsigned webhook → no pin (fail closed).
+        _owner_pinned = apply_owner_access(
+            event, _owner_extra, sender_authenticated=bool(secret)
+        )
 
         # v4.5.0 (chatlytics v5.4 P8): per-channel prompt injection — same
         # pattern as adapter._dispatch_envelope (keep the two in sync).
@@ -309,6 +319,14 @@ def make_webhook_handler(adapter: Any) -> Callable[[web.Request], Any]:
         except Exception:  # noqa: BLE001 -- prompt injection must never break dispatch
             logger.debug("channel_prompt injection raised; continuing")
 
+        # #5: never a silent refusal — WARN with the reason (advisory only).
+        report_gateway_refusal(
+            adapter,
+            event,
+            _owner_extra,
+            sender_authenticated=bool(secret),
+            pinned=_owner_pinned,
+        )
         try:
             await adapter.handle_message(event)
         except Exception:  # noqa: BLE001 -- never let dispatch errors crash the server
