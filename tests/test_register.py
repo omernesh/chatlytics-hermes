@@ -125,7 +125,7 @@ def test_plugin_yaml_is_valid() -> None:
 
     assert manifest["name"] == "chatlytics"
     assert manifest["kind"] == "platform"
-    assert manifest["version"] == "4.8.0"
+    assert manifest["version"] == "4.8.1"
 
     required = {entry["name"] for entry in manifest["requires_env"]}
     assert required == {"CHATLYTICS_BOT_TOKEN"}
@@ -165,22 +165,13 @@ def test_pyproject_declares_hermes_entry_point() -> None:
     assert entry_points["chatlytics"] == "chatlytics_hermes"
 
     project = data["project"]
-    assert project["version"] == "4.8.0"  # v4.8.0 — owner tagging (#3).
+    assert project["version"] == "4.8.1"  # v4.8.1 — hermes-agent dropped from deps (#4).
     assert project["name"] == "chatlytics-hermes"
 
     deps = project["dependencies"]
-    hermes_dep = next(dep for dep in deps if dep.startswith("hermes-agent"))
-    assert hermes_dep.startswith("hermes-agent>=0.14"), (
-        "hermes-agent must be pinned to >=0.14"
-    )
-    # v4.1.0 pin-downgrade fix: the upper bound MUST NOT exclude the live
-    # 0.15.x host. The old `<0.15` bound silently downgraded Hermes on
-    # install — guard against any regression to a sub-1.0 ceiling.
-    assert "<0.15" not in hermes_dep, (
-        "hermes-agent upper bound must not be <0.15 (excludes the live "
-        "0.15.x host and downgrades it on install)"
-    )
-    assert "<1.0" in hermes_dep
+    # v4.8.1 (#4): hermes-agent is the host, NOT a dependency. See
+    # tests/test_no_host_dependency.py for the full guard.
+    assert not any(dep.lower().startswith("hermes") for dep in deps)
     assert any(dep.startswith("httpx>=0.27") for dep in deps)
     assert any(dep.startswith("aiohttp>=3.9") for dep in deps)
     assert all(not dep.startswith("flask") for dep in deps), (

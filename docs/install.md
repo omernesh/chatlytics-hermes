@@ -9,7 +9,7 @@ a specific reason not to:
 | Channel | Survives a hermes-agent update? | How |
 |---------|--------------------------------|-----|
 | **Directory plugin** (recommended) | **YES** — lives under `$HERMES_HOME/plugins/`, not the venv | `hermes plugins install omernesh/chatlytics-hermes` |
-| pip entry-point | NO — `setup-hermes.sh` runs `rm -rf venv`, wiping `site-packages` | `pip install --no-deps ...` |
+| pip entry-point | NO — `setup-hermes.sh` runs `rm -rf venv`, wiping `site-packages` | `uv pip install --python <py> --no-deps ...` |
 
 ## 1. Directory-plugin install (recommended)
 
@@ -110,24 +110,31 @@ doctor.
 A pip install lands in the gateway venv's `site-packages`, which the next
 hermes-agent update wipes. If you use it anyway:
 
-### ⚠️ The no-downgrade rule
+### ⚠️ The install rule: ALWAYS `--no-deps`
 
-**Never let the resolver touch `hermes-agent` in a live gateway venv.** A
-plain `pip install` of this package once silently downgraded a production
-hermes-agent 0.15.1 → 0.14.0 (the v4.1.1 release pinned
-`hermes-agent==0.14.0`). The pin has been a floor (`>=0.14,<1.0`) since
-v4.1.2, but the discipline stands:
+`hermes-agent` is the host this plugin runs inside, so since v4.8.1 it is **not
+a declared dependency** of the package at all (issue #4): no resolver can act
+on it. A plain `pip install` of older releases once **silently downgraded a
+production hermes-agent 0.15.1 -> 0.14.0** (v4.1.1 pinned
+`hermes-agent==0.14.0`) and on 2026-10-09 a non-isolated install broke
+`hermes update` on hpg6. The remaining dependencies are lower-bound only, but
+`--no-deps` is still the rule: the host already provides httpx, aiohttp, PyYAML
+and jsonschema, and the only thing that should ever change in that env is this
+package. Target the hermes tool's own interpreter explicitly:
 
 ```bash
-uv pip install --no-deps /path/to/chatlytics-hermes   # or: pip install --no-deps .
-python -m chatlytics_hermes.doctor                    # verify nothing broke
+uv pip install --python <hermes tool python> --no-deps /path/to/chatlytics-hermes
+python -m chatlytics_hermes.doctor     # verify nothing broke
 ```
 
-The plugin self-defends: `register()` compares the installed hermes-agent
-against its floor at load time and logs an ERROR with the `--no-deps`
-reinstall fix when the environment has been downgraded. It never blocks an
-otherwise-working load, and the doctor's `hermes-agent` check reports the
-same comparison.
+(`<hermes tool python>` is the venv python the gateway runs on, e.g.
+`~/.hermes/tools/<runtime>/bin/python`. Without `--python`, uv installs into
+whatever env it happens to find.)
+
+The plugin also self-defends: `register()` compares the installed
+hermes-agent against its floor (`>=0.14`) at load time and logs an ERROR
+(with the fix) when the environment is too old or has been downgraded; it
+never blocks an otherwise-working load.
 
 ### Fresh-venv dev install
 

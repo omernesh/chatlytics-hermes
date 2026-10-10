@@ -102,7 +102,7 @@ def check_hermes_agent_version(installed: Optional[str] = None) -> Optional[str]
             "DOWN (the v4.1.1 ==0.14.0 pin did exactly this to production). "
             "Fix: reinstall the correct hermes-agent first, then ALWAYS "
             "install this plugin with `--no-deps` (e.g. "
-            "`uv pip install --no-deps /path/to/chatlytics-hermes`) so the "
+            "`uv pip install --python <hermes tool python> --no-deps /path/to/chatlytics-hermes`) so the "
             "resolver can never touch hermes-agent again."
         )
     return None

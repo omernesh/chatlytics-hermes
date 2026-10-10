@@ -86,29 +86,35 @@ at https://app.chatlytics.ai → Bots → Create Bot (shown only once), or via
 `chatlytics bots create`.
 
 Full instructions — including per-profile installs, updating with
-`git pull --ff-only`, the `--no-deps` rule for pip installs into an existing
+`git pull --ff-only`, the `--python ... --no-deps` rule for pip installs into an existing
 gateway venv, and the **never-leave-`.bak`-dirs-inside-`plugins/`** gotcha —
 live in [docs/install.md](docs/install.md).
 
-### ⚠️ No-downgrade rule (pip installs into an EXISTING gateway venv)
+### ⚠️ Install rule: ALWAYS `--no-deps` (pip installs into an EXISTING gateway venv)
 
-Never let the resolver touch `hermes-agent` in a live gateway venv. A plain
-`pip install` of this package once **silently downgraded a production
-hermes-agent 0.15.1 → 0.14.0** (the v4.1.1 release pinned
-`hermes-agent==0.14.0`; the resolver "helpfully" satisfied it). The pin has
-been a floor (`hermes-agent>=0.14,<1.0`) since v4.1.2, but the discipline
-stands — always install with `--no-deps` into an env that already has
-hermes-agent:
+`hermes-agent` is the host this plugin runs inside, so since v4.8.1 it is **not
+a declared dependency** of the package at all (issue #4): no resolver can act
+on it. A plain `pip install` of older releases once **silently downgraded a
+production hermes-agent 0.15.1 -> 0.14.0** (v4.1.1 pinned
+`hermes-agent==0.14.0`) and on 2026-10-09 a non-isolated install broke
+`hermes update` on hpg6. The remaining dependencies are lower-bound only, but
+`--no-deps` is still the rule: the host already provides httpx, aiohttp, PyYAML
+and jsonschema, and the only thing that should ever change in that env is this
+package. Target the hermes tool's own interpreter explicitly:
 
 ```bash
-uv pip install --no-deps /path/to/chatlytics-hermes   # or: pip install --no-deps .
-python -m chatlytics_hermes.doctor                    # verify nothing broke
+uv pip install --python <hermes tool python> --no-deps /path/to/chatlytics-hermes
+python -m chatlytics_hermes.doctor     # verify nothing broke
 ```
+
+(`<hermes tool python>` is the venv python the gateway runs on, e.g.
+`~/.hermes/tools/<runtime>/bin/python`. Without `--python`, uv installs into
+whatever env it happens to find.)
 
 The plugin also self-defends: `register()` compares the installed
 hermes-agent against its floor (`>=0.14`) at load time and logs an ERROR
-(with the fix) when the environment has been downgraded — it never blocks an
-otherwise-working load.
+(with the fix) when the environment is too old or has been downgraded; it
+never blocks an otherwise-working load.
 
 ## Self-check (doctor)
 

@@ -1,3 +1,25 @@
+## [4.8.1] - 2026-10-10
+
+### Fixed
+
+- **fix: installing this package can no longer touch `hermes-agent` (#4).**
+  `hermes-agent` is removed from the package dependencies entirely. It is
+  the host the plugin loads into, not something the plugin installs; declaring
+  it let a plain `pip install` / `uv pip install` resolve the host DOWN (the
+  v4.1.1 pin did it to production, and on 2026-10-09 it broke `hermes update`
+  on hpg6). The `>=0.14` floor is unchanged and still enforced at load time by
+  `register()` and the doctor, so a too-old host still gets a clear error.
+- Remaining runtime dependencies (httpx, aiohttp, PyYAML, jsonschema) are now
+  lower-bound only; the old `<1` / `<4` / `<5` caps could force downgrades of
+  packages the host already provides.
+- Install docs and the floor-check error text now give the one safe command:
+  `uv pip install --python <hermes tool python> --no-deps <path>`.
+
+### Added
+
+- `tests/test_no_host_dependency.py` fails if `hermes-agent` ever reappears in
+  the dependencies/extras, or if a runtime dependency gains an upper cap.
+
 ## [4.8.0] - 2026-10-06
 
 ### Added
