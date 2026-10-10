@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chatlytics-hermes"
-version = "4.8.0"
+version = "4.8.1"
 description = "Production-grade WhatsApp for Hermes Agent — full upstream contract, 22 tools, every media type, per-bot bearer auth (chatlytics v4.0 Multi-Bot Platform)"
 license = {text = "MIT"}
 readme = "README.md"
@@ -17,12 +17,19 @@ classifiers = [
     "Operating System :: OS Independent",
     "Framework :: AsyncIO",
 ]
+# hermes-agent is deliberately NOT listed (issue #4). It is the HOST this plugin
+# loads into, never something the plugin installs. Declaring it let a plain
+# `pip install` / `uv pip install` resolve the host DOWN (v4.1.1 did this to
+# production; 2026-10-09 it broke `hermes update` on hpg6). The >=0.14 floor is
+# enforced at load time by register() and the doctor instead.
+# Every dependency below is LOWER-BOUND ONLY: an upper cap can force the
+# resolver to downgrade a package the host already has. Do not add caps or
+# hermes-agent here; tests/test_no_host_dependency.py fails if you do.
 dependencies = [
-    "hermes-agent>=0.14,<1.0",
-    "httpx>=0.27,<1",
-    "aiohttp>=3.9,<4",
+    "httpx>=0.27",
+    "aiohttp>=3.9",
     "PyYAML>=6.0",
-    "jsonschema>=4,<5",
+    "jsonschema>=4",
 ]
 
 [project.optional-dependencies]
@@ -30,6 +37,7 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "respx>=0.21",
+    "tomli>=2; python_version < '3.11'",
 ]
 
 [project.entry-points."hermes_agent.plugins"]

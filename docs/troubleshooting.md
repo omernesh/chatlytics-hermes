@@ -75,11 +75,7 @@ plugin was pip-installed and a hermes-agent update wiped the venv
 ### hermes-agent got DOWNGRADED after installing the plugin
 
 A plain `pip install` of plugin v4.1.1 (pinned `hermes-agent==0.14.0`) once
-dragged a production 0.15.1 down to 0.14.0. The pin is a floor since v4.1.2,
-and `register()` logs an ERROR (with the fix) whenever it detects a
-downgraded hermes-agent. **Rule:** always `pip install --no-deps` into an
-existing gateway venv, then run the doctor. To recover, reinstall the
-correct hermes-agent, then `uv pip install --no-deps <plugin>`.
+dragged a production 0.15.1 down to 0.14.0. Since v4.8.1 the package no longer declares `hermes-agent` at all (#4), but `register()` still logs an ERROR (with the fix) whenever it detects a too-old hermes-agent. **Rule:** always `uv pip install --python <hermes tool python> --no-deps <path>` into an existing gateway venv, then run the doctor. To recover, reinstall the correct hermes-agent, then install the plugin with the same `--no-deps` command.
 
 ### Stale code keeps running after an update
 

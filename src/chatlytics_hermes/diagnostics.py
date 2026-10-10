@@ -30,9 +30,9 @@ from typing import Any, Optional, Tuple
 
 import httpx
 
-# Minimum hermes-agent version this plugin supports. MUST stay in lockstep
-# with the dependency floor in pyproject.toml (``hermes-agent>=0.14,<1.0``,
-# fixed in v4.1.2 after the ==0.14.0 pin downgraded production).
+# Minimum hermes-agent version this plugin supports. hermes-agent is NOT a
+# pyproject dependency (removed in v4.8.1, #4): this runtime check is the
+# only guard, so keep the floor in sync with the README/install docs.
 HERMES_AGENT_FLOOR: Tuple[int, int] = (0, 14)
 HERMES_AGENT_DIST: str = "hermes-agent"
 
@@ -92,6 +92,10 @@ def check_hermes_agent_version(installed: Optional[str] = None) -> Optional[str]
     parsed = parse_version(installed)
     if not parsed:
         return None
+    # 0.0.0* is what a git/editable install reports when the real version
+    # cannot be determined; that is NOT evidence of a downgrade.
+    if not any(parsed):
+        return None
     if parsed < HERMES_AGENT_FLOOR:
         floor_str = ".".join(str(p) for p in HERMES_AGENT_FLOOR)
         return (
@@ -102,7 +106,7 @@ def check_hermes_agent_version(installed: Optional[str] = None) -> Optional[str]
             "DOWN (the v4.1.1 ==0.14.0 pin did exactly this to production). "
             "Fix: reinstall the correct hermes-agent first, then ALWAYS "
             "install this plugin with `--no-deps` (e.g. "
-            "`uv pip install --no-deps /path/to/chatlytics-hermes`) so the "
+            "`uv pip install --python <hermes tool python> --no-deps /path/to/chatlytics-hermes`) so the "
             "resolver can never touch hermes-agent again."
         )
     return None
