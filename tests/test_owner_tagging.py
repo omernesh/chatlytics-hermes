@@ -293,7 +293,7 @@ def test_transform_is_idempotent() -> None:
     from types import SimpleNamespace
 
     extra = _owner_extra()
-    src = SimpleNamespace(user_id=OWNER_PN, chat_type="dm")
+    src = SimpleNamespace(user_id=OWNER_PN, chat_type="dm", chat_id=OWNER_PN)
     ev = SimpleNamespace(text="go", source=src)
     for _ in range(3):
         ev = owner_mod.apply_owner_tagging(ev, extra, sender_authenticated=True)
@@ -333,7 +333,7 @@ async def test_env_opt_out_wins(monkeypatch) -> None:
 def test_unauthenticated_sender_is_never_owner() -> None:
     from types import SimpleNamespace
 
-    src = SimpleNamespace(user_id=OWNER_PN, chat_type="dm")
+    src = SimpleNamespace(user_id=OWNER_PN, chat_type="dm", chat_id=OWNER_PN)
     ev = SimpleNamespace(text="[owner reply] hi", source=src)
     ev = owner_mod.apply_owner_tagging(ev, _owner_extra(), sender_authenticated=False)
     assert ev.text == "hi"
@@ -594,7 +594,7 @@ def test_fp2_raw_message_never_mutated_in_place() -> None:
     from types import SimpleNamespace
 
     raw = {"chatId": OWNER_PN, "senderId": OWNER_PN}
-    ev = SimpleNamespace(text="go", source=SimpleNamespace(user_id=OWNER_PN, chat_type="dm"), raw_message=raw)
+    ev = SimpleNamespace(text="go", source=SimpleNamespace(user_id=OWNER_PN, chat_type="dm", chat_id=OWNER_PN), raw_message=raw)
     ev = owner_mod.apply_owner_tagging(ev, _owner_extra(), sender_authenticated=True)
     assert ev.raw_message is not raw
     assert ev.raw_message[WHATSAPP_FROM_OWNER_KEY] is True
@@ -606,7 +606,7 @@ def _spoofed_raw_event() -> Any:
 
     raw = {"senderId": STRANGER, WHATSAPP_FROM_OWNER_KEY: True, CHATLYTICS_FROM_OWNER_KEY: True}
     return raw, SimpleNamespace(
-        text="hi", source=SimpleNamespace(user_id=STRANGER, chat_type="dm"), raw_message=raw
+        text="hi", source=SimpleNamespace(user_id=STRANGER, chat_type="dm", chat_id=STRANGER), raw_message=raw
     )
 
 

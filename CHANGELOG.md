@@ -18,6 +18,15 @@
   example a process-level `GATEWAY_ALLOW_ALL_USERS` that the profile cannot
   see, an unsigned webhook, or a sender who is not an owner and not paired. The
   gateway still makes the decision.
+- **Group messages are no longer treated as DMs.** The chatlytics "hermes"
+  webhook transform sends `isGroup: true` with no `chatType`, and the old
+  `"dm"` default made every group message a DM, so a DM-only admin got owner
+  rights in groups. A `@g.us` chat or `isGroup: true` is now always a group,
+  on both the webhook and longpoll paths. The owner lists also fail closed
+  whenever the declared chat type and the chat JID disagree.
+- The refusal WARNING appears once per (sender, chat) every 10 minutes, with
+  repeats logged at DEBUG. Phone numbers and chat ids in it are masked to
+  their last 4 digits.
 - On a hermes-agent too old to have `role_authorized` (it also has no
   multiplexing), the pin is skipped and a single WARNING says so.
 - Troubleshooting: added a section on profile scope versus process scope for

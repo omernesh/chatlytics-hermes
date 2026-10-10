@@ -95,6 +95,25 @@ def _derive_message_type(payload: Dict[str, Any]) -> "MessageType":
     return MessageType.TEXT
 
 
+def derive_chat_type(chat_id: Any, declared: Any, is_group: Any = None) -> str:
+    """Chat type for a SessionSource — the chat JID and ``isGroup`` win.
+
+    #5 review: the chatlytics "hermes" webhook transform
+    (chatlytics.ai src/webhook-forwarder.ts) sends ``isGroup: true`` and NO
+    ``chatType``, so the old ``chatType or "dm"`` default labelled every group
+    message a DM — and a DM admin got owner rights in groups. A ``@g.us``
+    chat or ``isGroup is True`` is ALWAYS a group, whatever was declared.
+    DO NOT reintroduce a bare "dm" default ahead of these checks.
+    """
+    cid = str(chat_id or "").strip().lower()
+    if cid.endswith("@g.us") or is_group is True:
+        return "group"
+    if cid.endswith("@newsletter"):
+        return "channel"
+    d = str(declared or "").strip()
+    return d if d else "dm"
+
+
 def normalize_payload(
     body: Dict[str, Any],
     platform: Any,
@@ -145,7 +164,7 @@ def normalize_payload(
         platform=platform,
         chat_id=chat_id,
         user_id=str(sender_id) if sender_id is not None else None,
-        chat_type=str(body.get("chatType") or "dm"),
+        chat_type=derive_chat_type(chat_id, body.get("chatType"), body.get("isGroup")),
         message_id=str(message_id) if message_id is not None else None,
     )
 
@@ -172,6 +191,12 @@ def verify_hmac(
     mismatched signature does not leak per-byte timing information.
     Returns False on any malformed input (missing signature, wrong
     length, non-hex characters).
+
+    TODO(#6): body-only HMAC is replayable — chatlytics signs v1 only
+    (no timestamp / v2 header exists today). Once it sends a timestamped v2
+    signature, verify it within ±5 min and apply the owner pin only on a
+    fresh v2. TODO(#7): chatlytics sends ``sha256=<hex>``; this compare
+    expects bare hex.
     """
     if not provided_signature:
         return False

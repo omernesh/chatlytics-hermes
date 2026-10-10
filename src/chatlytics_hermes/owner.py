@@ -53,6 +53,7 @@ import contextlib
 import dataclasses
 import logging
 import os
+import time
 import unicodedata
 from typing import Any, FrozenSet, Optional, Tuple
 
@@ -178,14 +179,43 @@ def _coerce_ids(raw: Any) -> FrozenSet[Tuple[str, str]]:
     return frozenset(out)
 
 
-def owner_ids_for_chat_type(extra: Any, chat_type: Any) -> FrozenSet[Tuple[str, str]]:
-    """The owner set for one scope. Channels/broadcasts have no owners."""
+_NOT_GIVEN: Any = object()
+
+
+def chat_kind(chat_id: Any) -> str:
+    """``"group"`` / ``"channel"`` / ``"dm"`` / ``"unknown"`` from the chat JID alone."""
+    s = str(chat_id or "").strip().lower()
+    if s.endswith("@g.us"):
+        return "group"
+    if s.endswith("@newsletter") or s.endswith("@broadcast"):
+        return "channel"
+    if canonical_identity(s) is not None:
+        return "dm"
+    return "unknown"
+
+
+def owner_ids_for_chat_type(
+    extra: Any, chat_type: Any, chat_id: Any = _NOT_GIVEN
+) -> FrozenSet[Tuple[str, str]]:
+    """The owner set for one scope. Channels/broadcasts have no owners.
+
+    When ``chat_id`` is supplied (every dispatch path does), the declared
+    ``chat_type`` must AGREE with the chat JID — a DM scope needs a user JID,
+    a group scope a ``@g.us`` JID. Any mismatch or unrecognized chat id fails
+    closed (#5 review: a group message mislabelled ``dm`` must never be judged
+    against the DM admin list).
+    """
     if not isinstance(extra, dict):
         return frozenset()
     ct = str(chat_type or "").strip().lower()
+    kind = None if chat_id is _NOT_GIVEN else chat_kind(chat_id)
     if ct in _DM_CHAT_TYPES:
+        if kind is not None and kind != "dm":
+            return frozenset()
         return _coerce_ids(extra.get("allow_admin_from"))
     if ct in _GROUP_CHAT_TYPES:
+        if kind is not None and kind != "group":
+            return frozenset()
         return _coerce_ids(extra.get("group_allow_admin_from"))
     return frozenset()
 
@@ -209,12 +239,22 @@ def tagging_enabled(extra: Any) -> bool:
     )
 
 
-def is_owner(sender_id: Any, chat_type: Any, extra: Any) -> bool:
+def is_owner(sender_id: Any, chat_type: Any, extra: Any, chat_id: Any = _NOT_GIVEN) -> bool:
     """Deterministic owner decision from the delivered sender identity."""
     ident = canonical_identity(sender_id)
     if ident is None:
         return False
-    return ident in owner_ids_for_chat_type(extra, chat_type)
+    return ident in owner_ids_for_chat_type(extra, chat_type, chat_id)
+
+
+def _source_is_owner(source: Any, extra: Any) -> bool:
+    """is_owner for a SessionSource — always cross-checks the chat JID."""
+    return is_owner(
+        getattr(source, "user_id", None),
+        getattr(source, "chat_type", None),
+        extra,
+        getattr(source, "chat_id", None),
+    )
 
 
 # ASCII fast path for _fold_char: same result as the general path (ASCII is
@@ -537,9 +577,7 @@ def apply_owner_access(event: Any, extra: Any, *, sender_authenticated: bool) ->
         if not sender_authenticated:
             return False
         source = getattr(event, "source", None)
-        if source is None or not is_owner(
-            getattr(source, "user_id", None), getattr(source, "chat_type", None), extra
-        ):
+        if source is None or not _source_is_owner(source, extra):
             return False
         if not _source_supports_access_pin(source):
             # Older hermes-agent: no multiplexing there either, so the
@@ -562,7 +600,7 @@ def apply_owner_access(event: Any, extra: Any, *, sender_authenticated: bool) ->
 def _refusal_reason(event: Any, extra: Any, *, sender_authenticated: bool, pinned: bool) -> str:
     source = getattr(event, "source", None)
     sender = getattr(source, "user_id", None)
-    owner = is_owner(sender, getattr(source, "chat_type", None), extra)
+    owner = _source_is_owner(source, extra)
     if owner and pinned:
         return (
             "sender is an owner and was pinned (role_authorized), yet the gateway "
@@ -590,6 +628,41 @@ def _refusal_reason(event: Any, extra: Any, *, sender_authenticated: bool, pinne
         "allowlist — the gateway will pair / decline / ignore per "
         "unauthorized_dm_behavior"
     )
+
+
+#: One WARNING per (sender, chat) per this many seconds; DEBUG in between.
+REFUSAL_WARN_TTL_S = 600.0
+#: Bound on remembered (sender, chat) pairs; oldest evicted first.
+_REFUSAL_WARN_MAX = 1024
+_REFUSAL_WARNED: "dict[Tuple[str, str], float]" = {}
+
+
+def _refusal_should_warn(sender: Any, chat: Any, now: Optional[float] = None) -> bool:
+    now = time.monotonic() if now is None else now
+    key = (str(sender), str(chat))
+    last = _REFUSAL_WARNED.get(key)
+    if last is not None and now - last < REFUSAL_WARN_TTL_S:
+        return False
+    _REFUSAL_WARNED.pop(key, None)
+    _REFUSAL_WARNED[key] = now  # re-insert → dict order = age order
+    while len(_REFUSAL_WARNED) > _REFUSAL_WARN_MAX:
+        _REFUSAL_WARNED.pop(next(iter(_REFUSAL_WARNED)))
+    return True
+
+
+def mask_id(value: Any) -> str:
+    """Mask a WhatsApp id for logs: keep the last 4 digits and the domain.
+
+    ``972544329000@c.us`` → ``***9000@c.us``; ids of 4 chars or fewer are
+    fully masked.
+    """
+    if value is None:
+        return "None"
+    s = str(value)
+    local, sep, domain = s.partition("@")
+    local = local.split(":", 1)[0]
+    tail = local[-4:] if len(local) > 4 else ""
+    return f"***{tail}{sep}{domain}"
 
 
 def report_gateway_refusal(
@@ -621,12 +694,17 @@ def report_gateway_refusal(
         if verdict is not True and verdict is not False:
             return None  # duck-typed / mocked runner: no real verdict
         if verdict is False:
-            logger.warning(
+            sender = getattr(source, "user_id", None)
+            chat = getattr(source, "chat_id", None)
+            # WARNING once per (sender, chat) per TTL, DEBUG in between: a
+            # stranger spamming the bot must not flood the log.
+            log = logger.warning if _refusal_should_warn(sender, chat) else logger.debug
+            log(
                 "inbound from %s (chat_type=%s, chat=%s) will be REFUSED by the "
                 "gateway's authorization: %s",
-                getattr(source, "user_id", None),
+                mask_id(sender),
                 getattr(source, "chat_type", None),
-                getattr(source, "chat_id", None),
+                mask_id(chat),
                 _refusal_reason(
                     event, extra, sender_authenticated=sender_authenticated, pinned=pinned
                 ),
@@ -644,11 +722,7 @@ def _tag(event: Any, extra: Any, sender_authenticated: bool) -> Tuple[Any, bool]
     text = getattr(event, "text", "") or ""
     text = neutralize_owner_markers(text)
     source = getattr(event, "source", None)
-    owner = bool(sender_authenticated) and is_owner(
-        getattr(source, "user_id", None),
-        getattr(source, "chat_type", None),
-        extra,
-    )
+    owner = bool(sender_authenticated) and _source_is_owner(source, extra)
     # Slash commands stay commands: Hermes detects them by a leading "/",
     # and owners are exactly the users allowed to run them
     # (slash_access). They still get the metadata flag.

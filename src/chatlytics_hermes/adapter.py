@@ -597,10 +597,13 @@ def _envelope_to_body(
         # as "the copy the agent receives" (v4.2 INJ-08 / CR-01).
         "text": (env.get("agent_text") or env.get("text", "")) if text is None else text,
         "senderId": env.get("sender_jid"),
+        # #5 review: no bare "dm" default here — normalize_payload's
+        # derive_chat_type decides from the chat JID first (a @g.us chat is a
+        # group whatever chat_type says), then this declared value.
         "chatType": (
             "channel"
             if env.get("chat_type") == "newsletter"
-            else env.get("chat_type") or "dm"
+            else env.get("chat_type")
         ),
         "session": env.get("session_id"),
     }

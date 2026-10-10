@@ -68,6 +68,7 @@ def _upstream_source(monkeypatch):
     monkeypatch.delenv("CHATLYTICS_OWNER_TAGGING", raising=False)
     monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
     owner_mod._WARNED.clear()
+    owner_mod._REFUSAL_WARNED.clear()
 
 
 class _MultiplexAuthzRunner:
@@ -161,7 +162,8 @@ async def test_stranger_is_not_pinned_and_still_refused_with_reason(
     assert runner._is_user_authorized_for_source(ev.source) is False
     [rec] = _refusals(caplog)
     msg = rec.getMessage()
-    assert STRANGER in msg
+    assert STRANGER not in msg  # masked
+    assert owner_mod.mask_id(STRANGER) in msg
     assert "multiplex_profiles" in msg and "PROCESS env" in msg
 
 
@@ -314,3 +316,146 @@ def test_report_without_runner_returns_none() -> None:
         _A(), _Ev(), {}, sender_authenticated=True, pinned=False
     ) is None
 
+
+
+# --- #5 review fix-pass: group detection + fail-closed scope --------------------
+
+GROUP = "120363100000000000@g.us"
+
+
+def _hermes_transform(from_jid: str, participant: str = "", body: str = "hi") -> dict:
+    """EXACT output of chatlytics.ai src/webhook-forwarder.ts payloadTransform
+    "hermes" (v3.32.2): no chatType, isGroup derived from ``from``."""
+    is_group = from_jid.endswith("@g.us")
+    return {
+        "chatId": from_jid,
+        "text": body,
+        "senderId": (participant or from_jid) if is_group else from_jid,
+        "senderName": "Omer",
+        "messageId": "false_" + from_jid + "_3EB0ABCDEF",
+        "isGroup": is_group,
+        "timestamp": 1700000000,
+        "platform": "whatsapp",
+    }
+
+
+async def test_hermes_transform_group_is_a_group_and_dm_admin_not_pinned() -> None:
+    events = await _post(
+        _wh_adapter(secret=True, allow_admin_from=[OWNER_PN]),
+        _hermes_transform(GROUP, participant=OWNER_PN),
+        sign=True,
+    )
+    ev = events[0]
+    assert ev.source.chat_type == "group"
+    assert ev.source.role_authorized is False
+    assert not ev.text.startswith("[owner reply]")
+
+
+async def test_hermes_transform_group_owner_pinned_via_group_list() -> None:
+    events = await _post(
+        _wh_adapter(secret=True, **_owner_extra()),
+        _hermes_transform(GROUP, participant=OWNER_PN),
+        sign=True,
+    )
+    assert events[0].source.chat_type == "group"
+    assert events[0].source.role_authorized is True
+
+
+async def test_hermes_transform_dm_owner_pinned() -> None:
+    events = await _post(
+        _wh_adapter(secret=True, allow_admin_from=[OWNER_PN]),
+        _hermes_transform(OWNER_PN),
+        sign=True,
+    )
+    assert events[0].source.chat_type == "dm"
+    assert events[0].source.role_authorized is True
+
+
+async def test_declared_dm_on_a_group_jid_is_still_a_group() -> None:
+    payload = {"chatId": GROUP, "senderId": OWNER_PN, "text": "x", "chatType": "dm"}
+    events = await _post(
+        _wh_adapter(secret=True, allow_admin_from=[OWNER_PN]), payload, sign=True
+    )
+    assert events[0].source.chat_type == "group"
+    assert events[0].source.role_authorized is False
+
+
+async def test_longpoll_group_jid_without_chat_type_is_a_group() -> None:
+    env = _env("hi", OWNER_PN, chat_type="group")
+    env.pop("chat_type")
+    ev = await _dispatch(_lp_adapter(allow_admin_from=[OWNER_PN]), env)
+    assert ev.source.chat_type == "group"
+    assert ev.source.role_authorized is False
+
+
+async def test_longpoll_group_jid_declared_dm_is_a_group() -> None:
+    env = _env("hi", OWNER_PN, chat_type="group")
+    env["chat_type"] = "dm"
+    ev = await _dispatch(_lp_adapter(allow_admin_from=[OWNER_PN]), env)
+    assert ev.source.chat_type == "group"
+    assert ev.source.role_authorized is False
+
+
+@pytest.mark.parametrize(
+    "chat_type,chat_id",
+    [
+        ("dm", GROUP),                       # mislabelled group
+        ("", GROUP),
+        ("group", OWNER_PN),                 # group scope on a user JID
+        ("dm", "x@newsletter"),
+        ("dm", None),                        # unknown chat → fail closed
+        ("dm", "garbage"),
+    ],
+)
+def test_owner_scope_fails_closed_on_chat_mismatch(chat_type, chat_id) -> None:
+    assert owner_mod.owner_ids_for_chat_type(_owner_extra(), chat_type, chat_id) == frozenset()
+    assert owner_mod.is_owner(OWNER_PN, chat_type, _owner_extra(), chat_id) is False
+
+
+def test_owner_scope_matching_chat_still_works() -> None:
+    assert owner_mod.is_owner(OWNER_PN, "dm", _owner_extra(), OWNER_PN) is True
+    assert owner_mod.is_owner(OWNER_LID, "dm", _owner_extra(), OWNER_LID) is True
+    assert owner_mod.is_owner(OWNER_PN, "group", _owner_extra(), GROUP) is True
+
+
+# --- #5 review fix-pass: refusal WARNING rate limit + masking -------------------
+
+
+async def test_refusal_warns_once_per_sender_chat_then_debug(caplog) -> None:
+    adapter = _with_runner(_lp_adapter(**_owner_extra()), _MultiplexAuthzRunner())
+    caplog.set_level(logging.DEBUG, logger="chatlytics_hermes.owner")
+    for _ in range(3):
+        await _dispatch(adapter, _env("spam", STRANGER))
+    warns = _refusals(caplog)
+    debugs = [
+        r for r in caplog.records
+        if r.levelno == logging.DEBUG and "will be REFUSED" in r.getMessage()
+    ]
+    assert len(warns) == 1 and len(debugs) == 2
+    other = "15557776666@c.us"
+    await _dispatch(adapter, _env("hi", other))
+    assert len(_refusals(caplog)) == 2  # a different sender still warns
+
+
+def test_refusal_warns_again_after_ttl() -> None:
+    t0 = 1000.0
+    assert owner_mod._refusal_should_warn("a", "c", now=t0) is True
+    assert owner_mod._refusal_should_warn("a", "c", now=t0 + 1) is False
+    assert owner_mod._refusal_should_warn(
+        "a", "c", now=t0 + owner_mod.REFUSAL_WARN_TTL_S + 1
+    ) is True
+
+
+def test_refusal_memory_is_bounded(monkeypatch) -> None:
+    monkeypatch.setattr(owner_mod, "_REFUSAL_WARN_MAX", 3)
+    for i in range(10):
+        owner_mod._refusal_should_warn(f"s{i}", "c", now=1.0)
+    assert len(owner_mod._REFUSAL_WARNED) == 3
+
+
+def test_refusal_log_masks_phone_numbers(caplog) -> None:
+    assert owner_mod.mask_id("972544329000@c.us") == "***9000@c.us"
+    assert owner_mod.mask_id("271862907039996@lid") == "***9996@lid"
+    assert owner_mod.mask_id("972544329000:26@s.whatsapp.net") == "***9000@s.whatsapp.net"
+    assert owner_mod.mask_id("123") == "***"
+    assert owner_mod.mask_id(None) == "None"
