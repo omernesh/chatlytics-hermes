@@ -715,9 +715,10 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
     def __init__(self, config: "PlatformConfig", **kwargs: Any) -> None:
         if not _HERMES_AVAILABLE:
             raise RuntimeError(
-                "hermes-agent>=0.14,<1.0 must be installed to instantiate "
-                "ChatlyticsAdapter. Install with: "
-                "pip install 'hermes-agent>=0.14,<1.0'"
+                "hermes-agent>=0.14 must be installed to instantiate "
+                "ChatlyticsAdapter. Install or update hermes-agent via the "
+                "host (e.g. `hermes update`); never let pip resolve it "
+                "from this plugin."
             )
 
         super().__init__(config=config, platform=Platform("chatlytics"))

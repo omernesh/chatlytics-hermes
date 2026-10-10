@@ -104,7 +104,7 @@ package. Target the hermes tool's own interpreter explicitly:
 
 ```bash
 uv pip install --python <hermes tool python> --no-deps /path/to/chatlytics-hermes
-python -m chatlytics_hermes.doctor     # verify nothing broke
+<hermes tool python> -m chatlytics_hermes.doctor  # verify nothing broke
 ```
 
 (`<hermes tool python>` is the venv python the gateway runs on, e.g.
