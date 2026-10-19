@@ -593,6 +593,35 @@ def _coerce_success_payload(
     return True, None
 
 
+# chatlytics#451: default media + follow-up text coalescing window.
+_DEFAULT_MEDIA_COALESCE_MS = 1500
+
+
+def _merge_media_and_text(media_event: Any, text_event: Any) -> Any:
+    """One event for a media message and the text that followed it.
+
+    The TEXT's event is the base (it is what the owner is asking for); the
+    media's text (the ``[media] ... url=`` fold) is appended below it, and any
+    media urls/types are carried over.
+    """
+    import dataclasses
+
+    t = getattr(text_event, "text", "") or ""
+    m = getattr(media_event, "text", "") or ""
+    changes: Dict[str, Any] = {"text": f"{t}\n{m}" if t and m else (t or m)}
+    for field in ("media_urls", "media_types"):
+        if hasattr(text_event, field):
+            changes[field] = list(getattr(text_event, field) or []) + list(
+                getattr(media_event, field, None) or []
+            )
+    try:
+        return dataclasses.replace(text_event, **changes)
+    except Exception:  # noqa: BLE001 -- non-dataclass event (harness drift)
+        for k, v in changes.items():
+            setattr(text_event, k, v)
+        return text_event
+
+
 def _envelope_to_body(
     env: Dict[str, Any], *, text: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -1063,6 +1092,29 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             or str(extra.get("inject_media_markers") or "")
         ).strip().lower()
         self.inject_media_markers: bool = _markers_raw in ("1", "true", "yes", "on")
+
+        # chatlytics#451 — media + follow-up text coalescing window (seconds).
+        # See _handle_or_coalesce. CHATLYTICS_MEDIA_COALESCE_MS /
+        # extra.media_coalesce_ms; 0 turns it off; clamped to 10 s.
+        _coalesce_raw = os.getenv("CHATLYTICS_MEDIA_COALESCE_MS")
+        if _coalesce_raw is None or not _coalesce_raw.strip():
+            _coalesce_raw = extra.get("media_coalesce_ms")
+        try:
+            _coalesce_ms = (
+                _DEFAULT_MEDIA_COALESCE_MS
+                if _coalesce_raw is None or str(_coalesce_raw).strip() == ""
+                else int(str(_coalesce_raw).strip())
+            )
+        except ValueError:
+            logger.warning(
+                "media_coalesce_ms=%r is not an integer; using %d",
+                _coalesce_raw,
+                _DEFAULT_MEDIA_COALESCE_MS,
+            )
+            _coalesce_ms = _DEFAULT_MEDIA_COALESCE_MS
+        self.media_coalesce_s: float = max(0, min(_coalesce_ms, 10_000)) / 1000.0
+        # (bot conn id, chat, sender) -> (held media event, release timer)
+        self._held_media: Dict[tuple, Tuple[Any, "asyncio.Task[None]"]] = {}
 
         # HTTP client is constructed lazily on ``connect()`` so that
         # misconfigured adapters (empty base_url/api_key) raise only at
@@ -2465,7 +2517,86 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             sender_authenticated=True,
             pinned=_owner_pinned,
         )
+        await self._handle_or_coalesce(event, env, conn)
+
+    # --- Media + follow-up text coalescing (chatlytics#451) ----------------
+
+    async def _handle_or_coalesce(
+        self, event: Any, env: Dict[str, Any], conn: Optional["_BotConn"]
+    ) -> None:
+        """Hand ``event`` to core, folding a media message and the text that
+        follows it into ONE turn.
+
+        WHY: a video and the text the owner sends right after it ("forward
+        this to X") reached the agent as two turns, and it answered twice.
+        hermes-agent merges a follow-up into the pending turn only for a PHOTO
+        burst (gateway/run_busy.py ``_queue_or_replace_pending_event``); video,
+        voice and document follow-ups deliberately get their own turn. On this
+        transport every event is TEXT anyway (the media rides in agent_text),
+        so core cannot tell the pair apart.
+
+        HOW: an envelope with ``has_media`` is HELD for ``media_coalesce_s``.
+        If a text-only envelope from the same sender, in the same chat, on the
+        same bot connection arrives inside that window, the two are dispatched
+        as one event: the text's event, with the media's text appended. If
+        nothing arrives, the media goes alone when the window ends. A second
+        media message releases the first one on its own (unchanged behaviour
+        for media bursts). Text that arrives FIRST is never held, so plain text
+        never waits.
+
+        The envelope timestamp is the server's routing time, not WhatsApp's,
+        so the window is measured here, on arrival. The held turn is already
+        acked upstream; a process crash inside the window (default 1.5 s)
+        would lose it. disconnect() releases anything still held.
+        """
+        key = self._coalesce_key(env, conn)
+        if key is None:
+            await self.handle_message(event)
+            return
+        held = self._held_media.pop(key, None)
+        if held is not None:
+            held_event, timer = held
+            timer.cancel()
+            if not env.get("has_media"):
+                await self.handle_message(_merge_media_and_text(held_event, event))
+                return
+            await self.handle_message(held_event)
+        if env.get("has_media"):
+            timer = asyncio.ensure_future(self._release_held_media(key, event))
+            self._held_media[key] = (event, timer)
+            return
         await self.handle_message(event)
+
+    def _coalesce_key(
+        self, env: Dict[str, Any], conn: Optional["_BotConn"]
+    ) -> Optional[tuple]:
+        if self.media_coalesce_s <= 0:
+            return None
+        chat, sender = env.get("entity_jid"), env.get("sender_jid")
+        if not (isinstance(chat, str) and chat and isinstance(sender, str) and sender):
+            return None
+        return (id(conn) if conn is not None else None, chat, sender)
+
+    async def _release_held_media(self, key: tuple, event: Any) -> None:
+        await asyncio.sleep(self.media_coalesce_s)
+        held = self._held_media.get(key)
+        if held is None or held[0] is not event:
+            return
+        del self._held_media[key]
+        try:
+            await self.handle_message(event)
+        except Exception:  # noqa: BLE001 -- a background release must not die silently
+            logger.exception("held media turn failed to dispatch")
+
+    async def _flush_held_media(self) -> None:
+        """Dispatch every held media turn now (teardown). Never raises."""
+        held, self._held_media = self._held_media, {}
+        for event, timer in held.values():
+            timer.cancel()
+            try:
+                await self.handle_message(event)
+            except Exception:  # noqa: BLE001 -- teardown never raises
+                logger.exception("held media turn failed to dispatch at disconnect")
 
     # --- Control envelopes (v4.3.0 — chatlytics v5.4 P6) -------------------
 
@@ -3730,6 +3861,10 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # Stop accepting new inbound work before tearing down transports so
         # the longpoll loop sees ``_running == False`` and exits its while.
         self._running = False
+
+        # chatlytics#451: a media turn still waiting for its follow-up text
+        # goes out now, while the clients are still open.
+        await self._flush_held_media()
 
         # v4.5.2: drop the live-adapter registry entry (identity-guarded —
         # a newer adapter that already re-registered is left untouched).
