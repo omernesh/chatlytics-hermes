@@ -41,6 +41,7 @@ first):
 | `CHATLYTICS_API_KEY` | yes\* | Legacy operator bearer. Fallback when `CHATLYTICS_BOT_TOKEN` is unset; removed in plugin v5.0. |
 | `CHATLYTICS_BASE_URL` | no | Chatlytics gateway base URL. Default `https://node.chatlytics.ai`. Override to self-host or target a non-default node. **On-prem gateways should use the LAN URL** (e.g. `http://192.168.1.133:8050`) — the Cloudflare tunnel in front of the public DNS name caps concurrent longpolls and 502s past the limit. |
 | `CHATLYTICS_INBOUND_MODE` | no | `webhook` (default — aiohttp PUSH server) or `longpoll` (PULL via `GET /api/v1/bot/updates`). |
+| `CHATLYTICS_TRANSPORT` | no | Pull-mode transport (v5.0): `auto` (default — WebSocket stream, long-poll only when the server has no stream route, re-probed every 10 min), `stream`, or `longpoll`. Config: `extra.transport`. Re-probe interval: `extra.stream_reprobe_s` / `CHATLYTICS_STREAM_REPROBE_S` (default 600). |
 | `CHATLYTICS_SESSION` | no | **Deprecated (v4.5.8).** Default WAHA session name (e.g. `3cf11776_logan`) used for outbound `/api/v1/send` in **legacy webhook mode only** (no `CHATLYTICS_BOT_TOKEN`). A no-op when bot-token auth is active — bot tokens pin the session server-side. Will be removed in v5.0. |
 | `CHATLYTICS_ACCOUNT_ID` | no | Default session/account ID for outbound sends. |
 | `CHATLYTICS_HOME_CHANNEL` | no | Default chat_id for cron / notification delivery. |

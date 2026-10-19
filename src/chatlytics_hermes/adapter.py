@@ -79,6 +79,15 @@ from .diagnostics import (
     map_connect_error,
 )
 from .inbound import make_health_handler, make_webhook_handler, normalize_payload
+from .stream import (
+    CLOSE_SLOW_CONSUMER,
+    CLOSE_SUPERSEDED,
+    HEALTHY_RESET_S,
+    DedupeCache,
+    StreamOutcome,
+    reconnect_delay,
+    run_stream_once,
+)
 from .owner import (
     apply_owner_access,
     apply_owner_tagging,
@@ -136,6 +145,17 @@ _LONGPOLL_TIMEOUT_MS: int = 25000
 # nothing changes on ack. DO NOT remove this param — without it the server
 # silently withholds control envelopes and conversation commands no-op.
 _LONGPOLL_CAPS: str = "control"
+
+# v5.0.0 (bot stream, chatlytics#793): inbound transport selection for pull
+# mode, and how often an ``auto`` bot that fell back to long-poll re-probes
+# the stream (it switches over by itself once the server flag is on).
+_TRANSPORTS: frozenset = frozenset({"auto", "stream", "longpoll"})
+_STREAM_REPROBE_DEFAULT_S: float = 600.0
+# ``transport: stream`` against a server with no stream route: retry cadence.
+_STREAM_FORCED_RETRY_S: float = 60.0
+# A bot whose token the stream rejected (4401/4403 or HTTP 401/403) is
+# stopped; it retries this rarely (a rotated token needs a config update).
+_STREAM_AUTH_RETRY_S: float = 300.0
 
 # v4.3.0: control-envelope action set (chatlytics v5.4 wire contract).
 # ``kind=="control"`` envelopes carry one of these in ``action``; anything
@@ -688,7 +708,19 @@ class _BotConn:
     primary bot exactly as it did before v4.6.0.
     """
 
-    __slots__ = ("token", "fp", "client", "label", "index", "task")
+    __slots__ = (
+        "token",
+        "fp",
+        "client",
+        "label",
+        "index",
+        "task",
+        "cursor",
+        "dedupe",
+        "transport",
+        "transport_since",
+        "transport_detail",
+    )
 
     def __init__(self, token: str, index: int) -> None:
         self.token: str = token
@@ -701,6 +733,27 @@ class _BotConn:
         self.label: str = f"bot fp={self.fp}"
         self.index: int = index
         self.task: Optional["asyncio.Task"] = None
+        # v5.0.0 (bot stream): inbound state shared by BOTH transports. The
+        # cursor format is identical on long-poll and the stream, so a bot
+        # that switches transport resumes exactly where it acked. The dedupe
+        # cache holds stream ``env.id``s (stable across redelivery, failover
+        # and token rotation) and survives reconnects.
+        self.cursor: str = ""
+        self.dedupe: DedupeCache = DedupeCache()
+        # "starting" | "stream" | "longpoll" | "stopped" (+ a detail line) —
+        # reported by inbound_status() / chatlytics_health / logs.
+        self.transport: str = "starting"
+        self.transport_since: float = time.time()
+        self.transport_detail: str = ""
+
+    def set_transport(self, transport: str, detail: str = "") -> bool:
+        """Record the live inbound transport; True when it CHANGED."""
+        changed = transport != self.transport
+        if changed:
+            self.transport = transport
+            self.transport_since = time.time()
+        self.transport_detail = detail
+        return changed
 
     @property
     def is_primary(self) -> bool:
@@ -846,6 +899,37 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             or extra.get("inbound_mode")
             or "webhook"
         ).strip().lower()
+        # v5.0.0 (bot stream, chatlytics#793): HOW a pull-mode bot receives.
+        #   auto     (default) — WebSocket stream; falls back to long-poll ONLY
+        #            when the server has no stream route (404/426: flag off or
+        #            old server), and re-probes every stream_reprobe_s so it
+        #            switches to the stream by itself once the server flag is on.
+        #   stream   — stream only (never long-poll).
+        #   longpoll — the v4.x long-poll consumer, byte-for-byte.
+        # Applies only when inbound_mode == "longpoll" (= pull mode); webhook
+        # mode is unchanged. Env CHATLYTICS_TRANSPORT > extra.transport.
+        _transport_raw = str(
+            os.getenv("CHATLYTICS_TRANSPORT") or extra.get("transport") or "auto"
+        ).strip().lower()
+        if _transport_raw not in _TRANSPORTS:
+            logger.warning(
+                "chatlytics transport %r is not one of %s — using 'auto'",
+                _transport_raw,
+                "/".join(sorted(_TRANSPORTS)),
+            )
+            _transport_raw = "auto"
+        self.transport: str = _transport_raw
+        try:
+            self.stream_reprobe_s: float = max(
+                10.0,
+                float(
+                    os.getenv("CHATLYTICS_STREAM_REPROBE_S")
+                    or extra.get("stream_reprobe_s")
+                    or _STREAM_REPROBE_DEFAULT_S
+                ),
+            )
+        except (TypeError, ValueError):
+            self.stream_reprobe_s = _STREAM_REPROBE_DEFAULT_S
 
         # Emit a one-time deprecation warning when CHATLYTICS_SESSION is set
         # AND bot-token auth is in use (the env var is a no-op in that path).
@@ -1245,7 +1329,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 if not await self._verify_bot_identity(conn):
                     continue
                 if conn.task is None or conn.task.done():
-                    conn.task = asyncio.create_task(self._poll_loop(conn))
+                    conn.task = asyncio.create_task(self._inbound_loop(conn))
                     conn.task.add_done_callback(self._on_poll_task_done)
                     logger.info(
                         "chatlytics inbound: longpoll loop started for extra "
@@ -1650,7 +1734,9 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
     # --- Longpoll inbound consumer (v4.1) ---------------------------------
 
-    async def _poll_loop(self, conn: Optional["_BotConn"] = None) -> None:
+    async def _poll_loop(
+        self, conn: Optional["_BotConn"] = None, *, until: Optional[float] = None
+    ) -> None:
         """PULL inbound messages from chatlytics via long-poll.
 
         v4.6.0 (MULTIBOT): one loop instance PER BOT. ``conn`` selects which
@@ -1699,7 +1785,11 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # extra bots are identified by name + fingerprint on every line.
         tag: str = "" if (conn is None or conn.is_primary) else f"[{conn.label} fp={conn.fp}] "
 
-        cursor: str = ""
+        # v5.0.0: resume from the bot's shared cursor (same format on the
+        # stream). With ``until`` (a time.monotonic() deadline) the loop
+        # returns after the iteration in flight so an ``auto`` bot can
+        # re-probe the stream; ``until=None`` = run until disconnect (v4.x).
+        cursor: str = conn.cursor if conn is not None else ""
         # Consecutive-failure count (indexes _BACKOFF_LADDER) and the
         # degraded-state label (None == healthy). Both reset on success.
         # LOCALS, not instance state: this is what isolates one bot's
@@ -1783,7 +1873,9 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # while still being unmissable the first time.
         unexpected_seen: set = set()
 
-        while self._running:
+        while self._running and (until is None or time.monotonic() < until):
+            if conn is not None:
+                conn.cursor = cursor
             # v4.6.0 (MULTIBOT): this loop uses ITS OWN bot's client, never
             # self._client — using the shared/primary client here would send
             # this bot's acks (and route its envelopes) under the WRONG bearer.
@@ -1969,6 +2061,208 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     level=logging.ERROR,
                 )
                 await asyncio.sleep(delay)
+        if conn is not None:
+            conn.cursor = cursor
+
+    # --- Inbound transport selection (v5.0.0 — bot stream) ----------------
+
+    async def _inbound_loop(self, conn: "_BotConn") -> None:
+        """Serve ONE bot's inbound for the adapter's lifetime (pull mode).
+
+        One task per bot (multiplexed bots each get their own socket and
+        their own state — one bot's outage never touches another).
+        Transport per :attr:`transport`:
+
+        - ``longpoll``: exactly :meth:`_poll_loop` (v4.x).
+        - ``auto`` / ``stream``: the WebSocket stream (:mod:`.stream`) with
+          the §3.6 reconnect contract. ``auto`` falls back to long-poll ONLY
+          when the upgrade answers 404/426 (no stream route — server flag
+          off or old server), runs long-poll for :attr:`stream_reprobe_s`,
+          then re-probes; it switches to the stream by itself once the
+          server enables it. A transient refusal (503 store/coordination
+          unavailable, 429, 409, 5xx, transport error, close 1013) is NOT a
+          fallback: back off with jitter and retry the stream.
+        - close 1012 (deploy drain, token_rotated) → reconnect after
+          ``reconnect.after_ms`` (+ jitter); 4409 (superseded/fenced) → long
+          escalating backoff (another consumer holds this bot — logged
+          loudly); 4401/4403 or HTTP 401/403 → this bot is STOPPED (other
+          bots unaffected) and retried every 5 min.
+
+        Never returns while running, never raises except CancelledError.
+        """
+        tag: str = "" if conn.is_primary else f"[{conn.label} fp={conn.fp}] "
+        if self.transport == "longpoll":
+            conn.set_transport("longpoll", "configured (transport: longpoll)")
+            await self._poll_loop(conn)
+            return
+
+        attempt: int = 0
+        superseded_streak: int = 0
+        fallback_logged: bool = False
+        last_failure: Optional[str] = None
+        max_inflight: Optional[int] = None
+
+        def _on_cursor(c: str) -> None:
+            conn.cursor = c
+
+        def _on_open(hello: Dict[str, Any]) -> None:
+            if conn.set_transport("stream", f"conn_id={hello.get('conn_id')}"):
+                logger.info(
+                    "%schatlytics inbound: STREAM connected (conn_id=%s, "
+                    "max_inflight=%s)",
+                    tag,
+                    hello.get("conn_id"),
+                    hello.get("max_inflight"),
+                )
+
+        async def _on_envelope(env: Dict[str, Any]) -> None:
+            await self._dispatch_envelope(env, conn)
+
+        while self._running:
+            client = conn.client
+            if client is None:
+                return  # teardown race — disconnect() owns the rest
+            try:
+                outcome: StreamOutcome = await run_stream_once(
+                    base_url=self.base_url,
+                    token=conn.token,
+                    user_agent=USER_AGENT,
+                    cursor=conn.cursor or None,
+                    dedupe=conn.dedupe,
+                    on_envelope=_on_envelope,
+                    on_cursor=_on_cursor,
+                    on_open=_on_open,
+                    caps=[_LONGPOLL_CAPS],
+                    max_inflight=max_inflight,
+                    should_run=lambda: self._running,
+                    log_tag=tag,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 -- the loop must never die
+                logger.exception("%sstream attempt raised unexpectedly; backing off", tag)
+                outcome = StreamOutcome(error=f"unexpected {type(exc).__name__}")
+            if not self._running:
+                return
+
+            if outcome.unavailable:
+                if self.transport == "auto":
+                    detail = (
+                        f"stream unavailable (HTTP {outcome.http_status}); "
+                        f"re-probing every {self.stream_reprobe_s:.0f}s"
+                    )
+                    changed = conn.set_transport("longpoll", detail)
+                    if changed or not fallback_logged:
+                        logger.info(
+                            "%schatlytics inbound: stream not enabled on this "
+                            "server (HTTP %d) — using long-poll; re-probing the "
+                            "stream every %.0fs",
+                            tag,
+                            outcome.http_status,
+                            self.stream_reprobe_s,
+                        )
+                        fallback_logged = True
+                    await self._poll_loop(
+                        conn, until=time.monotonic() + self.stream_reprobe_s
+                    )
+                    attempt = 0
+                    continue
+                conn.set_transport(
+                    "stopped", f"transport: stream but server answered HTTP {outcome.http_status}"
+                )
+                logger.error(
+                    "%schatlytics inbound: transport is 'stream' but the server "
+                    "has no stream route (HTTP %d) — NOT receiving; retrying in "
+                    "%.0fs. Set transport: auto to fall back to long-poll.",
+                    tag,
+                    outcome.http_status,
+                    _STREAM_FORCED_RETRY_S,
+                )
+                await asyncio.sleep(_STREAM_FORCED_RETRY_S)
+                continue
+
+            if outcome.auth_rejected:
+                conn.set_transport("stopped", f"token rejected ({outcome.describe()})")
+                logger.error(
+                    "%s%sbot fp=%s token REJECTED by the stream (%s) — this bot "
+                    "is stopped (other bots unaffected); retrying every %.0fs. "
+                    "%s Update the token in the profile config and restart the "
+                    "gateway.",
+                    _LOAD_FAIL_PREFIX + " " if conn.is_primary else "",
+                    tag,
+                    conn.fp,
+                    outcome.describe(),
+                    _STREAM_AUTH_RETRY_S,
+                    map_connect_error(status_code=401),
+                )
+                await asyncio.sleep(_STREAM_AUTH_RETRY_S)
+                attempt = 0
+                continue
+
+            # A normal / transient ending: reconnect.
+            if outcome.connected_s >= HEALTHY_RESET_S:
+                attempt = 0
+            if outcome.close_code == CLOSE_SUPERSEDED:
+                superseded_streak += 1
+                logger.warning(
+                    "%schatlytics stream SUPERSEDED (4409) for bot fp=%s — another "
+                    "consumer connected with this token (two gateways running "
+                    "for one bot?). Backing off before reclaiming (streak %d).",
+                    tag,
+                    conn.fp,
+                    superseded_streak,
+                )
+            elif outcome.connected_s >= HEALTHY_RESET_S:
+                superseded_streak = 0
+            if outcome.close_code == CLOSE_SLOW_CONSUMER:
+                max_inflight = max(1, (max_inflight or 32) // 2)
+            delay = reconnect_delay(outcome, attempt, superseded_streak)
+            attempt += 1
+            failure = outcome.describe()
+            if outcome.hello:
+                conn.set_transport("stream", f"reconnecting after {failure}")
+                logger.info(
+                    "%schatlytics stream disconnected (%s, up %.0fs) — "
+                    "reconnecting in %.1fs",
+                    tag,
+                    failure,
+                    outcome.connected_s,
+                    delay,
+                )
+                last_failure = None
+            else:
+                conn.set_transport(
+                    "starting" if conn.transport == "starting" else conn.transport,
+                    f"stream attempt failed: {failure}",
+                )
+                cls = failure.split(" (")[0]
+                log = logger.warning if cls != last_failure else logger.debug
+                log(
+                    "%schatlytics stream attempt failed: %s — retrying in %.1fs "
+                    "(transient; not falling back to long-poll)",
+                    tag,
+                    failure,
+                    delay,
+                )
+                last_failure = cls
+            await asyncio.sleep(delay)
+
+    def inbound_status(self) -> List[Dict[str, Any]]:
+        """Per-bot inbound transport report (no secrets — fingerprints only)."""
+        out: List[Dict[str, Any]] = []
+        for c in self._conns:
+            out.append(
+                {
+                    "bot": c.label,
+                    "fp": c.fp,
+                    "primary": c.is_primary,
+                    "transport": c.transport,
+                    "since": int(c.transport_since),
+                    "detail": c.transport_detail,
+                    "configured": self.transport,
+                }
+            )
+        return out
 
     async def _dispatch_envelope(
         self, env: Dict[str, Any], conn: Optional["_BotConn"] = None
@@ -3252,7 +3546,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             # Idempotency: don't spawn a second poll task on re-connect.
             if self._poll_task is None or self._poll_task.done():
                 self._poll_task = asyncio.create_task(
-                    self._poll_loop(self._conns[0])
+                    self._inbound_loop(self._conns[0])
                 )
                 # v4.5.1 (review-d3 X1): belt + suspenders for the loop's
                 # never-exit contract — if the task ever completes without
