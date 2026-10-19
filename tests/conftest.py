@@ -46,6 +46,12 @@ def _isolate_chatlytics_env(monkeypatch):
     """
     for var in _CHATLYTICS_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
+    # v5.0.0: the default transport is ``auto`` (WebSocket stream first).
+    # The pre-5.0 suites mock long-poll with respx (httpx only) and never
+    # stand up a WebSocket server, so pin them to long-poll. The stream
+    # suites (tests/test_stream*.py) delete or override this themselves.
+    monkeypatch.setenv("CHATLYTICS_TRANSPORT", "longpoll")
+    monkeypatch.delenv("CHATLYTICS_STREAM_REPROBE_S", raising=False)
 
 
 @pytest.fixture(autouse=True)

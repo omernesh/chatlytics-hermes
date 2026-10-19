@@ -20,6 +20,10 @@ c. base_url reachable — ``GET /health``
 d. token valid — ``GET /api/v1/bot/me`` (prints the bot name)
 e. longpoll endpoint reachable — ``GET /api/v1/bot/updates``
 f. hermes-agent version >= plugin floor (no-downgrade guard)
+g. bot stream enabled? — a NON-consuming probe of ``/api/v1/bot/stream``:
+   an upgrade request WITHOUT the subprotocol. The server answers 426 when
+   the stream is on and 404 when it is off, before it reads the token, so
+   the probe can never take over (4409) the live gateway's socket.
 
 Network checks share one sync ``httpx.Client`` and classify failures through
 :func:`chatlytics_hermes.diagnostics.map_connect_error` so the doctor's FAIL
@@ -199,6 +203,38 @@ def check_longpoll(client: httpx.Client) -> CheckResult:
         f"{map_connect_error(status_code=resp.status_code)}"
     )
 
+
+def check_stream(client: httpx.Client) -> CheckResult:
+    """(g) bot stream on? Non-consuming probe (no subprotocol → 426 / 404)."""
+    import base64
+    import os as _os
+
+    try:
+        resp = client.get(
+            "/api/v1/bot/stream",
+            headers={
+                "Upgrade": "websocket",
+                "Connection": "Upgrade",
+                "Sec-WebSocket-Version": "13",
+                "Sec-WebSocket-Key": base64.b64encode(_os.urandom(16)).decode(),
+            },
+        )
+    except httpx.RequestError as exc:
+        return False, f"stream probe failed: {map_connect_error(exc=exc)}"
+    if resp.status_code == 426:
+        return True, (
+            "bot stream ENABLED — transport auto receives over the WebSocket "
+            "stream"
+        )
+    if resp.status_code == 404:
+        return True, (
+            "bot stream not enabled on this server (404) — transport auto "
+            "uses long-poll and re-probes every 10 min"
+        )
+    return False, (
+        f"stream probe returned HTTP {resp.status_code} (expected 426 or 404): "
+        f"{map_connect_error(status_code=resp.status_code)}"
+    )
 
 def doctor(
     base_url: Optional[str] = None,

@@ -1,3 +1,32 @@
+## [5.0.0] - 2026-10-19
+
+### Added
+
+- **Bots receive over a persistent connection (chatlytics#793).** In pull
+  mode (`inbound_mode: longpoll`) each bot now holds one WebSocket to
+  `/api/v1/bot/stream` (`chatlytics.bot.v1`) instead of polling. Envelopes are
+  deduplicated on their stable `id`, acknowledged after dispatch, and resumed
+  from the last acknowledged cursor after any reconnect. Conversation commands
+  and question resolutions keep working (`ready.caps: ["control"]`).
+- **`transport: auto | stream | longpoll`** (`extra.transport`, env
+  `CHATLYTICS_TRANSPORT`, default `auto`). `auto` uses the stream and falls
+  back to long-poll only when the server has no stream route (404/426); it
+  re-probes every 10 minutes (`extra.stream_reprobe_s`) and switches to the
+  stream by itself once the server enables it. No config change is needed.
+- **Multiplexed bots** (`extra_bot_tokens`) each get their own connection;
+  replies keep egressing on the receiving bot's own token.
+- **Status:** `chatlytics_health` returns `inbound: [{bot, fp, transport,
+  since, detail}]`; the doctor gains a non-consuming `stream` check.
+
+### Changed
+
+- Reconnect contract: deploy/rotation restarts (1012) reconnect after the
+  server's `after_ms`; temporary refusals (503, 429, 409, 1013) back off with
+  full jitter and retry the stream — they never fall back to long-poll. A
+  connection replaced by another consumer of the same token (4409) backs off
+  60 s → 5 min and logs a warning. A rejected token (4401/4403, HTTP 401/403)
+  stops that bot only, logs an error, and retries every 5 minutes.
+- `CHATLYTICS_API_KEY` fallback is **kept** in this release.
 ## [4.8.2] - 2026-10-10
 
 ### Fixed

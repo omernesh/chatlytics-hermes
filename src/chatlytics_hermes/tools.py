@@ -1223,8 +1223,17 @@ async def chatlytics_actions(client: ChatlyticsClient) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-async def chatlytics_health(client: ChatlyticsClient) -> Dict[str, Any]:
-    return await _get(client, "/health")
+async def chatlytics_health(client: ChatlyticsClient, *, adapter: Any = None) -> Dict[str, Any]:
+    result = await _get(client, "/health")
+    # v5.0.0 (bot stream): report which inbound transport each served bot is
+    # on (stream / longpoll / stopped) — fingerprints only, never tokens.
+    status = getattr(adapter, "inbound_status", None)
+    if callable(status) and isinstance(result, dict):
+        try:
+            result["inbound"] = status()
+        except Exception:  # noqa: BLE001 -- status must never break health
+            pass
+    return result
 
 
 async def chatlytics_login(client: ChatlyticsClient) -> Dict[str, Any]:
