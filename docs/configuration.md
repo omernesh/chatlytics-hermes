@@ -55,6 +55,7 @@ first):
 | `CHATLYTICS_UPLOAD_ALLOWED_ROOTS` | no | OS-pathsep-separated absolute paths that media tools may read from disk. **Default-deny when unset.** See below. |
 | `CHATLYTICS_INJECT_SENDER_IDS` | no | When truthy (`1`/`true`/`yes`/`on`), prefixes every inbound message's text with the sender's platform id — `[15550001111@c.us] hello` — so agent sessions can identify WHO is speaking (display names are absent/spoofable on WhatsApp; the envelope `sender_jid` is the platform truth). Per-profile opt-in; `extra.inject_sender_ids` equivalent. |
 | `CHATLYTICS_INJECT_MEDIA_MARKERS` | no | When truthy, appends `[media: document \| id: <message_id>]` to inbound messages that carry media (`has_media` on the envelope), so agent sessions know a file arrived even though the envelope carries no media URL. Per-profile opt-in; `extra.inject_media_markers` equivalent. |
+| `CHATLYTICS_MEDIA_COALESCE_MS` | no | Default `1500`. A media message is held this many milliseconds. If the same sender then sends text in the same chat, the two reach the agent as **one** turn, so the agent answers once. Media with no follow-up goes alone when the time is up. `0` turns this off; the maximum is `10000`. `extra.media_coalesce_ms` equivalent. |
 | `CHATLYTICS_OWNER_TAGGING` | no | Owner tagging (default **on** whenever `allow_admin_from` or `group_allow_admin_from` is configured). `0`/`false`/`no`/`off` disables; `extra.owner_tagging` equivalent. See [Owner tagging](#owner-tagging). |
 
 \* One of `CHATLYTICS_BOT_TOKEN` / `CHATLYTICS_API_KEY` must be set for the
