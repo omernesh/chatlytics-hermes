@@ -236,6 +236,7 @@ def check_stream(client: httpx.Client) -> CheckResult:
         f"{map_connect_error(status_code=resp.status_code)}"
     )
 
+
 def doctor(
     base_url: Optional[str] = None,
     token: Optional[str] = None,
@@ -266,6 +267,9 @@ def doctor(
         base_url=resolved_url.rstrip("/"), timeout=_HTTP_TIMEOUT, headers=headers
     ) as client:
         results.append(("health", check_health(client)))
+        # (g) runs with or without a token: the server answers the
+        # subprotocol-less upgrade (426 on / 404 off) before it reads one.
+        results.append(("stream", check_stream(client)))
         if resolved_token:
             results.append(("bot-me", check_bot_me(client)))
             results.append(("longpoll", check_longpoll(client)))
