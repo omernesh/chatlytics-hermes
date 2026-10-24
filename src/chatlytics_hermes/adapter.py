@@ -2099,6 +2099,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
         attempt: int = 0
         superseded_streak: int = 0
+        duplicate_streak: int = 0
         fallback_logged: bool = False
         last_failure: Optional[str] = None
         max_inflight: Optional[int] = None
@@ -2203,6 +2204,21 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             # A normal / transient ending: reconnect.
             if outcome.connected_s >= HEALTHY_RESET_S:
                 attempt = 0
+            if outcome.duplicate_consumer:
+                duplicate_streak += 1
+                # ONE loud line per episode; later refusals stay at DEBUG so a
+                # long wait cannot flood the log.
+                (logger.warning if duplicate_streak == 1 else logger.debug)(
+                    "%schatlytics stream REFUSED for bot fp=%s: another gateway "
+                    "is already consuming this bot token (409 duplicate_consumer). "
+                    "Two gateways are running for one bot -- stop one. Backing "
+                    "off (60s doubling to 10min); will take over when the other "
+                    "one stops.",
+                    tag,
+                    conn.fp,
+                )
+            elif outcome.hello or outcome.close_code is not None:
+                duplicate_streak = 0
             if outcome.close_code == CLOSE_SUPERSEDED:
                 superseded_streak += 1
                 logger.warning(
@@ -2217,7 +2233,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 superseded_streak = 0
             if outcome.close_code == CLOSE_SLOW_CONSUMER:
                 max_inflight = max(1, (max_inflight or 32) // 2)
-            delay = reconnect_delay(outcome, attempt, superseded_streak)
+            delay = reconnect_delay(outcome, attempt, superseded_streak, duplicate_streak)
             attempt += 1
             failure = outcome.describe()
             if outcome.hello:

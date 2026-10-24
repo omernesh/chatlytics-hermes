@@ -1,3 +1,21 @@
+## [5.0.3] - 2026-10-25
+
+### Added
+
+- **Gateway instance id on the bot stream (chatlytics#838).** Each process
+  generates one random id at start and sends it on every stream connect as
+  `X-Chatlytics-Gateway-Instance`. The id is never derived from config, env
+  or hostname, so two containers sharing one config get different ids and the
+  server can tell a restart or reconnect from a second live gateway.
+- **`409 duplicate_consumer` is handled.** When the server refuses the
+  connect because another gateway is already consuming the bot token
+  (`X-Chatlytics-Reject-Reason: duplicate_consumer`), the plugin logs one
+  warning per episode and backs off at least `Retry-After` (60 s), doubling
+  per consecutive refusal up to 10 min, with jitter. It never gives up and
+  never hot-loops: when the other gateway stops, the next attempt connects.
+  Long-poll is unchanged.
+
+
 ## [5.0.2] - 2026-10-25
 
 ### Fixed
@@ -17,8 +35,6 @@
   `group_allow_admin_from`; without it such owners were refused
   `permission_denied`.
 
-Note: 5.0.1 (gateway instance id) is released separately; the two changes
-are independent.
 ## [5.0.0] - 2026-10-19
 
 ### Added
