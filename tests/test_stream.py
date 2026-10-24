@@ -71,6 +71,7 @@ class FakeServer:
         self.lp_acks: List[Tuple[str, str]] = []
         self.sends: List[Tuple[str, Dict[str, Any]]] = []
         self.upgrade_attempts: List[Tuple[str, float]] = []
+        self.upgrade_headers: List[Dict[str, str]] = []
         self.wake = asyncio.Event()
         self.runner: Optional[web.AppRunner] = None
         self.base_url = ""
@@ -98,6 +99,7 @@ class FakeServer:
     async def stream(self, request: web.Request) -> web.StreamResponse:
         token = _bearer(request)
         self.upgrade_attempts.append((token, time.monotonic()))
+        self.upgrade_headers.append(dict(request.headers))
         if not self.stream_enabled:
             return web.Response(status=404, text="Not Found")
         if self.refuse.get(token):

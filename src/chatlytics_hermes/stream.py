@@ -36,6 +36,7 @@ import contextlib
 import json
 import logging
 import random
+import secrets
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -47,6 +48,26 @@ logger = logging.getLogger(__name__)
 
 SUBPROTOCOL: str = "chatlytics.bot.v1"
 STREAM_PATH: str = "/api/v1/bot/stream"
+
+#: Header carrying this process's gateway instance id (server design 3.7 /
+#: 4.3.1, chatlytics#838). The server uses it to tell "the same gateway
+#: reconnecting" and "a restarted gateway" from "a second live gateway on the
+#: same token".
+GATEWAY_INSTANCE_HEADER: str = "X-Chatlytics-Gateway-Instance"
+#: ONE random id per process. 32 hex chars, within the server's accepted
+#: 1-128 chars of [A-Za-z0-9._:-]. Deliberately NOT derived from env, config
+#: or hostname: two containers sharing one config must still get different
+#: ids, or the server would treat the second as a reconnect of the first and
+#: the two would evict each other forever. Reused for every reconnect.
+GATEWAY_INSTANCE_ID: str = secrets.token_hex(16)
+#: ``409`` + this ``X-Chatlytics-Reject-Reason``: a LIVE gateway already holds
+#: the bot (not a 4409 close code -- the refusal happens before the 101).
+REJECT_REASON_HEADER: str = "X-Chatlytics-Reject-Reason"
+REJECT_DUPLICATE_CONSUMER: str = "duplicate_consumer"
+#: duplicate_consumer backoff (3.7): at least Retry-After (60 s), doubling per
+#: consecutive refusal up to 10 min, jittered. Never counts toward giving up.
+DUPLICATE_BACKOFF_S: float = 60.0
+DUPLICATE_BACKOFF_CAP_S: float = 600.0
 
 #: Client watchdog: no ping and no frame for this long means the socket is
 #: dead (protocol §3.2 — server pings every 30 s).
@@ -120,6 +141,8 @@ class StreamOutcome:
     http_status: Optional[int] = None
     #: ``Retry-After`` seconds from a refused upgrade.
     retry_after_s: Optional[float] = None
+    #: ``X-Chatlytics-Reject-Reason`` of a refused upgrade, if any.
+    reject_reason: Optional[str] = None
     #: WebSocket close code (None when the socket never opened).
     close_code: Optional[int] = None
     #: Last ``reconnect`` frame seen before the close.
@@ -134,6 +157,15 @@ class StreamOutcome:
     @property
     def unavailable(self) -> bool:
         return self.http_status in UNAVAILABLE_STATUSES
+
+    @property
+    def duplicate_consumer(self) -> bool:
+        """409 + ``duplicate_consumer``: another live gateway holds this bot.
+
+        A plain 409 (``bot_already_connected``, lease wait) is NOT this; it
+        keeps its ordinary retry-with-Retry-After meaning.
+        """
+        return self.http_status == 409 and self.reject_reason == REJECT_DUPLICATE_CONSUMER
 
     @property
     def auth_rejected(self) -> bool:
@@ -158,11 +190,19 @@ def full_jitter(attempt: int) -> float:
     return random.uniform(0.0, min(BACKOFF_CAP_S, BACKOFF_BASE_S * (2 ** max(0, attempt))))
 
 
-def reconnect_delay(outcome: StreamOutcome, attempt: int, superseded_streak: int) -> float:
+def reconnect_delay(
+    outcome: StreamOutcome,
+    attempt: int,
+    superseded_streak: int,
+    duplicate_streak: int = 0,
+) -> float:
     """Seconds to wait before the next stream attempt (non-terminal outcomes).
 
     - ``reconnect`` frame (deploy 1012, token_rotated 1012, redis 1013, …):
       ``after_ms + random(0, after_ms)`` — ``after_ms: 0`` reconnects now.
+    - ``409 duplicate_consumer`` (#838): a live gateway holds this bot. At
+      least ``Retry-After``, 60 s doubling to 10 min per consecutive refusal,
+      plus jitter.
     - 4409 superseded / fenced: another consumer holds this bot. Long,
       escalating, jittered wait (60 s → 300 s cap) so two gateways on one
       token do not flap, while a one-off (a takeover during a restart)
@@ -171,6 +211,15 @@ def reconnect_delay(outcome: StreamOutcome, attempt: int, superseded_streak: int
       to 1 s jitter, never less than the jittered backoff floor.
     - anything else: full-jitter backoff.
     """
+    if outcome.duplicate_consumer:
+        base = min(
+            DUPLICATE_BACKOFF_CAP_S,
+            DUPLICATE_BACKOFF_S * (2 ** max(0, duplicate_streak - 1)),
+        )
+        # Honour a larger server Retry-After; jitter keeps two gateways from
+        # retrying in lockstep.
+        base = max(base, outcome.retry_after_s or 0.0)
+        return base + random.uniform(0.0, base / 4)
     if outcome.close_code == CLOSE_SUPERSEDED:
         base = min(SUPERSEDED_BACKOFF_CAP_S, SUPERSEDED_BACKOFF_S * (2 ** max(0, superseded_streak - 1)))
         return base + random.uniform(0.0, base / 2)
@@ -226,6 +275,7 @@ async def run_stream_once(
     max_inflight: Optional[int] = None,
     should_run: Callable[[], bool] = lambda: True,
     log_tag: str = "",
+    instance_id: str = GATEWAY_INSTANCE_ID,
 ) -> StreamOutcome:
     """Open ONE stream connection and serve it until it closes.
 
@@ -241,7 +291,11 @@ async def run_stream_once(
     the caller can resume from it, on either transport.
     """
     outcome = StreamOutcome()
-    headers = {"Authorization": f"Bearer {token}", "User-Agent": user_agent}
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": user_agent,
+        GATEWAY_INSTANCE_HEADER: instance_id,
+    }
     session = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=None, connect=15.0, sock_connect=15.0),
         trust_env=True,
@@ -267,6 +321,11 @@ async def run_stream_once(
             outcome.http_status = exc.status
             outcome.retry_after_s = _parse_retry_after(getattr(exc, "headers", None))
             outcome.error = (exc.message or "")[:200] or None
+            try:
+                reason = exc.headers.get(REJECT_REASON_HEADER) if exc.headers is not None else None
+            except Exception:  # noqa: BLE001
+                reason = None
+            outcome.reject_reason = (str(reason).strip() or None) if reason else None
             return outcome
         except asyncio.CancelledError:
             raise
