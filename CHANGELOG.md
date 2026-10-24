@@ -1,3 +1,24 @@
+## [5.0.2] - 2026-10-25
+
+### Fixed
+
+- **Owner messages refused on hermes-agent 0.22.5.** hermes-agent 0.22.5
+  admits inbound messages through a native envelope whose `metadata`
+  contract is closed: any metadata on a non-`whatsapp` platform refuses the
+  whole message (`Native admission refused: invalid_params (metadata)`). The
+  owner flag (`whatsapp_from_owner` / `chatlytics_from_owner`) is now set only
+  when the running gateway accepts it (feature-detected against its own
+  check); otherwise the owner is marked by the `[owner reply] ` text prefix
+  and the `raw_message` mirror, as before. Older hermes-agent is unchanged.
+- **Pinned owners pass native role reauthorization.** The adapter implements
+  `reauthorize_native_roles`, which hermes-agent 0.22.5 calls for a
+  `role_authorized` sender that is not otherwise allowlisted. It re-applies
+  the owner rule against the current `allow_admin_from` /
+  `group_allow_admin_from`; without it such owners were refused
+  `permission_denied`.
+
+Note: 5.0.1 (gateway instance id) is released separately; the two changes
+are independent.
 ## [5.0.0] - 2026-10-19
 
 ### Added

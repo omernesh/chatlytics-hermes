@@ -92,6 +92,7 @@ from .owner import (
     apply_owner_access,
     apply_owner_tagging,
     neutralize_event_text,
+    reauthorize_owner_role,
     report_gateway_refusal,
 )
 
@@ -2466,6 +2467,18 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             pinned=_owner_pinned,
         )
         await self.handle_message(event)
+
+    async def reauthorize_native_roles(self, source: Any) -> bool:
+        """hermes >= 0.22.5 native-admission hook for a pinned owner (#5).
+
+        Called by ``gateway/session_ingress_context.reauthorize_roles`` when an
+        event carries ``role_authorized`` (set only by ``apply_owner_access``)
+        and the sender is not otherwise allowlisted. Without this hook the
+        gateway refuses the owner with ``permission_denied``.
+        """
+        return reauthorize_owner_role(
+            source, getattr(self.config, "extra", None) or {}
+        )
 
     # --- Control envelopes (v4.3.0 — chatlytics v5.4 P6) -------------------
 
