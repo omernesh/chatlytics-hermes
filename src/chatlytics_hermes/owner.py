@@ -7,7 +7,9 @@ message gets
 
 - ``MessageEvent.metadata["whatsapp_from_owner"] = True`` (upstream key, so
   hooks/plugins written against the official integration work unchanged) and
-  ``metadata["chatlytics_from_owner"] = True``;
+  ``metadata["chatlytics_from_owner"] = True`` — EXCEPT on hermes-agent
+  >= 0.22.5, whose native admission refuses any metadata on a non-whatsapp
+  platform; there the flag is skipped (see ``_native_admission_refuses``);
 - its text prefixed with the literal ``"[owner reply] "`` — never twice.
 
 WHO the owner is: the gateway's own slash-command admin lists in the platform
@@ -55,7 +57,8 @@ import logging
 import os
 import time
 import unicodedata
-from typing import Any, FrozenSet, Optional, Tuple
+from types import SimpleNamespace
+from typing import Any, Dict, FrozenSet, Optional, Tuple
 
 logger = logging.getLogger("chatlytics_hermes.owner")
 
@@ -489,7 +492,60 @@ def neutralize_event_text(event: Any, extra: Any) -> Any:
         return event
 
 
+_METADATA_SKIP_LOGGED: set = set()
+
+
+def _native_admission_refuses(event: Any, metadata: Dict[str, Any]) -> bool:
+    """True when this gateway's native admission would refuse ``metadata``.
+
+    hermes-agent >= 0.22.5 admits every inbound message through a durable
+    "native" envelope (``gateway/session_envelope.py``). Its ``metadata``
+    contract is CLOSED: ``_native_metadata`` returns ``None`` — and the gateway
+    refuses the whole message with ``invalid_params (metadata)`` — for any
+    non-empty metadata unless the platform is ``whatsapp`` and every key is one
+    the bundled Baileys adapter stamps. A plugin platform (``chatlytics``) can
+    therefore carry NO metadata at all.
+
+    Feature-detected by asking the running gateway's own check, so it follows
+    upstream exactly: older hermes (no ``gateway.session_envelope``) keeps the
+    free-form metadata flag; a gateway that has the module but no recognizable
+    check is treated as closed (dropping the flag is harmless — the text
+    prefix is the version-independent signal; refusing the message is not).
+    """
+    try:
+        import importlib
+
+        envelope = importlib.import_module("gateway.session_envelope")
+    except ImportError:
+        return False
+    except Exception:  # noqa: BLE001 -- unknown host state: stay off metadata
+        return True
+    check = getattr(envelope, "_native_metadata", None)
+    if not callable(check):
+        return True
+    try:
+        probe = SimpleNamespace(
+            metadata=dict(metadata), source=getattr(event, "source", None)
+        )
+        return check(probe) is None
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def _set_owner_metadata(event: Any) -> None:
+    wanted = {WHATSAPP_FROM_OWNER_KEY: True, CHATLYTICS_FROM_OWNER_KEY: True}
+    if _native_admission_refuses(event, wanted):
+        # hermes >= 0.22.5: the flag would get the owner's message refused
+        # (invalid_params/metadata). The "[owner reply] " text prefix and the
+        # raw_message mirror still carry it. DO NOT set metadata here.
+        if "skip" not in _METADATA_SKIP_LOGGED:
+            _METADATA_SKIP_LOGGED.add("skip")
+            logger.info(
+                "owner flag not set on MessageEvent.metadata: this hermes-agent's "
+                "native admission refuses metadata on non-whatsapp platforms; "
+                "the owner is marked by the text prefix only"
+            )
+        return
     md = getattr(event, "metadata", None)
     if not isinstance(md, dict):
         # hermes-agent 0.14's MessageEvent has no ``metadata`` field; upstream
@@ -594,6 +650,23 @@ def apply_owner_access(event: Any, extra: Any, *, sender_authenticated: bool) ->
         return True
     except Exception:  # noqa: BLE001 -- must never break dispatch
         logger.debug("owner access pin raised", exc_info=True)
+        return False
+
+
+def reauthorize_owner_role(source: Any, extra: Any) -> bool:
+    """Fresh check behind a pinned ``role_authorized`` (hermes >= 0.22.5).
+
+    Native admission treats ``role_authorized`` as a REQUEST for a connector
+    check, never as a grant: unless the sender passes the gateway's own
+    allowlist/pairing, it calls the adapter's ``reauthorize_native_roles`` and
+    refuses ``permission_denied`` when the adapter has none. The pin is only
+    ever set for an authenticated-transport owner, so the fresh check re-applies
+    the same deterministic rule against the CURRENT admin lists. ``True`` only.
+    """
+    try:
+        return _source_is_owner(source, extra) is True
+    except Exception:  # noqa: BLE001 -- fail closed
+        logger.debug("owner role re-check raised", exc_info=True)
         return False
 
 
