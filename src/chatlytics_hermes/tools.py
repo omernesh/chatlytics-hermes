@@ -45,7 +45,9 @@ from __future__ import annotations
 import inspect
 import json
 import logging
-from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
+import re
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import httpx
 
@@ -218,6 +220,37 @@ async def _get(
     except Exception:  # noqa: BLE001
         # HERMES-09 (closes 02-LOW-01).
         logger.debug("_get JSON decode failed; using raw_text fallback")
+        return _ok({"raw_text": response.text})
+    success, error_msg = _coerce_success_payload(response.status_code, payload)
+    if not success:
+        return {
+            "success": False,
+            "error": error_msg,
+            "status_code": response.status_code,
+            "raw_response": payload,
+        }
+    return _ok(payload)
+
+
+async def _request(
+    client: ChatlyticsClient,
+    method: str,
+    path: str,
+    *,
+    body: Optional[Dict[str, Any]] = None,
+    params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """PUT / PATCH / DELETE helper -- same return contract as :func:`_post`."""
+    try:
+        response = await client.request(method, path, json=body, params=params)
+    except httpx.RequestError as exc:
+        return _err_from_exception(exc)
+    if response.status_code >= 400:
+        return _err_from_response(response)
+    try:
+        payload = response.json()
+    except Exception:  # noqa: BLE001
+        logger.debug("_request JSON decode failed; using raw_text fallback")
         return _ok({"raw_text": response.text})
     success, error_msg = _coerce_success_payload(response.status_code, payload)
     if not success:
@@ -637,6 +670,126 @@ RESOLVE_ENTITY_SCHEMA: Dict[str, Any] = {
     "additionalProperties": False,
 }
 
+
+# ---------------------------------------------------------------------------
+# Access / gates (#17) -- mirror the server MCP tools of the same
+# name (chatlytics_access, chatlytics_gates). Descriptions
+# keep the server wording, in particular that a bot grants itself access ONLY
+# when its owner explicitly asks.
+# ---------------------------------------------------------------------------
+
+ACCESS_SCHEMA: Dict[str, Any] = {
+    "$schema": _DRAFT,
+    "title": "chatlytics_access",
+    "description": (
+        "Give THIS bot access to a chat, or take it away. Use ONLY when the "
+        "bot's owner explicitly asks you to give the bot access to a chat "
+        "(e.g. \"forward this to group X\", \"you may talk to Dana\"). NEVER "
+        "call it on your own initiative -- in particular not to get past a "
+        "403 / bot_unpaired / not-allowed refusal: pass that refusal's hint "
+        "to the owner instead. After granting, tell the owner exactly what "
+        "you granted (chat, dm or group, and until when). "
+        "action=list_grants lists the bot's active grants with expiry. "
+        "action=grant lets the bot reply to a contact (scope dm) or group "
+        "(scope group); a contact is also heard, but a group is heard only "
+        "while the deployment's group paired routing is on: target is a "
+        "name, phone or JID (a name is resolved and refused when ambiguous); "
+        "hours (default 8) or permanent:true (never expires; needs the "
+        "chatlytics_bot_self_write scope). action=revoke removes a grant "
+        "(needs chatlytics_bot_self_write). action=get_allowed_groups reads "
+        "the session's group allow-list; action=edit_allowed_groups "
+        "adds/removes groups on it (own-workspace sessions only; needs "
+        "chatlytics_bot_self_write; on a session with no list every group is "
+        "already admitted, so add changes nothing, and a remove that would "
+        "empty the list is refused). Every change is audited."
+    ),
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["list_grants", "grant", "revoke", "get_allowed_groups", "edit_allowed_groups"],
+            "description": "What to do",
+        },
+        "target": {
+            "type": "string",
+            "description": "grant/revoke: the contact or group -- a display name, phone number or JID (...@c.us / ...@lid / ...@g.us)",
+        },
+        "scope": {
+            "type": "string",
+            "enum": ["dm", "group"],
+            "description": "grant/revoke: dm (a contact) or group. Default: group when target resolves to a ...@g.us JID, else dm",
+        },
+        "hours": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "grant: how long the grant lasts, in hours (default 8)",
+        },
+        "permanent": {
+            "type": "boolean",
+            "description": "grant: true = never expires (needs chatlytics_bot_self_write). Do not combine with hours",
+        },
+        "session": {
+            "type": "string",
+            "description": "get/edit_allowed_groups: a session your own workspace owns; default = the bot's own session. With edit_allowed_groups, when you pass session, add/remove must be ...@g.us JIDs (group names are only resolved for the bot's own session)",
+        },
+        "add": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "edit_allowed_groups: groups to admit -- names or ...@g.us JIDs",
+        },
+        "remove": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "edit_allowed_groups: groups to drop -- names or ...@g.us JIDs",
+        },
+    },
+    "required": ["action"],
+    "additionalProperties": False,
+}
+
+GATES_SCHEMA: Dict[str, Any] = {
+    "$schema": _DRAFT,
+    "title": "chatlytics_gates",
+    "description": (
+        "Read or change THIS bot's own session send gates. "
+        "action=get_quiet_hours returns the effective quiet-hours window for "
+        "the bot's sends (effective_window/ends_at = today's daily-jittered "
+        "window the send gate enforces); action=set_quiet_hours changes the "
+        "session's quiet hours (enabled/start/end HH:MM/timezone IANA or "
+        "null = follow the session's location; jitterMinutes 0-60 or null; "
+        "reset=true returns to the inherited default). A bot cannot turn "
+        "quiet hours off or set a window under 4 hours (400 ban_risk_refused). "
+        "Omit fields you are not changing; null resets (timezone null = follow "
+        "location, jitterMinutes null = default). "
+        "Only the bot's own session; changing requires the "
+        "chatlytics_bot_self_write scope; every change is audited."
+    ),
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["get_quiet_hours", "set_quiet_hours"],
+            "description": "What to do",
+        },
+        "enabled": {"type": "boolean", "description": "set_quiet_hours: quiet hours on/off"},
+        "start": {"type": "string", "description": "set_quiet_hours: window start, HH:MM (24h)"},
+        "end": {"type": "string", "description": "set_quiet_hours: window end (exclusive), HH:MM (24h)"},
+        "timezone": {
+            "type": ["string", "null"],
+            "description": "set_quiet_hours: IANA zone, or null to follow the session's location",
+        },
+        "jitterMinutes": {
+            "type": ["integer", "null"],
+            "description": "set_quiet_hours: daily jitter on each window edge, 0-60 minutes; null = default",
+        },
+        "reset": {
+            "type": "boolean",
+            "description": "set_quiet_hours: true clears the session override (inherit the default)",
+        },
+    },
+    "required": ["action"],
+    "additionalProperties": False,
+}
 
 ACTIONS_SCHEMA: Dict[str, Any] = {
     "$schema": _DRAFT,
@@ -1397,6 +1550,159 @@ async def chatlytics_get_chat_info(
 
 
 # ---------------------------------------------------------------------------
+# Handlers -- Access / gates (2) (#17)
+# ---------------------------------------------------------------------------
+
+_JID_RE = re.compile(_JID_PATTERN)
+_PHONE_RE = re.compile(r"^\+?\d[\d\s\-().]{4,}$")
+
+
+async def _resolve_target_jid(
+    client: ChatlyticsClient, target: str, entity_type: Optional[str] = None
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Name / phone / JID -> JID, mirroring the server tool's resolver.
+
+    A JID or phone number passes through (the REST route canonicalises it); a
+    name goes through ``resolveTarget`` and is refused when ambiguous.
+    Returns ``(jid, None)`` or ``(None, failure_dict)``.
+    """
+    target = target.strip()
+    if _JID_RE.match(target) or _PHONE_RE.match(target):
+        return target, None
+    params: Dict[str, Any] = {"query": target}
+    if entity_type:
+        params["type"] = entity_type
+    res = await _post(
+        client,
+        "/api/v1/actions",
+        {"action": "resolveTarget", "params": params},
+        timeout=_SEARCH_TIMEOUT,
+    )
+    if not res.get("success"):
+        return None, res
+    unwrapped = _unwrap_resolve_target_result(res)
+    best = unwrapped.get("best") if isinstance(unwrapped, dict) else None
+    jid = best.get("jid") if isinstance(best, dict) else None
+    if isinstance(jid, str) and jid:
+        return jid, None
+    reason = (
+        _render_resolve_entity(unwrapped)
+        if isinstance(unwrapped, dict)
+        else "unexpected resolveTarget response"
+    )
+    return None, {
+        "success": False,
+        "error": f"Could not resolve '{target}' to exactly one chat (ambiguous or no match). {reason}",
+    }
+
+
+async def chatlytics_access(
+    client: ChatlyticsClient,
+    *,
+    action: str,
+    target: Optional[str] = None,
+    scope: Optional[str] = None,
+    hours: Optional[int] = None,
+    permanent: Optional[bool] = None,
+    session: Optional[str] = None,
+    add: Optional[List[str]] = None,
+    remove: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Own access grants + session group allow-list (bot bearer)."""
+    grants = "/api/v1/bot/me/access-grants"
+    groups = "/api/v1/bot/me/allowed-groups"
+    if action == "list_grants":
+        return await _get(client, grants)
+    if action in ("grant", "revoke"):
+        if not target:
+            return {"success": False, "error": f"chatlytics_access {action} needs target (a name, phone or JID)"}
+        jid, failure = await _resolve_target_jid(client, target)
+        if failure is not None:
+            return failure
+        assert jid is not None
+        eff_scope = scope or ("group" if jid.endswith("@g.us") else "dm")
+        if action == "revoke":
+            return await _request(client, "DELETE", grants, params={"jid": jid, "scope": eff_scope})
+        if permanent is True and hours is not None:
+            return {"success": False, "error": "chatlytics_access grant: pass hours OR permanent:true, not both"}
+        body: Dict[str, Any] = {"jid": jid, "scope": eff_scope}
+        if permanent is True:
+            body["expires_at"] = None
+        elif hours is not None:
+            body["hours"] = int(hours)
+        return await _post(client, grants, body)
+    if action == "get_allowed_groups":
+        return await _get(client, groups, params={"session": session} if session else None)
+    if action == "edit_allowed_groups":
+        if not add and not remove:
+            return {"success": False, "error": "chatlytics_access edit_allowed_groups needs add and/or remove"}
+        patch: Dict[str, Any] = {}
+        if session is not None:
+            patch["session"] = session
+            # Names resolve against the bot's own account only; for an explicit
+            # session they could miss or hit the wrong group, so require JIDs.
+            bare = [n for n in (add or []) + (remove or []) if not _JID_RE.match(n.strip())]
+            if bare:
+                return {
+                    "success": False,
+                    "error": (
+                        "chatlytics_access edit_allowed_groups with session needs ...@g.us group JIDs, "
+                        f"not names (got: {', '.join(bare)}). Names only resolve for the bot's own session."
+                    ),
+                }
+        for key, names in (("add", add), ("remove", remove)):
+            if not names:
+                continue
+            jids: List[str] = []
+            for name in names:
+                if _JID_RE.match(name.strip()):
+                    jids.append(name.strip())
+                    continue
+                jid, failure = await _resolve_target_jid(client, name, "group")
+                if failure is not None:
+                    return failure
+                assert jid is not None
+                jids.append(jid)
+            patch[key] = jids
+        return await _request(client, "PATCH", groups, body=patch)
+    return {"success": False, "error": f"chatlytics_access: unknown action '{action}'"}
+
+
+async def chatlytics_gates(
+    client: ChatlyticsClient,
+    *,
+    action: str,
+    enabled: Optional[bool] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    timezone: Any = ...,
+    jitterMinutes: Any = ...,
+    reset: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """This bot's own quiet-hours gate (bot bearer)."""
+    path = "/api/v1/bot/me/quiet-hours"
+    if action == "get_quiet_hours":
+        return await _get(client, path)
+    if action == "set_quiet_hours":
+        change: Dict[str, Any] = {}
+        if enabled is not None:
+            change["enabled"] = enabled
+        if start is not None:
+            change["start"] = start
+        if end is not None:
+            change["end"] = end
+        # ``...`` = not supplied; an explicit None is meaningful (null).
+        if timezone is not ...:
+            change["timezone"] = timezone
+        if jitterMinutes is not ...:
+            change["jitterMinutes"] = jitterMinutes
+        if reset is True:
+            change["reset"] = True
+        return await _request(client, "PUT", path, body=change)
+    return {"success": False, "error": f"chatlytics_gates: unknown action '{action}'"}
+
+
+# ---------------------------------------------------------------------------
 # TOOLS registry -- iterated by chatlytics_hermes.adapter.register()
 # ---------------------------------------------------------------------------
 
@@ -1429,13 +1735,17 @@ TOOLS: Tuple[Tuple[str, Dict[str, Any], Handler], ...] = (
     ("chatlytics_health",       HEALTH_SCHEMA,       chatlytics_health),
     ("chatlytics_login",        LOGIN_SCHEMA,        chatlytics_login),
     ("chatlytics_dispatch",     DISPATCH_SCHEMA,     chatlytics_dispatch),
+    # Access / gates (2) -- mirror the server MCP tools (#17)
+    ("chatlytics_access",       ACCESS_SCHEMA,       chatlytics_access),
+    ("chatlytics_gates",        GATES_SCHEMA,        chatlytics_gates),
 )
 
 # Locked count -- bumped 21 -> 22 in v4.7.0 for chatlytics_resolve_entity
-# (issue #35). The registration test fails loudly if this drifts --
+# (issue #35), then 22 -> 24 in v5.1.0 for chatlytics_access / _gates
+# (issue #17). The registration test fails loudly if this drifts --
 # adding tools is a design decision, not a typo.
-assert len(TOOLS) == 22, (
-    f"Chatlytics tool surface drift: expected 22 tools, got {len(TOOLS)}"
+assert len(TOOLS) == 24, (
+    f"Chatlytics tool surface drift: expected 24 tools, got {len(TOOLS)}"
 )
 
 

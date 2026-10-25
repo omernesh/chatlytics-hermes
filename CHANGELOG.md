@@ -1,3 +1,23 @@
+## [5.1.0] - 2026-10-25
+
+### Added
+
+- **Two new tools: `chatlytics_access`, `chatlytics_gates`** (#17). Bots on
+  Hermes can now use the Chatlytics server tools that were missing from the
+  plugin, subject to their granted scopes. Tool count 22 -> 24.
+  - `chatlytics_access`: list/grant/revoke the bot's own access grants
+    (timed, or permanent with an explicit never-expires) and read/edit the
+    session group allow-list. Names are resolved to a single JID and refused
+    when ambiguous. The description keeps the rule that a bot grants itself
+    access only when its owner explicitly asks. When `session` is passed to
+    `edit_allowed_groups`, group names are refused and `...@g.us` JIDs are
+    required (names only resolve for the bot's own session).
+  - `chatlytics_gates`: read or change the bot's own quiet-hours window. The
+    description now says to omit fields you are not changing (null resets).
+- `chatlytics_pairings` is deliberately not included: the pairings routes
+  reject bot bearers, so it could only work with the deprecated shared
+  operator key, which would hand a chat-driven model control over pairings.
+
 ## [5.0.3] - 2026-10-25
 
 ### Added

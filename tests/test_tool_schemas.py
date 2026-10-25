@@ -6,7 +6,7 @@ Covers ROADMAP Phase 5 acceptance criteria:
 - AC-2: messaging tools require ``chatId`` (or ``messageId`` for
         message-target actions); non-messaging tools require their own
         primary parameter (``action``, ``query``, none)
-- AC-7: tool count >= 13 (8 baseline + 5 media) -- locked at 22 (v4.7.0)
+- AC-7: tool count >= 13 (8 baseline + 5 media) -- locked at 24 (v5.1.0, issue #17)
 - AC-8: every tool name starts with ``chatlytics_``
 """
 
@@ -39,7 +39,7 @@ _REQUIRES_CHAT_OR_MESSAGE_ID = {
     "chatlytics_send_animation",
 }
 _REQUIRES_QUERY = {"chatlytics_search", "chatlytics_resolve_entity"}
-_REQUIRES_ACTION = {"chatlytics_dispatch"}
+_REQUIRES_ACTION = {"chatlytics_dispatch", "chatlytics_access", "chatlytics_gates"}
 _NO_REQUIRED = {
     "chatlytics_directory",
     "chatlytics_actions",
@@ -108,8 +108,8 @@ def test_tool_count_matches_claude_code_plugin_baseline() -> None:
     """AC-7: tool count >= 13 (8 baseline + 5 media); locked at 22 (v4.7.0, issue #35)."""
     n = len(TOOLS)
     assert n >= 13, f"Expected at least 13 tools (8 baseline + 5 media); got {n}"
-    assert n == 22, (
-        f"Tool count is locked at 22 (v4.7.0 added chatlytics_resolve_entity "
+    assert n == 24, (
+        f"Tool count is locked at 24 (v5.1.0 added access/gates, #17; v4.7.0 added chatlytics_resolve_entity "
         f"for issue #35); got {n}. If you intentionally added a tool, update "
         "CONTEXT + this assertion."
     )
@@ -206,3 +206,39 @@ class TestJidValidation:
                 f"{name}: chatId schema must use the strict _JID_PATTERN; "
                 f"got pattern={field.get('pattern')!r}. Use _chat_id_field()."
             )
+
+
+# --- #17: access / gates mirror the server MCP schemas -----
+
+
+def _schema(name: str) -> dict:
+    return {n: sch for n, sch, _ in TOOLS}[name]
+
+
+def test_access_schema_mirrors_server() -> None:
+    sch = _schema("chatlytics_access")
+    props = sch["properties"]
+    assert props["action"]["enum"] == [
+        "list_grants", "grant", "revoke", "get_allowed_groups", "edit_allowed_groups",
+    ]
+    assert set(props) == {
+        "action", "target", "scope", "hours", "permanent", "session", "add", "remove",
+    }
+    assert props["scope"]["enum"] == ["dm", "group"]
+    assert props["hours"]["minimum"] == 1
+    assert props["add"]["items"] == {"type": "string"}
+    assert sch["required"] == ["action"]
+    # The owner-asks-only rule must survive in the description.
+    desc = sch["description"]
+    assert "ONLY when the bot's owner explicitly asks" in desc
+    assert "NEVER call it on your own initiative" in desc
+
+
+def test_gates_schema_mirrors_server() -> None:
+    sch = _schema("chatlytics_gates")
+    props = sch["properties"]
+    assert props["action"]["enum"] == ["get_quiet_hours", "set_quiet_hours"]
+    assert set(props) == {"action", "enabled", "start", "end", "timezone", "jitterMinutes", "reset"}
+    assert props["timezone"]["type"] == ["string", "null"]
+    assert props["jitterMinutes"]["type"] == ["integer", "null"]
+    assert sch["required"] == ["action"]

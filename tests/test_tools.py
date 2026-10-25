@@ -26,9 +26,11 @@ import respx
 from chatlytics_hermes.client import ChatlyticsClient
 from chatlytics_hermes.tools import (
     TOOLS,
+    chatlytics_access,
     chatlytics_delete,
     chatlytics_dispatch,
     chatlytics_edit,
+    chatlytics_gates,
     chatlytics_pin,
     chatlytics_poll,
     chatlytics_react,
@@ -180,7 +182,7 @@ def test_tool_count_matches_claude_code_plugin_baseline() -> None:
     """``len(TOOLS) >= 13`` and exactly ``22`` (v4.7.0, issue #35)."""
     n = len(TOOLS)
     assert n >= 13, f"Expected at least 13 tools; got {n}"
-    assert n == 22, f"Tool count is locked at 22 (v4.7.0); got {n}"
+    assert n == 24, f"Tool count is locked at 24 (v5.1.0); got {n}"
 
 
 # --- issue #35: chatlytics_resolve_entity renders a decisive verdict --
@@ -622,3 +624,168 @@ async def test_dispatch_caller_chatid_not_clobbered_by_target(
     )
     params = _json.loads(route.calls.last.request.content)["params"]
     assert params["chatId"] == "own@g.us"
+
+
+# --- #17: chatlytics_access / chatlytics_gates ---
+
+
+def _resolve_envelope(best: Any) -> Dict[str, Any]:
+    payload = {"matches": [best] if best else [], "best": best, "ambiguous": best is None}
+    return {
+        "success": True,
+        "result": {"content": [{"type": "text", "text": _json.dumps(payload)}]},
+    }
+
+
+async def test_access_list_grants(client, mock_router) -> None:
+    route = mock_router.get("/api/v1/bot/me/access-grants").mock(
+        return_value=httpx.Response(200, json={"grants": []})
+    )
+    result = await chatlytics_access(client, action="list_grants")
+    assert result == {"success": True, "grants": []}
+    assert route.calls.last.request.headers["authorization"] == EXPECTED_AUTH
+
+
+async def test_access_grant_default_hours_jid_passthrough(client, mock_router) -> None:
+    route = mock_router.post("/api/v1/bot/me/access-grants").mock(
+        return_value=httpx.Response(201, json={"ok": True})
+    )
+    result = await chatlytics_access(client, action="grant", target=CHAT_ID)
+    assert result["success"] is True
+    # group JID -> scope group; no hours/expires_at (server default 8h)
+    assert _json.loads(route.calls.last.request.content) == {"jid": CHAT_ID, "scope": "group"}
+
+
+async def test_access_grant_permanent_sends_explicit_null(client, mock_router) -> None:
+    route = mock_router.post("/api/v1/bot/me/access-grants").mock(
+        return_value=httpx.Response(201, json={"ok": True})
+    )
+    await chatlytics_access(client, action="grant", target="972501234567@c.us", permanent=True)
+    assert _json.loads(route.calls.last.request.content) == {
+        "jid": "972501234567@c.us", "scope": "dm", "expires_at": None,
+    }
+
+
+async def test_access_grant_hours_and_permanent_refused(client, mock_router) -> None:
+    result = await chatlytics_access(
+        client, action="grant", target="972501234567@c.us", permanent=True, hours=2
+    )
+    assert result["success"] is False
+    assert "not both" in result["error"]
+
+
+async def test_access_grant_resolves_name(client, mock_router) -> None:
+    resolve = mock_router.post("/api/v1/actions").mock(
+        return_value=httpx.Response(200, json=_resolve_envelope({"jid": "972501234567@c.us", "name": "Dana"}))
+    )
+    grant = mock_router.post("/api/v1/bot/me/access-grants").mock(
+        return_value=httpx.Response(201, json={"ok": True})
+    )
+    result = await chatlytics_access(client, action="grant", target="Dana", hours=3)
+    assert result["success"] is True
+    assert _json.loads(resolve.calls.last.request.content)["action"] == "resolveTarget"
+    assert _json.loads(grant.calls.last.request.content) == {
+        "jid": "972501234567@c.us", "scope": "dm", "hours": 3,
+    }
+
+
+async def test_access_grant_ambiguous_name_refused(client, mock_router) -> None:
+    mock_router.post("/api/v1/actions").mock(
+        return_value=httpx.Response(200, json=_resolve_envelope(None))
+    )
+    grant = mock_router.post("/api/v1/bot/me/access-grants")
+    result = await chatlytics_access(client, action="grant", target="Dana")
+    assert result["success"] is False
+    assert not grant.called
+
+
+async def test_access_revoke_uses_delete_with_query(client, mock_router) -> None:
+    route = mock_router.delete("/api/v1/bot/me/access-grants").mock(
+        return_value=httpx.Response(200, json={"revoked": 1})
+    )
+    result = await chatlytics_access(client, action="revoke", target="972501234567@c.us")
+    assert result["success"] is True
+    q = route.calls.last.request.url.params
+    assert q["jid"] == "972501234567@c.us" and q["scope"] == "dm"
+
+
+async def test_access_grant_needs_target(client, mock_router) -> None:
+    result = await chatlytics_access(client, action="grant")
+    assert result["success"] is False and "needs target" in result["error"]
+
+
+async def test_access_get_allowed_groups_passes_session(client, mock_router) -> None:
+    route = mock_router.get("/api/v1/bot/me/allowed-groups").mock(
+        return_value=httpx.Response(200, json={"allowedGroups": []})
+    )
+    await chatlytics_access(client, action="get_allowed_groups", session="s1")
+    assert route.calls.last.request.url.params["session"] == "s1"
+
+
+async def test_access_edit_allowed_groups_patch(client, mock_router) -> None:
+    route = mock_router.patch("/api/v1/bot/me/allowed-groups").mock(
+        return_value=httpx.Response(200, json={"allowedGroups": [CHAT_ID]})
+    )
+    result = await chatlytics_access(client, action="edit_allowed_groups", add=[CHAT_ID], session="s1")
+    assert result["success"] is True
+    assert _json.loads(route.calls.last.request.content) == {"session": "s1", "add": [CHAT_ID]}
+
+
+async def test_access_edit_allowed_groups_needs_add_or_remove(client, mock_router) -> None:
+    result = await chatlytics_access(client, action="edit_allowed_groups")
+    assert result["success"] is False and "add and/or remove" in result["error"]
+
+
+async def test_access_scope_denied_maps_to_error(client, mock_router) -> None:
+    mock_router.post("/api/v1/bot/me/access-grants").mock(
+        return_value=httpx.Response(403, json={"error": "bot_scope_denied"})
+    )
+    result = await chatlytics_access(client, action="grant", target=CHAT_ID, permanent=True)
+    assert result["success"] is False
+    assert result["status_code"] == 403 and result["error"] == "bot_scope_denied"
+
+
+async def test_gates_get_quiet_hours(client, mock_router) -> None:
+    mock_router.get("/api/v1/bot/me/quiet-hours").mock(
+        return_value=httpx.Response(200, json={"enabled": True})
+    )
+    result = await chatlytics_gates(client, action="get_quiet_hours")
+    assert result == {"success": True, "enabled": True}
+
+
+async def test_gates_set_quiet_hours_puts_only_supplied_fields(client, mock_router) -> None:
+    route = mock_router.put("/api/v1/bot/me/quiet-hours").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    await chatlytics_gates(client, action="set_quiet_hours", start="22:00", end="07:00", timezone=None)
+    # explicit null timezone is kept; unsupplied jitterMinutes is absent
+    assert _json.loads(route.calls.last.request.content) == {
+        "start": "22:00", "end": "07:00", "timezone": None,
+    }
+
+
+async def test_gates_reset_and_ban_risk_error(client, mock_router) -> None:
+    route = mock_router.put("/api/v1/bot/me/quiet-hours").mock(
+        return_value=httpx.Response(400, json={"error": "ban_risk_refused"})
+    )
+    result = await chatlytics_gates(client, action="set_quiet_hours", enabled=False, reset=True)
+    assert _json.loads(route.calls.last.request.content) == {"enabled": False, "reset": True}
+    assert result["success"] is False and result["error"] == "ban_risk_refused"
+
+
+async def test_access_edit_allowed_groups_other_session_rejects_names(client, mock_router) -> None:
+    route = mock_router.patch("/api/v1/bot/me/allowed-groups").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    result = await chatlytics_access(client, action="edit_allowed_groups", session="other", add=["Family"])
+    assert result["success"] is False and "@g.us" in result["error"] and "Family" in result["error"]
+    assert not route.called
+
+
+async def test_access_edit_allowed_groups_other_session_accepts_jids(client, mock_router) -> None:
+    route = mock_router.patch("/api/v1/bot/me/allowed-groups").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    result = await chatlytics_access(client, action="edit_allowed_groups", session="other", add=[CHAT_ID])
+    assert result["success"] is True
+    assert _json.loads(route.calls.last.request.content) == {"session": "other", "add": [CHAT_ID]}

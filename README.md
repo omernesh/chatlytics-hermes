@@ -5,7 +5,7 @@
 Production-grade messaging through the [Chatlytics](https://chatlytics.ai)
 gateway -- text, all six media types (image, voice, video, document, animation,
 sticker), reactions, groups, channels, contacts, polls, labels, presence,
-profile. **22 Hermes tools, the full upstream `BasePlatformAdapter` contract,
+profile. **24 Hermes tools, the full upstream `BasePlatformAdapter` contract,
 end-to-end async.**
 
 [![PyPI](https://img.shields.io/pypi/v/chatlytics-hermes.svg)](https://pypi.org/project/chatlytics-hermes/) [![Python](https://img.shields.io/pypi/pyversions/chatlytics-hermes.svg)](https://pypi.org/project/chatlytics-hermes/) [![License](https://img.shields.io/pypi/l/chatlytics-hermes.svg)](LICENSE)
@@ -13,7 +13,7 @@ end-to-end async.**
 A first-class platform plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 One install hands your agent a fully-stocked WhatsApp toolbox -- a
 `BasePlatformAdapter` subclass implementing all required methods plus all six
-media variants, 22 Hermes tools auto-registered through `ctx.register_tool()`,
+media variants, 24 Hermes tools auto-registered through `ctx.register_tool()`,
 a durable long-poll inbound consumer (or an aiohttp webhook server living
 *inside* `connect()`), native exec-approval / clarify routing to the bot
 owner's DM, and a cron-delivery hook for scheduled sends.
@@ -40,7 +40,7 @@ channel (see [Install](#install)). PyPI hosts the 3.x line only.
 ## Why chatlytics-hermes?
 
 - **Full surface, not a stub** -- every Chatlytics REST action exposed as a
-  Hermes tool. 22 tools covering send (text + 6 media), read, search,
+  Hermes tool. 24 tools covering send (text + 6 media), read, search,
   entity resolution, directory, sessions, presence, profile, actions
   enumeration, health, dispatch.
 - **Survives the host** -- installs as a Hermes *directory plugin* under
