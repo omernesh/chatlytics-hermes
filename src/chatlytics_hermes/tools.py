@@ -672,8 +672,8 @@ RESOLVE_ENTITY_SCHEMA: Dict[str, Any] = {
 
 
 # ---------------------------------------------------------------------------
-# Access / gates / pairings (#17) -- mirror the server MCP tools of the same
-# name (chatlytics_access, chatlytics_gates, chatlytics_pairings). Descriptions
+# Access / gates (#17) -- mirror the server MCP tools of the same
+# name (chatlytics_access, chatlytics_gates). Descriptions
 # keep the server wording, in particular that a bot grants itself access ONLY
 # when its owner explicitly asks.
 # ---------------------------------------------------------------------------
@@ -730,7 +730,7 @@ ACCESS_SCHEMA: Dict[str, Any] = {
         },
         "session": {
             "type": "string",
-            "description": "get/edit_allowed_groups: a session your own workspace owns; default = the bot's own session",
+            "description": "get/edit_allowed_groups: a session your own workspace owns; default = the bot's own session. With edit_allowed_groups, when you pass session, add/remove must be ...@g.us JIDs (group names are only resolved for the bot's own session)",
         },
         "add": {
             "type": "array",
@@ -759,6 +759,8 @@ GATES_SCHEMA: Dict[str, Any] = {
         "null = follow the session's location; jitterMinutes 0-60 or null; "
         "reset=true returns to the inherited default). A bot cannot turn "
         "quiet hours off or set a window under 4 hours (400 ban_risk_refused). "
+        "Omit fields you are not changing; null resets (timezone null = follow "
+        "location, jitterMinutes null = default). "
         "Only the bot's own session; changing requires the "
         "chatlytics_bot_self_write scope; every change is audited."
     ),
@@ -788,45 +790,6 @@ GATES_SCHEMA: Dict[str, Any] = {
     "required": ["action"],
     "additionalProperties": False,
 }
-
-PAIRINGS_SCHEMA: Dict[str, Any] = {
-    "$schema": _DRAFT,
-    "title": "chatlytics_pairings",
-    "description": (
-        "Operator only. List, add or remove a bot's pairings with a contact "
-        "(DM), group or channel (wraps GET/POST/DELETE "
-        "/api/v1/bots/{bot}/pairings). A pairing lets the bot send to "
-        "(outbound), hear (inbound) or both, for that entity. add is "
-        "idempotent; direction defaults to both; every add/remove is "
-        "audited. Accepts the bot token or its fingerprint."
-    ),
-    "type": "object",
-    "properties": {
-        "action": {
-            "type": "string",
-            "enum": ["list", "add", "remove"],
-            "description": "list the bot's pairings, add one, or remove one",
-        },
-        "bot": {"type": "string", "description": "Bot token (sk_bot_...) or its fingerprint"},
-        "entity_jid": {
-            "type": "string",
-            "description": "add/remove: the contact (@c.us / @lid), group (@g.us) or channel (@newsletter) JID",
-        },
-        "entity_type": {
-            "type": "string",
-            "enum": ["contact", "group", "newsletter", "broadcast"],
-            "description": "add: the entity type (broadcast matches the admin modal)",
-        },
-        "direction": {
-            "type": "string",
-            "enum": ["inbound", "outbound", "both"],
-            "description": "add: inbound (bot hears), outbound (bot may send) or both (default)",
-        },
-    },
-    "required": ["action", "bot"],
-    "additionalProperties": False,
-}
-
 
 ACTIONS_SCHEMA: Dict[str, Any] = {
     "$schema": _DRAFT,
@@ -1587,7 +1550,7 @@ async def chatlytics_get_chat_info(
 
 
 # ---------------------------------------------------------------------------
-# Handlers -- Access / gates / pairings (3) (#17)
+# Handlers -- Access / gates (2) (#17)
 # ---------------------------------------------------------------------------
 
 _JID_RE = re.compile(_JID_PATTERN)
@@ -1676,6 +1639,17 @@ async def chatlytics_access(
         patch: Dict[str, Any] = {}
         if session is not None:
             patch["session"] = session
+            # Names resolve against the bot's own account only; for an explicit
+            # session they could miss or hit the wrong group, so require JIDs.
+            bare = [n for n in (add or []) + (remove or []) if not _JID_RE.match(n.strip())]
+            if bare:
+                return {
+                    "success": False,
+                    "error": (
+                        "chatlytics_access edit_allowed_groups with session needs ...@g.us group JIDs, "
+                        f"not names (got: {', '.join(bare)}). Names only resolve for the bot's own session."
+                    ),
+                }
         for key, names in (("add", add), ("remove", remove)):
             if not names:
                 continue
@@ -1728,37 +1702,6 @@ async def chatlytics_gates(
     return {"success": False, "error": f"chatlytics_gates: unknown action '{action}'"}
 
 
-async def chatlytics_pairings(
-    client: ChatlyticsClient,
-    *,
-    action: str,
-    bot: str,
-    entity_jid: Optional[str] = None,
-    entity_type: Optional[str] = None,
-    direction: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Operator-only bot<->entity pairings (wraps /api/v1/bots/{bot}/pairings)."""
-    base = f"/api/v1/bots/{quote(bot, safe='')}/pairings"
-    if action == "list":
-        return await _get(client, base)
-    if not entity_jid:
-        return {"success": False, "error": f"chatlytics_pairings {action} needs entity_jid"}
-    if action == "remove":
-        return await _request(client, "DELETE", f"{base}/{quote(entity_jid, safe='')}")
-    if action == "add":
-        if not entity_type:
-            return {
-                "success": False,
-                "error": "chatlytics_pairings add needs entity_type (contact, group, newsletter or broadcast)",
-            }
-        return await _post(
-            client,
-            base,
-            {"entity_jid": entity_jid, "entity_type": entity_type, "direction": direction or "both"},
-        )
-    return {"success": False, "error": f"chatlytics_pairings: unknown action '{action}'"}
-
-
 # ---------------------------------------------------------------------------
 # TOOLS registry -- iterated by chatlytics_hermes.adapter.register()
 # ---------------------------------------------------------------------------
@@ -1792,18 +1735,17 @@ TOOLS: Tuple[Tuple[str, Dict[str, Any], Handler], ...] = (
     ("chatlytics_health",       HEALTH_SCHEMA,       chatlytics_health),
     ("chatlytics_login",        LOGIN_SCHEMA,        chatlytics_login),
     ("chatlytics_dispatch",     DISPATCH_SCHEMA,     chatlytics_dispatch),
-    # Access / gates / pairings (3) -- mirror the server MCP tools (#17)
+    # Access / gates (2) -- mirror the server MCP tools (#17)
     ("chatlytics_access",       ACCESS_SCHEMA,       chatlytics_access),
     ("chatlytics_gates",        GATES_SCHEMA,        chatlytics_gates),
-    ("chatlytics_pairings",     PAIRINGS_SCHEMA,     chatlytics_pairings),
 )
 
 # Locked count -- bumped 21 -> 22 in v4.7.0 for chatlytics_resolve_entity
-# (issue #35), then 22 -> 25 in v5.1.0 for chatlytics_access / _gates /
-# _pairings (issue #17). The registration test fails loudly if this drifts --
+# (issue #35), then 22 -> 24 in v5.1.0 for chatlytics_access / _gates
+# (issue #17). The registration test fails loudly if this drifts --
 # adding tools is a design decision, not a typo.
-assert len(TOOLS) == 25, (
-    f"Chatlytics tool surface drift: expected 25 tools, got {len(TOOLS)}"
+assert len(TOOLS) == 24, (
+    f"Chatlytics tool surface drift: expected 24 tools, got {len(TOOLS)}"
 )
 
 

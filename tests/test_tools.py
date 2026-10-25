@@ -31,7 +31,6 @@ from chatlytics_hermes.tools import (
     chatlytics_dispatch,
     chatlytics_edit,
     chatlytics_gates,
-    chatlytics_pairings,
     chatlytics_pin,
     chatlytics_poll,
     chatlytics_react,
@@ -183,7 +182,7 @@ def test_tool_count_matches_claude_code_plugin_baseline() -> None:
     """``len(TOOLS) >= 13`` and exactly ``22`` (v4.7.0, issue #35)."""
     n = len(TOOLS)
     assert n >= 13, f"Expected at least 13 tools; got {n}"
-    assert n == 25, f"Tool count is locked at 25 (v5.1.0); got {n}"
+    assert n == 24, f"Tool count is locked at 24 (v5.1.0); got {n}"
 
 
 # --- issue #35: chatlytics_resolve_entity renders a decisive verdict --
@@ -627,7 +626,7 @@ async def test_dispatch_caller_chatid_not_clobbered_by_target(
     assert params["chatId"] == "own@g.us"
 
 
-# --- #17: chatlytics_access / chatlytics_gates / chatlytics_pairings ---
+# --- #17: chatlytics_access / chatlytics_gates ---
 
 
 def _resolve_envelope(best: Any) -> Dict[str, Any]:
@@ -774,28 +773,19 @@ async def test_gates_reset_and_ban_risk_error(client, mock_router) -> None:
     assert result["success"] is False and result["error"] == "ban_risk_refused"
 
 
-async def test_pairings_list_add_remove(client, mock_router) -> None:
-    lst = mock_router.get("/api/v1/bots/fp123/pairings").mock(
-        return_value=httpx.Response(200, json={"pairings": []})
+async def test_access_edit_allowed_groups_other_session_rejects_names(client, mock_router) -> None:
+    route = mock_router.patch("/api/v1/bot/me/allowed-groups").mock(
+        return_value=httpx.Response(200, json={"ok": True})
     )
-    add = mock_router.post("/api/v1/bots/fp123/pairings").mock(
-        return_value=httpx.Response(201, json={"ok": True})
-    )
-    rm = mock_router.delete(f"/api/v1/bots/fp123/pairings/{CHAT_ID}").mock(
-        return_value=httpx.Response(200, json={"deleted": 1})
-    )
-    assert (await chatlytics_pairings(client, action="list", bot="fp123"))["success"] is True
-    assert lst.called
-    await chatlytics_pairings(client, action="add", bot="fp123", entity_jid=CHAT_ID, entity_type="group")
-    assert _json.loads(add.calls.last.request.content) == {
-        "entity_jid": CHAT_ID, "entity_type": "group", "direction": "both",
-    }
-    result = await chatlytics_pairings(client, action="remove", bot="fp123", entity_jid=CHAT_ID)
-    assert result == {"success": True, "deleted": 1} and rm.called
+    result = await chatlytics_access(client, action="edit_allowed_groups", session="other", add=["Family"])
+    assert result["success"] is False and "@g.us" in result["error"] and "Family" in result["error"]
+    assert not route.called
 
 
-async def test_pairings_validation_errors(client, mock_router) -> None:
-    r1 = await chatlytics_pairings(client, action="add", bot="fp123")
-    assert r1["success"] is False and "entity_jid" in r1["error"]
-    r2 = await chatlytics_pairings(client, action="add", bot="fp123", entity_jid=CHAT_ID)
-    assert r2["success"] is False and "entity_type" in r2["error"]
+async def test_access_edit_allowed_groups_other_session_accepts_jids(client, mock_router) -> None:
+    route = mock_router.patch("/api/v1/bot/me/allowed-groups").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    result = await chatlytics_access(client, action="edit_allowed_groups", session="other", add=[CHAT_ID])
+    assert result["success"] is True
+    assert _json.loads(route.calls.last.request.content) == {"session": "other", "add": [CHAT_ID]}
