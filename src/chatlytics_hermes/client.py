@@ -214,6 +214,17 @@ class ChatlyticsClient:
         """POST ``{base_url}{path}`` with a JSON body."""
         return await self._get_client().post(path, json=json, timeout=timeout)
 
+    async def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> httpx.Response:
+        """Generic verb (PUT / PATCH / DELETE) against ``{base_url}{path}``."""
+        return await self._get_client().request(method, path, json=json, params=params)
+
     async def post_multipart(
         self,
         path: str,
