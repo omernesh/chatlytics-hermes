@@ -88,6 +88,7 @@ from .stream import (
     reconnect_delay,
     run_stream_once,
 )
+from .trigger_context import with_trigger_context
 from .owner import (
     apply_owner_access,
     apply_owner_tagging,
@@ -2457,6 +2458,11 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     exc,
                 )
                 cp = None
+        # chatlytics#956: a turn the owner summoned from their own number gets
+        # its facts here, on the per-turn prompt channel, and NOT on event.text
+        # or event.metadata. See trigger_context.py. The memoized envelope keeps
+        # the field, so retry_last re-renders it.
+        cp = with_trigger_context(cp, env)
         # hasattr guard = harness-drift tolerance (older MessageEvent
         # dataclasses without the field must not grow a stray attribute).
         if isinstance(cp, str) and cp.strip():

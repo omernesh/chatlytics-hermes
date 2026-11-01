@@ -27,6 +27,7 @@ from typing import Any, Callable, Dict, Optional
 
 from aiohttp import web
 
+from .trigger_context import with_trigger_context
 from .owner import (
     apply_owner_access,
     apply_owner_tagging,
@@ -327,6 +328,10 @@ def make_webhook_handler(adapter: Any) -> Callable[[web.Request], Any]:
                         exc,
                     )
                     cp = None
+            # chatlytics#956 — same as adapter._dispatch_envelope (keep in sync).
+            # Only a signed webhook may say the owner summoned this turn.
+            if secret:
+                cp = with_trigger_context(cp, payload)
             if isinstance(cp, str) and cp.strip():
                 if hasattr(event, "channel_prompt"):
                     event.channel_prompt = cp.strip()

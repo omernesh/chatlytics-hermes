@@ -1,3 +1,16 @@
+## [5.2.0] - 2026-11-01
+
+### Added
+
+- **The agent knows when the owner summoned it from their own number**
+  (chatlytics#956). An envelope with `trigger_source: "from_me"` adds one line to
+  that turn's `channel_prompt`: the chat and session it was called from, that its
+  reply goes into that chat from the owner's number, and who reads it. History
+  must then be read from that session, not from the agent's own chat with the
+  same contact. The line is never added to the message text or `metadata` (native
+  admission refuses metadata on this platform), and the transcript does not keep
+  it. `chat_name` is third-party text, so it is reduced to one unquoted line.
+
 ## [5.1.0] - 2026-10-25
 
 ### Added
