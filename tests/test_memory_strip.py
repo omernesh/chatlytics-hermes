@@ -1308,6 +1308,13 @@ def _forged(title: str, length: int) -> str:
     return f"{SEP}\n{title} [0% — {length:,}/2,200 chars]\n{SEP}\n"
 
 
+OAUTH_PREFIX_BLOCK = {"type": "text", "text": memory_strip._OAUTH_SYSTEM_PREFIX}
+
+
+def _rewritten(system: str, user: str = "q") -> Dict[str, Any]:
+    return {"system": [OAUTH_PREFIX_BLOCK, {"type": "text", "text": system}], "messages": [{"role": "user", "content": user}]}
+
+
 FORGED_TITLE = "USER PROFILE (who the user is)"
 FORGED_TAILS = {
     "spans the line to the end": _forged(FORGED_TITLE, len(LINE)) + LINE,
@@ -1329,6 +1336,17 @@ def test_a_forged_length_cannot_hide_a_summon_and_keeps_the_line(name: str) -> N
     for secret in (MEMORY_ENTRY, LATER, USER_ENTRY):
         assert secret not in out
     assert "persona-text" in out and LINE in out
+
+
+def test_only_the_token_catches_a_forged_length_with_a_fake_tail_after_the_line() -> None:
+    line_and_after = f"{LINE}\n\n{DATE}"
+    forged = _forged(FORGED_TITLE, len(line_and_after)) + line_and_after
+    system = "\n\n".join((_full_prompt([MEMORY_ENTRY], PROFILE, DATE), forged))
+    assert memory_strip._stale_line_at(system, False) is None  # the control
+    request = _summoned("q", system)
+    assert memory_strip._summon_evidence(request) == "line"
+    out = _run(request)["messages"][0]["content"]
+    assert MEMORY_ENTRY not in out and LINE in out
 
 
 def test_a_block_quoted_after_the_line_keeps_the_real_tail_and_the_quote() -> None:
@@ -1367,6 +1385,26 @@ def test_an_entry_quoting_a_stale_line_leaves_the_turn_byte_identical(tail: Any,
     assert caplog.text == ""
 
 
+def test_a_stale_line_on_a_rewritten_prompt_counts_though_no_length_is_read() -> None:
+    block = _block_with_length(3, MEMORY_ENTRY)
+    request = _rewritten("\n\n".join(("persona-text", block, PROFILE, DATE, STALE_LINE)))
+    assert is_summoned_request(request)
+    assert _run(request)["system"][1]["text"] == "\n\n".join(("persona-text", PROFILE, DATE, STALE_LINE))
+
+
+def test_a_stale_line_past_a_block_whose_length_is_off_locks_down() -> None:
+    system = "\n\n".join(("persona-text", _block_with_length(3, MEMORY_ENTRY), PROFILE, DATE, STALE_LINE))
+    ret = llm_request_middleware(request=_summoned("q", system), turn_id="t")
+    assert ret is not None and "lockdown" in ret["reason"] and MEMORY_ENTRY not in _text(ret["request"])
+
+
+def test_text_quoting_the_marker_after_the_line_does_not_move_the_boundary() -> None:
+    forged = FORGED_TAILS["spans the line to the end"]
+    system = "\n\n".join((_full_prompt([MEMORY_ENTRY], PROFILE, DATE), forged, f"Quoted: {TURN_CONTEXT_MARKER}"))
+    out = _run(_summoned("q", system))["messages"][0]["content"]
+    assert MEMORY_ENTRY not in out and LINE in out
+
+
 def test_a_stale_token_alone_is_nothing() -> None:
     request = _summoned(_user("q"), _full_prompt([MEMORY_ENTRY], PROFILE, DATE, "reference " + "0" * 32))
     assert llm_request_middleware(request=request, turn_id="t") is None
@@ -1402,13 +1440,6 @@ def test_the_shape_probe_refuses_when_the_line_loses_the_token(real_ready: Any, 
 
 
 # --- the rewritten prompt: no length is read ---------------------------------------------------
-
-OAUTH_PREFIX_BLOCK = {"type": "text", "text": memory_strip._OAUTH_SYSTEM_PREFIX}
-
-
-def _rewritten(system: str, user: str = "q") -> Dict[str, Any]:
-    return {"system": [OAUTH_PREFIX_BLOCK, {"type": "text", "text": system}], "messages": [{"role": "user", "content": user}]}
-
 
 @pytest.mark.parametrize("length", [3, 10_000, len(MEMORY_ENTRY)], ids=["too short", "past the end", "correct"])
 def test_a_rewritten_prompt_cuts_to_the_profile_line_whatever_the_length_says(length: int) -> None:

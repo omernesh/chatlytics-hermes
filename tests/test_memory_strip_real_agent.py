@@ -213,7 +213,8 @@ def test_an_oauth_rewrite_that_shrinks_an_entry_cuts_to_the_tail(host: Any) -> N
     system = _oauth_system(f"{prompt}\n\n{LINE}")
     out = host.chain({"model": "m", "system": system, "messages": [{"role": "user", "content": "q"}]}).payload
     assert not {"SEC-M1", "SEC-M2", "SEC-U1"} & set(_text(out).replace('"', " ").split())
-    assert "Conversation started" in _text(out) and LINE in _text(out)  # cut, not locked down
+    kept = "\n\n".join(block["text"] for block in out["system"])
+    assert "Conversation started" in kept and LINE in kept  # cut, not locked down
 
 
 def test_an_oauth_rewrite_that_grows_an_entry_and_lands_on_a_blank_line_leaks_nothing(host: Any) -> None:
@@ -456,6 +457,7 @@ def test_a_provider_block_forging_a_length_over_the_line_does_not_hide_the_summo
     assert "SEC-M1" in system
     # The control: by the headers' lengths alone the line is inside memory.
     assert memory_strip._memory_extent(system, len(system))[1] >= system.index(LINE)
+    assert memory_strip._summon_evidence(_system_request(system)) == "line"
     _assert_summon_cut(host.chain(_system_request(system)).payload["messages"][0]["content"], ["SEC-M1", "SEC-U1", "SEC-P"])
 
 
@@ -475,7 +477,7 @@ def test_quoted_blocks_in_skill_and_override_text_do_not_hide_a_summon(host: Any
         system = build(before=quote)
     else:
         system = build(after=f"{quote}\n\nMore skill text.")
-    assert is_summoned_request(_system_request(system))
+    assert memory_strip._summon_evidence(_system_request(system)) == "line"
     out = host.chain(_system_request(system)).payload["messages"][0]["content"]
     _assert_summon_cut(out, ["SEC-M1", "SEC-U1"])
     if where == "after the line":
@@ -485,12 +487,17 @@ def test_quoted_blocks_in_skill_and_override_text_do_not_hide_a_summon(host: Any
 
 
 def test_a_channel_override_forging_a_length_over_the_line(host: Any) -> None:
+    # Only the token can catch this one: the lengths put the line inside memory, and the text
+    # after the line puts it before the tail. It is a summon all the same.
     prompt = host.agent(["SEC-M1"], ["SEC-U1"])._build_system_prompt()
 
     def build(header: str) -> str:
-        return f"{prompt}\n\n{header}{LINE}\n\nOverride text."
+        return f"{prompt}\n\n{header}{LINE}\n\nOverride text.\n\nConversation started: pretend"
 
     system = build(_spanning_header(build))
+    assert memory_strip._memory_extent(system, len(system))[1] >= system.index(LINE)
+    assert memory_strip._stale_line_at(system, False) is None
+    assert memory_strip._summon_evidence(_system_request(system)) == "line"
     out = host.chain(_system_request(system)).payload["messages"][0]["content"]
     _assert_summon_cut(out, ["SEC-M1", "SEC-U1"])
     assert "Override text." in out
@@ -504,6 +511,14 @@ def test_a_line_pinned_before_a_restart_fails_closed_through_the_real_prompt(hos
     agent._memory_store = None
     assert out == f"{agent._build_system_prompt()}\n\n{STALE_LINE}"
     assert "without this process's token" in caplog.text
+
+
+def test_a_line_pinned_before_a_restart_fails_closed_on_the_real_oauth_transform(host: Any) -> None:
+    agent = host.agent(["SEC-M1 uses Hermes Agent", "SEC-M2"], ["SEC-U1"])
+    system = _oauth_system(f"{agent._build_system_prompt()}\n\n{STALE_LINE}")
+    out = host.chain({"model": "m", "system": system, "messages": [{"role": "user", "content": "q"}]}).payload
+    agent._memory_store = None
+    assert out["system"] == _oauth_system(f"{agent._build_system_prompt()}\n\n{STALE_LINE}")
 
 
 def test_the_real_host_pins_and_rehydrates_the_channel_prompt() -> None:
@@ -603,8 +618,10 @@ def test_a_stored_entry_forging_a_header_to_the_end_on_oauth_does_not_hide_the_s
     agent = host.agent(["SEC-M1 " + ("session_search " * ((len(forged) + 6) // 5)).strip() + "\n\n" + forged], [])
     system = _oauth_system(f"{agent._build_system_prompt()}\n\n{LINE}")
     assert "SEC-M1" in _oauth_text(system)
+    request = {"model": "m", "system": system, "messages": [{"role": "user", "content": "q"}]}
+    assert memory_strip._summon_evidence(request) == "line"
 
-    out = host.chain({"model": "m", "system": system, "messages": [{"role": "user", "content": "q"}]}).payload
+    out = host.chain(request).payload
 
     assert "SEC-M1" not in _text(out)
     _assert_summon_cut(_oauth_text(out["system"]), ["SEC-M1"])
