@@ -1,3 +1,16 @@
+## [5.3.1] - 2026-11-02
+
+### Fixed
+
+- **Dangerous-command approvals reach the owner again.** `send_exec_approval` did not accept
+  the `allow_permanent`, `allow_session` and `smart_denied` keywords the hermes-agent runner
+  passes (already the case on 0.22.5), and 0.22.6 adds `request_id`. The runner swallowed the
+  `TypeError` into its typed `/approve` text prompt, which Chatlytics intercepts, so the
+  approval timed out to deny. The adapter now accepts these keywords and any later ones.
+- **The owner's answer resolves the approval it was asked about.** With two approvals pending
+  in one session, an answer resolved the oldest, whichever command it was about. On hosts that
+  send `request_id` (0.22.6+) it now resolves that request. Older hosts keep the old behaviour.
+
 ## [5.3.0] - 2026-11-02
 
 ### Security
