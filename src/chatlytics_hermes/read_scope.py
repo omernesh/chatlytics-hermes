@@ -9,6 +9,9 @@ accounts' messages. So the rule is enforced here, on the tool call:
 - ``transform_tool_result`` refuses a result that can't be shown to be that chat;
 - :func:`scope_ready` makes the dispatch drop the turn when either hook can't run.
 
+``pre_tool_call`` also refuses the hub's own MCP tools that send or act (:data:`_HUB_WRITES`), which
+skip the account and route checks of the plugin's ``chatlytics_send``.
+
 Every comparison is against values taken from the hub's envelope when the turn was dispatched
 (:func:`open_for_event`), never against anything the model wrote.
 
@@ -533,6 +536,51 @@ def _chatlytics_verb(base: str, is_mcp: bool) -> str:
     return base
 
 
+def _is_hub_server(name: str) -> bool:
+    """Is the MCP tool ``name`` the hub's? Without the host's word that it isn't, it is.
+
+    DO NOT make a failure here answer False, and DO NOT drop either sign. The server's name is the
+    operator's choice, and a bot's scope can hide every ``chatlytics_*`` tool from its catalog, so the
+    catalog alone can't say and neither can the tool's own description if the hub rewords it. Being wrong
+    costs another server's tool on a summon, which is the cheap direction: a message from the wrong number
+    can't be taken back.
+    """
+    try:
+        from tools.registry import registry
+
+        toolset = registry.get_toolset_for_tool(name)
+        if not toolset:
+            return True
+        schema = registry.get_schema(name) or {}
+        # Prefixed names, so this holds for a server with chatlytics in its name too.
+        return (
+            any("chatlytics_" in tool.casefold() for tool in registry.get_tool_names_for_toolset(toolset))
+            or _HUB_DESCRIPTION.search(str(schema.get("description") or "")) is not None
+        )
+    except Exception:  # noqa: BLE001 -- nothing says it isn't the hub's
+        return True
+
+
+def _hub_write_tool(tool_name: Any) -> bool:
+    """A hub MCP tool that sends or acts, in any spelling, under any server name. Asked of MCP tools only."""
+    base, _ = _base_name(tool_name)
+    name = str(tool_name or "").strip()
+    if not any(base == tool or base.endswith(f"_{tool}") for tool in _HUB_WRITES):
+        # The host cuts a name over 64 characters and ends it in a hash, so only the host can read it.
+        if not _CUT_MCP_NAME.fullmatch(name):
+            return False
+        try:
+            from tools.mcp_tool_schema import mcp_prefixed_tool_name
+            from tools.registry import registry
+
+            server = (registry.get_toolset_for_tool(name) or "").removeprefix("mcp-")
+            if server and not any(mcp_prefixed_tool_name(server, tool) == name for tool in _HUB_WRITES):
+                return False
+        except Exception:  # noqa: BLE001 -- see _is_hub_server
+            return True
+    return _is_hub_server(name)
+
+
 def _lextrove_tool(tool_name: Any) -> Optional[str]:
     """The Lextrove tool this name means: a table name, or "unknown" for one not in the table.
 
@@ -689,6 +737,19 @@ _ALWAYS_REFUSED = {"session_search": "transcripts_of_other_chats"}
 _CHATLYTICS_READS = frozenset({"chatlytics_read", "read_messages"})
 _CHATLYTICS_DISPATCH = frozenset({"chatlytics_dispatch", "chatlytics_dispatch_action"})
 _READ_ACTION = re.compile(r"^(get|read|list|search|fetch|export|find|load)|messages|history|overview", re.IGNORECASE)
+# DO NOT REMOVE a name without reading src/mcp-server.ts on the hub. Every tool there that can send or
+# change something, whole, also where another of its actions only reads. They skip the account and route
+# checks of the plugin's tools, so a summon's send could leave from the wrong number (chatlytics#956).
+_HUB_WRITES = frozenset({
+    "send_message", "send_media", "send_poll", "send_reaction", "manage_group",
+    "chatlytics_dispatch_action", "chatlytics_dispatch",
+    "chatlytics_access", "chatlytics_gates", "chatlytics_short_links_create",
+    "update_settings", "session_update_filters", "chatlytics_update_config", "chatlytics_module_config",
+    "chatlytics_toggle_module", "chatlytics_bots_create", "chatlytics_bots_set_default", "chatlytics_pairings",
+})
+_HUB_WRITE_REFUSED = "hub_tool_skips_summon_checks"
+_HUB_DESCRIPTION = re.compile(r"whatsapp|chatlytics|\bwaha\b", re.IGNORECASE)
+_CUT_MCP_NAME = re.compile(r"mcp__.{50}_[0-9a-f]{8}")
 # DO NOT read this as containment. These tools run arbitrary text, and the plugin can see only
 # the text. It stops a model reaching for the archive or the host's own stores by name; encoding
 # the name, or a script written earlier, goes past it. Listed as open in docs/summoned-turns.md.
@@ -825,7 +886,6 @@ def _check_one(tool_name: Any, raw_args: Any, scope: SummonScope) -> Optional[Re
         action = (args or {}).get("action")
         if args is None or not isinstance(action, str) or _READ_ACTION.search(action.strip()):
             return Refusal("chatlytics_read_action", label)
-        return None
     if not is_mcp:
         if base in _TEXT_ROUTE:
             text = raw_args if isinstance(raw_args, str) else json.dumps(raw_args, ensure_ascii=False, default=str)
@@ -834,7 +894,7 @@ def _check_one(tool_name: Any, raw_args: Any, scope: SummonScope) -> Optional[Re
         return None
     if any(marks.search(text) for marks, text in _reach_values(args or {})):
         return Refusal("names_the_archive_or_host_store", label)
-    return None
+    return Refusal(_HUB_WRITE_REFUSED, label) if _hub_write_tool(tool_name) else None
 
 
 def _how_to_read(scope: SummonScope) -> str:
@@ -850,6 +910,12 @@ def _how_to_read(scope: SummonScope) -> str:
 
 
 def _refusal_text(reason: str, scope: SummonScope) -> str:
+    if reason == _HUB_WRITE_REFUSED:
+        return (
+            f"Refused ({reason}): on this turn this tool could send or act from the wrong account. Nothing was "
+            "done. Use chatlytics_send to send a message, and chatlytics_react to react. If they can't do what "
+            "was asked, say so. Do not try another tool."
+        )
     return (
         f"Refused ({reason}): on this turn you cannot read outside this chat and this account. "
         "Do not try another tool, session or chat to get it. "

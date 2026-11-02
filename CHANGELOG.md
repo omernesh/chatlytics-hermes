@@ -24,6 +24,13 @@
   uses that bot's bearer for its tools and its `/retry`, and a late retry by the host can't post an old
   answer into a route a later summon reopened. An action the hub would run from the wrong account in
   the summoned chat, such as a poll or a pin, is refused with a clear tool result.
+- **A summon sends only through the plugin's own tools** (chatlytics#956). On a gateway with the hub's
+  MCP server connected, the hub's tools that send or act (`send_message`, `send_media`, `send_poll`,
+  `send_reaction`, `chatlytics_dispatch_action`, `manage_group`, and its access, gate, short-link and
+  operator settings tools) are refused on a summoned turn, under any server name and inside `tool_call`,
+  and the model is told to use `chatlytics_send`. A tool of the same name on another MCP server keeps
+  working, unless it describes itself as WhatsApp or its server has a `chatlytics_` tool. Ordinary turns
+  and the summon's reply are unchanged.
 
 ## [5.3.0] - 2026-11-02
 

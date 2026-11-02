@@ -46,6 +46,7 @@ read. To allow more, measure what the tool returns for that call first.
 | `session_search` | Refused: it reads every session's transcript. |
 | `chatlytics_read`, the hub MCP's `read_messages` | Refused: they read the bot's own number. |
 | `chatlytics_dispatch` | Refused when the action reads (`get`, `list`, `search`, `messages`, ...). |
+| The hub MCP's tools that send or act | Refused. See [The hub's own MCP tools](#the-hubs-own-mcp-tools). `chatlytics_send`, `chatlytics_react` and the plugin's other tools are not MCP tools and aren't affected. |
 | `chatlytics_directory`, `chatlytics_search`, `chatlytics_resolve_entity` | Allowed: names and ids, no messages, and sending needs them. |
 | `terminal`, `execute_code`, `process`, `read_file`, `search_files`, `cronjob` | Refused when the arguments name the archive or the host's own stores. This is text matching. |
 | MCP tools, any server | Judged only by the arguments that say where the tool goes, in any spelling of the key (`baseUrl`, `file-path`), at any depth. A place (`url`, `uri`, `path`, `file`, `endpoint`, `resource`, ...) is refused when it points at the archive's host or a host store (`state.db`, `sessions.json`, `.hermes/.env`), a command (`command`, `cmd`, `script`, `code`) when it names either, and a query (`sql`, `statement`, `query`, ...) when it selects from the archive. JSON held in such an argument is searched as text. No other key is searched. So a mail to an address at lextrove, a memory search for the word and `read_note` of `projects/lextrove.md` pass, and a fetch of the archive's URL doesn't. |
@@ -68,6 +69,8 @@ This limits a confused model. It is not a sandbox against a hostile one. Not blo
   not read at all.
 - `write_file` and `patch`, on any path.
 - `chatlytics_dispatch` with an action whose name doesn't look like a read (`chats`, `groups`).
+- A send to the hub by other means than its MCP tools: a `curl` from a shell, or another MCP server
+  with its own send tool under another name, such as a `chatlytics_send` served over MCP.
 - `memory` and any memory tool, which also means a summon can write what it read into memory. See
   [Clean start](#clean-start).
 
@@ -259,18 +262,35 @@ that same chat. After a restart the ledger's retry has no scope and is refused.
 
 **An MCP tool told in prose.** A second agent behind an MCP tool can be told in `message` or `text` to read the archive; this is accepted, so that a message to a person or a memory search is never refused for a word.
 
-**The hub's own MCP tools.** A gateway with the hub's MCP server connected gives the model a second way to send, which skips the plugin's account checks in `tools.py`, the closed-route check and the refusal of unroutable actions. The hub decides the account (`src/mcp-server.ts`), for the bearer that MCP server is configured with. A route belongs to one bearer, so with another bot's bearer no route applies and the send leaves from that bot's number. The read hook still sees these calls, so `read_messages` and reading dispatch actions are refused.
+## The hub's own MCP tools
 
-| Tool | Account with that bearer | If the route is closed |
+A gateway with the hub's MCP server connected gives the model a second way to send, which skips the plugin's account checks in `tools.py`, the closed-route check and the refusal of unroutable actions. So on a summon `pre_tool_call` refuses the ones that send or act, also inside `tool_call`, and the model is told to use `chatlytics_send`. The log has the usual `summon read refused` line, with `reason=hub_tool_skips_summon_checks`. The summon's reply and `chatlytics_send` don't go through these tools and work as before. An ordinary turn isn't touched.
+
+| Tool (`src/mcp-server.ts`) | On a summon | On an ordinary turn, as before: the account, with that server's bearer |
 |---|---|---|
-| `send_message`, `send_media`, `send_poll`, no `session` | The owner's, when a live route covers the chat by JID; otherwise the bot's. A bare or `+` phone misses the route, so it leaves from the bot's. | Leaves from the bot's number, into the summoned chat if it can reach it. |
-| The same, naming the owner's session | The owner's, when a live route covers the chat. | Hub refuses it: `from_me_route_expired`. |
-| `send_reaction` | Always the bot's. It has no route check. | The same. |
-| `chatlytics_dispatch_action`, non-send verbs (`react`, `edit`, `unsend`, `pin`, ...) | Always the bot's. | The same. |
-| `chatlytics_dispatch_action`, send verbs | Refused by the hub, on any bearer that is a bot's. | The same. |
-| `manage_group` | Always the bot's. Writes need an explicit grant on the bot, or the hub refuses them. | The same. |
+| `send_message`, `send_media`, `send_poll` | Refused | The owner's when a live route covers the chat by JID, otherwise the bot's. |
+| `send_reaction` | Refused | The bot's. |
+| `chatlytics_dispatch_action` | Refused | The bot's for non-send verbs. The hub refuses send verbs on a bot's bearer. |
+| `manage_group`, all of it, `info` too | Refused | The bot's. Writes need a grant on the bot. |
+| `chatlytics_access`, `chatlytics_gates`, `chatlytics_short_links_create` | Refused, all of it, reads too | The bot's own settings and workspace. |
+| `update_settings`, `session_update_filters`, `chatlytics_update_config`, `chatlytics_module_config`, `chatlytics_toggle_module`, `chatlytics_bots_create`, `chatlytics_bots_set_default`, `chatlytics_pairings` | Refused | Operator bearer only. A bot's bearer doesn't list them. |
+| `read_messages`, `chatlytics_resolve_entity` | Refused, by the read checks | As before. |
+| `search`, `get_directory`, `get_status`, `chatlytics_list_actions`, `chatlytics_list_modules`, `chatlytics_get_config`, `chatlytics_short_links_stats` | Allowed: they read and don't send | As before. |
 
-So on such a gateway a summon can still send from the bot's number into its chat, a summon whose route closed can still post through a route a later summon reopened, and an ordinary turn's `send_message` follows the owner's live route. Rows H1 to H7 record this for real.
+`chatlytics_dispatch` over MCP is refused too. The hub doesn't serve that name today, and it would skip the same checks.
+
+**How a tool is known to be the hub's.** The server's name is the operator's choice, so `mcp__<server>__send_message` alone can't say. The plugin asks the host's tool registry about a tool with one of these names, and treats it as the hub's unless the registry says otherwise:
+
+- The registry has no record of the tool, or can't be asked: the hub's.
+- Any tool of the same server has `chatlytics_` in its full name, which covers a server called `chatlytics`: the hub's.
+- The tool's own description says `WhatsApp`, `Chatlytics` or `WAHA`: the hub's. This is for a bot whose scope hides every `chatlytics_*` tool from the catalog.
+- Otherwise it is another server's, and it runs.
+
+A name the host cut to 64 characters is compared with what the host makes of that server and each of these tools.
+
+**The tradeoff.** This errs toward refusing. Another server's `send_message` is refused on a summon if its description mentions WhatsApp, or if that server has a `chatlytics_`-named tool. The other way to be wrong is possible but narrow: a hub under a server name without the word, a scope that hides every `chatlytics_*` tool, and a description that no longer says any of the three words. If the hub rewords those descriptions, update `_HUB_DESCRIPTION`. A tool added to `src/mcp-server.ts` that sends or acts has to be added to `_HUB_WRITES`; nothing here finds it for you.
+
+**An ordinary turn is not covered.** Its `send_message` still follows the owner's live route, because the hub decides that. See row H5.
 
 ## Live test rows
 
@@ -286,12 +306,13 @@ What can't be decided without a real hub and real accounts. Each row says what d
 | R2 | A summon whose `chatlytics_send` to its chat gets a 409. Summon again, and have the first turn call `chatlytics_send` to the chat. | Nothing from the first turn is in the chat. The log has `summon send refused, summon_route_closed`. The new summon's reply posts. |
 | M1 | Summon in a DM. Have the model send a file to a group the bot's session isn't in and another tenant session is. | The file is refused with `SESSION_CANNOT_REACH_TARGET`, the log has `route_closed=False`, and the turn's reply is in the summoned chat from the owner's number. |
 | A1 | Summon in a DM whose envelope has `chat_phone` and a `@lid` id. Have the model react with a message id from the search result, then pin that message and create a poll in the chat. | The reaction lands from the owner's number, with no `from_me_route_target_mismatch`. Pin and poll reach nobody, and the log has `summon send refused, summon_action_off_route` for each. |
-| H1 | Summon in a DM on a gateway with the hub's MCP server, bearer of the summoned bot. Have the model call `send_message` to the envelope's chat id. | Source says: from the owner's number. Record the sender on the phone. Repeat with `send_media` and `send_poll`. |
-| H2 | The same, with `send_message` to the bare phone of that chat. | Source says: from the bot's number. Record the sender, or that the person received nothing. |
-| H3 | Summon, close the route with a person's message to the bot in that chat, then have the running turn call `send_message` to the chat id with no session, and again naming the owner's session. | Source says: the first from the bot's number, the second refused with `from_me_route_expired`. Record both. |
-| H4 | The same turn as H3 after a new summon reopened the route: have the old turn call `send_message`. | Source says: from the owner's number, with no `summon_route_closed` in the log, because the plugin doesn't see this send. Record it. |
-| H5 | During an open route, have an ordinary turn in that chat call `send_message` with no session. | Source says: from the owner's number. Record the sender. |
-| H6 | Summon, then have the model call `send_reaction`, and `chatlytics_dispatch_action` with `react` and with `pin`, on a message of the chat. | Source says: all on the bot's session, not the owner's. Record what the chat shows. WAHA may answer 200 and do nothing. |
-| H7 | Summon in a group, then have the model call `chatlytics_dispatch_action` with `send`, and `manage_group` with `add_participant`. | Source says: `send` refused, and `manage_group` refused unless the bot has the write grant. With the grant it runs on the bot's session. Record both. |
-| H8 | The gateway's MCP bearer differs from the summoned bot's, if it does on any profile. Have the model call `send_message` to the chat id. | Source says: from the MCP bearer's bot's number, whatever the route of the summoned bot. Record the sender and the bot fingerprint in the hub's log. |
+| H1 | Summon in a DM on a gateway with the hub's MCP server, under any server name, bearer of the summoned bot. Have the model call `send_message` to the envelope's chat id. Repeat with `send_media` and `send_poll`. | Refused each time: nothing reaches the chat from either number, and the log has `summon read refused` with `reason=hub_tool_skips_summon_checks`. The model then uses `chatlytics_send`, or the turn's reply, and that posts from the owner's number. |
+| H2 | The same, with `send_message` to the bare phone of that chat. | Refused as in H1. The person receives nothing from the bot's number. |
+| H3 | Summon, close the route with a person's message to the bot in that chat, then have the running turn call `send_message` to the chat id with no session, and again naming the owner's session. | Both refused in the plugin, so the hub's log has nothing for them. Nothing reaches the chat from either number. |
+| H4 | The same turn as H3 after a new summon reopened the route: have the old turn call `send_message`. | Refused. Nothing from the old turn is in the chat, and the new summon's reply posts. |
+| H5 | During an open route, have an ordinary turn in that chat call `send_message` with no session. | Not changed by this check. Source says: from the owner's number. Record the sender, and that the log has no `hub_tool_skips_summon_checks`. |
+| H6 | Summon, then have the model call `send_reaction`, and `chatlytics_dispatch_action` with `react` and with `pin`, on a message of the chat. | All refused. The chat shows nothing from these calls. `chatlytics_react` still reacts from the owner's number. |
+| H7 | Summon in a group, then have the model call `chatlytics_dispatch_action` with `send`, and `manage_group` with `add_participant`, on a bot with the write grant. | Both refused in the plugin, grant or no grant. The group doesn't change. |
+| H8 | The gateway's MCP bearer differs from the summoned bot's, if it does on any profile. Have the model call `send_message` to the chat id. | Refused. The hub's log has nothing for that bot's fingerprint. |
+| H9 | On the same gateway, another MCP server with a `send_message` tool that doesn't mention WhatsApp. Have a summon call it. | It runs. This is the false refusal to look for. |
 | B1 | A long summon, `/stop` after the bubble is up. | Records the stuck bubble in **Known gaps**: whether "working..." stays, and for how long. |

@@ -10,6 +10,8 @@ import asyncio
 import contextvars
 import json
 import logging
+import re
+import sys
 import time
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
@@ -591,7 +593,6 @@ def _summon_pre(tool: str, args: Any) -> Any:
 @pytest.mark.parametrize("tool,args", [
     ("mcp__chatlytics__chatlytics_send", {"chatId": PEER, "text": "Lextrove is our archive"}),
     ("mcp_chatlytics_chatlytics_send", {"chatId": PEER, "text": "Lextrove is our archive"}),
-    ("mcp__chatlytics__send_message", {"chatId": PEER, "text": "see sessions.json"}),
     ("mcp__memorygraph__search", {"query": "lextrove"}),
     ("mcp_memory_graph_search", {"query": "state.db"}),
     ("mcp__slack__post", {"channel": "c1", "text": "Lextrove is our archive"}),
@@ -648,8 +649,10 @@ def test_single_underscore_names_mean_the_same_tool(tool: str, args: Any, reason
     assert verdict is not None and reason in verdict["message"]
 
 
-def test_a_single_underscore_dispatch_that_only_sends_passes() -> None:
-    assert _summon_pre("mcp_chatlytics_chatlytics_dispatch", {"action": "send"}) is None
+def test_the_plugins_dispatch_that_only_sends_passes_and_the_hubs_does_not() -> None:
+    assert _summon_pre("chatlytics_dispatch", {"action": "send"}) is None
+    verdict = _summon_pre("mcp_chatlytics_chatlytics_dispatch", {"action": "send"})
+    assert verdict is not None and "hub_tool_skips_summon_checks" in verdict["message"]
 
 
 def test_another_servers_tool_of_a_similar_name_is_left_alone() -> None:
@@ -1813,3 +1816,194 @@ async def test_a_tools_409_with_a_body_that_is_not_json_is_a_failure_and_closes_
     out = json.loads(await _in_turn(summon.source.thread_id, lambda: tool({"chatId": PEER, "text": "x"})))
     assert out["success"] is False and out["status_code"] == 409
     assert not read_scope.scope_for_key(summon.source.thread_id).route_closed
+
+
+# --- the hub's own MCP tools that send or act --------------------------------------------------------
+
+# Copied from src/mcp-server.ts on the hub: what the tool is called and what it says it does.
+_HUB_TOOLS = {
+    "send_message": "Send a WhatsApp text message. Routes through the mimicry gate (time gate + hourly cap).",
+    "send_media": "Send a WhatsApp media message (image, video, file, or voice). Routes through the mimicry gate.",
+    "send_poll": "Send a WhatsApp poll message. Routes through the mimicry gate.",
+    "send_reaction": "Send an emoji reaction to a WhatsApp message.",
+    "manage_group": "Manage a WhatsApp group: info/get_invite_code are reads.",
+    "update_settings": "Update a Chatlytics config value. Path must be under 'channels.waha'.",
+    "session_update_filters": "Update event type filters for a WAHA session.",
+    "chatlytics_dispatch_action": "Execute an action by name.",
+    "chatlytics_access": "Give THIS bot access to a chat, or take it away.",
+    "chatlytics_gates": "Read or change THIS bot's own session send gates.",
+    "chatlytics_short_links_create": "Create a tracked short link with the URL Shortener add-on.",
+    "chatlytics_update_config": "Update a config value.",
+    "chatlytics_module_config": "Get or update configuration for a specific module.",
+    "chatlytics_toggle_module": "Enable or disable a module.",
+    "chatlytics_bots_create": "Operator only. Create a bot.",
+    "chatlytics_bots_set_default": "Operator only. Set the default bot.",
+    "chatlytics_pairings": "Operator only. List, add or remove a bot's pairings.",
+}
+_HUB_ARGS = {"action": "send", "chatId": PEER, "text": "hi"}
+_REFUSED = "hub_tool_skips_summon_checks"
+_LONG_SERVER = "a_very_long_operator_chosen_server_name_nothing_more"
+
+
+@pytest.fixture
+def mcp_tools() -> Any:
+    """Register MCP tools in the host's real registry, under the name and toolset the host gives them."""
+    registry = pytest.importorskip("tools.registry").registry
+    schema_module = pytest.importorskip("tools.mcp_tool_schema")
+    names: List[str] = []
+
+    def register(server: str, tool: str, description: str) -> str:
+        name = schema_module.mcp_prefixed_tool_name(server, tool)
+        registry.register(name=name, toolset=f"mcp-{server}", handler=lambda *_a, **_k: "{}", schema={
+            "name": name, "description": description, "parameters": {"type": "object", "properties": {}},
+        })
+        names.append(name)
+        return name
+
+    yield register
+    for name in names:
+        registry.deregister(name)
+
+
+def _refused_by_hub_check(verdict: Any) -> bool:
+    return verdict is not None and verdict["action"] == "block" and f"Refused ({_REFUSED})" in verdict["message"]
+
+
+@pytest.mark.parametrize("tool", sorted(_HUB_TOOLS))
+def test_every_write_of_the_hub_is_refused_under_a_name_the_operator_chose(tool: str, mcp_tools: Any) -> None:
+    name = mcp_tools("acme_hub", tool, _HUB_TOOLS[tool])
+    assert name == f"mcp__acme_hub__{tool}"
+    verdict = _summon_pre(name, _HUB_ARGS)
+    assert _refused_by_hub_check(verdict)
+    assert "chatlytics_send" in verdict["message"]
+
+
+@pytest.mark.parametrize("tool", ["send_message", "manage_group", "chatlytics_dispatch_action"])
+def test_a_hub_write_is_refused_inside_the_wrapper(tool: str, mcp_tools: Any) -> None:
+    name = mcp_tools("acme_hub", tool, _HUB_TOOLS[tool])
+    for args in (
+        {"name": name, "arguments": _HUB_ARGS},
+        {"calls": [{"name": name, "arguments": json.dumps(_HUB_ARGS)}]},
+        {"calls": json.dumps([{"name": "chatlytics_send", "arguments": {}}, {"name": name, "arguments": _HUB_ARGS}])},
+    ):
+        assert _refused_by_hub_check(_summon_pre("tool_call", args))
+
+
+@pytest.mark.parametrize("spelled", [
+    "mcp__hub__send_message", "mcp_hub_send_message", "mcp-hub-send-message", "mcp__hub.x__send_poll",
+    "MCP__HUB__SEND_REACTION", "mcp_my_server_chatlytics_dispatch_action",
+])
+def test_a_spelling_the_host_has_no_record_of_is_refused(spelled: str) -> None:
+    assert _refused_by_hub_check(_summon_pre(spelled, _HUB_ARGS))
+
+
+def test_with_no_registry_a_hub_write_is_refused(monkeypatch: pytest.MonkeyPatch, mcp_tools: Any) -> None:
+    name = mcp_tools("slack", "send_message", "Post to a Slack channel.")
+    assert _summon_pre(name, {"text": "hi"}) is None
+    monkeypatch.setitem(sys.modules, "tools.registry", None)
+    assert _refused_by_hub_check(_summon_pre(name, {"text": "hi"}))
+
+
+@pytest.mark.parametrize("server,tool,description", [
+    ("chatlytics_cloud", "send_message", "Send a message."),  # by the server's name
+    ("acme", "send_message", "Send a WhatsApp text message."),  # by what it says, with a filtered catalog
+    ("acme", "session_update_filters", "Update event type filters for a WAHA session."),
+])
+def test_each_sign_of_the_hub_is_enough_on_its_own(server: str, tool: str, description: str, mcp_tools: Any) -> None:
+    assert _refused_by_hub_check(_summon_pre(mcp_tools(server, tool, description), {"chatId": PEER}))
+
+
+def test_a_sibling_only_the_hub_has_is_a_sign_of_the_hub(mcp_tools: Any) -> None:
+    name = mcp_tools("acme", "send_message", "Send a message.")
+    assert _summon_pre(name, {"text": "hi"}) is None
+    mcp_tools("acme", "chatlytics_resolve_entity", "Find a contact.")
+    assert _refused_by_hub_check(_summon_pre(name, {"text": "hi"}))
+
+
+@pytest.mark.parametrize("tool", ["send_message", "chatlytics_dispatch_action", "manage_group"])
+def test_a_hub_write_is_refused_when_the_host_cut_its_name(tool: str, mcp_tools: Any) -> None:
+    name = mcp_tools(_LONG_SERVER, tool, "Send a WhatsApp thing.")
+    assert len(name) == 64 and not name.endswith(tool)
+    assert _refused_by_hub_check(_summon_pre(name, {"chatId": PEER}))
+
+
+def test_another_servers_tool_is_left_alone_when_the_hubs_is_refused(mcp_tools: Any) -> None:
+    hub = mcp_tools("acme_hub", "send_message", _HUB_TOOLS["send_message"])
+    slack = mcp_tools("slack", "send_message", "Post a message to a Slack channel.")
+    mail = mcp_tools("mail", "send_media", "Attach a file to a mail.")
+    cut = mcp_tools(_LONG_SERVER, "send_message", "Post to a pager.")
+    cut_other = mcp_tools(_LONG_SERVER, "fetch_message", "Send a WhatsApp thing, by its description.")
+    assert _refused_by_hub_check(_summon_pre(hub, {"chatId": PEER}))
+    assert _summon_pre(slack, {"channel": "c", "text": "hi"}) is None
+    assert _summon_pre(mail, {"to": "a@example.test"}) is None
+    assert _summon_pre(cut, {"text": "hi"}) is None
+    assert _summon_pre(cut_other, {"text": "hi"}) is None
+    assert _summon_pre("tool_call", {"calls": [{"name": slack, "arguments": {"text": "hi"}}]}) is None
+    assert _refused_by_hub_check(_summon_pre("tool_call", {"calls": [{"name": hub, "arguments": {}}]}))
+
+
+def test_the_plugins_own_tools_pass_when_the_hubs_are_refused(mcp_tools: Any) -> None:
+    hub = mcp_tools("acme_hub", "send_message", _HUB_TOOLS["send_message"])
+    assert _refused_by_hub_check(_summon_pre(hub, {"chatId": PEER}))
+    for tool, args in (
+        ("chatlytics_send", {"chatId": PEER, "text": "hi"}),
+        ("chatlytics_react", {"messageId": "x", "emoji": "y"}),
+        ("chatlytics_access", {"action": "list_grants"}),
+        ("send_message", {"target": "x", "message": "hi"}),  # the host's own
+    ):
+        assert _summon_pre(tool, args) is None
+
+
+def test_the_hubs_tools_that_only_read_names_stay_allowed(mcp_tools: Any) -> None:
+    hub = mcp_tools("acme_hub", "send_message", _HUB_TOOLS["send_message"])
+    assert _refused_by_hub_check(_summon_pre(hub, {"chatId": PEER}))
+    for tool in ("search", "get_directory", "get_status", "chatlytics_list_actions"):
+        assert _summon_pre(mcp_tools("acme_hub", tool, f"Hub {tool}."), {"query": "x"}) is None
+
+
+@pytest.mark.parametrize("tool", sorted(_HUB_TOOLS))
+def test_an_ordinary_turn_is_unchanged(tool: str, mcp_tools: Any) -> None:
+    name = mcp_tools("acme_hub", tool, _HUB_TOOLS[tool])
+    wrapped = {"calls": [{"name": name, "arguments": _HUB_ARGS}]}
+    # The same calls: refused while a summon is bound to these ids, untouched once a request released them.
+    assert _refused_by_hub_check(_summon_pre(name, _HUB_ARGS))
+    read_scope.note_request(False, "", "s", "s")
+    assert pre_tool_call(tool_name=name, args=_HUB_ARGS, session_id="s", task_id="s") is None
+    assert pre_tool_call(tool_name="tool_call", args=wrapped, session_id="s", task_id="s") is None
+    assert pre_tool_call(tool_name=name, args=_HUB_ARGS, session_id="never", task_id="seen") is None
+
+
+def test_the_refusal_keeps_the_log_line_and_names_the_way_to_send(
+    mcp_tools: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    name = mcp_tools("acme_hub", "send_message", _HUB_TOOLS["send_message"])
+    with caplog.at_level(logging.WARNING, logger=read_scope.__name__):
+        verdict = _summon_pre(name, {"chatId": PEER, "text": "private words"})
+    assert "Use chatlytics_send" in verdict["message"] and "read outside" not in verdict["message"]
+    lines = [r.getMessage() for r in caplog.records if "summon read refused" in r.getMessage()]
+    assert len(lines) == 1
+    assert re.fullmatch(
+        rf"chatlytics#956: summon read refused tool={name} reason={_REFUSED} scope=summon-[0-9a-f]{{16}} turn=",
+        lines[0],
+    )
+    assert "private words" not in caplog.text
+
+
+async def test_a_summons_reply_and_chatlytics_send_post_while_the_hubs_tools_are_refused(mcp_tools: Any) -> None:
+    hub_tool = mcp_tools("acme_hub", "send_message", _HUB_TOOLS["send_message"])
+    adapter, hub, conn = _adapter()
+    summon = await _deliver(adapter, ENVELOPES["from_me_dm"], conn)
+    key = summon.source.thread_id
+    hub.routes[PEER] = OWNER_SESSION
+    read_scope.note_request(True, f"x:{key}", "s", "s")
+
+    refused = pre_tool_call(tool_name=hub_tool, args={"chatId": PEER, "text": "x"}, session_id="s", task_id="s")
+    assert _refused_by_hub_check(refused)
+    assert pre_tool_call(
+        tool_name="chatlytics_send", args={"chatId": PEER, "text": "tool"}, session_id="s", task_id="s"
+    ) is None
+
+    tool = _bound_tool(adapter, chatlytics_send, "chatlytics_send")
+    await _in_turn(key, lambda: tool({"chatId": PEER, "text": "tool"}))
+    assert (await adapter.send(PEER, "the answer", metadata=_turn(summon))).success
+    assert hub.left == [(OWNER_SESSION, PEER, "tool"), (OWNER_SESSION, PEER, "the answer")]
