@@ -324,20 +324,109 @@ async def test_an_ordinary_turns_tool_uses_its_profiles_adapter(platform: str, p
     assert hubs[expected].left == [(sessions[expected], PEER, "x")]
 
 
+# A turn with no adapter of its own, on a gateway with several, doesn't take the one that connected last.
+NO_PROFILE = [
+    {},  # no session context at all: it was lost
+    {"platform": "", "profile": ""},  # a cron job binds neither, and may be any profile's
+]
+
+
+def _misses(caplog: Any) -> list:
+    return [r.getMessage() for r in caplog.records if "has no profile on its turn" in r.getMessage()]
+
+
 @pytest.mark.parametrize(
     "bound",
     [
-        {},  # no session context at all
         {"platform": "chatlytics", "profile": "no-such-profile"},
-        {"platform": "", "profile": ""},  # a cron job binds neither, and may be any profile's
+        {"platform": "telegram", "profile": "no-such-profile"},
+        {"platform": "", "profile": "no-such-profile"},
+        # The primary's turn, with the primary not connected.
+        {"platform": "chatlytics", "profile": ""},
+        {"platform": "telegram", "profile": "default"},
     ],
 )
-async def test_an_ordinary_turn_with_no_adapter_for_its_profile_uses_the_slot(bound: Dict[str, str]) -> None:
+async def test_a_named_profile_with_no_adapter_is_not_connected_among_several(
+    bound: Dict[str, str], caplog: Any
+) -> None:
+    _, alpha_hub, _ = _profile_bot("alpha", ALPHA_SESSION)
+    _, bravo_hub, _ = _profile_bot("bravo", BRAVO_SESSION)
+    tool = _send_tool()
+    caplog.set_level(logging.WARNING)
+    out = await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), **bound)
+    assert "not connected" in json.loads(out)["error"]
+    assert alpha_hub.bodies == [] and bravo_hub.bodies == []
+    assert _misses(caplog) == []  # it names a profile: nothing about it is lost
+
+
+async def test_a_named_profile_with_no_adapter_doesnt_take_the_default_either() -> None:
     _, primary_hub, _ = _profile_bot(None, "33333333_primary")
+    _, bravo_hub, _ = _profile_bot("bravo", BRAVO_SESSION)
+    tool = _send_tool()
+    out = await _in_session(
+        lambda: tool({"chatId": PEER, "text": "x"}), platform="chatlytics", profile="no-such-profile"
+    )
+    assert "not connected" in json.loads(out)["error"]
+    assert primary_hub.bodies == [] and bravo_hub.bodies == []
+
+
+@pytest.mark.parametrize("own", [None, "alpha"])
+@pytest.mark.parametrize(
+    "bound",
+    [
+        *NO_PROFILE,
+        {"platform": "chatlytics", "profile": "no-such-profile"},
+        {"platform": "telegram", "profile": ""},
+    ],
+)
+async def test_a_lone_adapter_serves_any_turn_and_says_nothing(
+    own: Optional[str], bound: Dict[str, str], caplog: Any
+) -> None:
+    _, hub, _ = _profile_bot(own, ALPHA_SESSION)
+    tool = _send_tool()
+    caplog.set_level(logging.WARNING)
+    await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), **bound)
+    assert hub.left == [(ALPHA_SESSION, PEER, "x")]
+    assert _misses(caplog) == []
+
+
+@pytest.mark.parametrize("bound", NO_PROFILE)
+async def test_no_profile_uses_the_default_adapter_when_another_connected_last(
+    bound: Dict[str, str], caplog: Any
+) -> None:
+    _, primary_hub, _ = _profile_bot(None, "33333333_primary")
+    _, alpha_hub, _ = _profile_bot("alpha", ALPHA_SESSION)
     _, last_hub, _ = _profile_bot("bravo", BRAVO_SESSION)
     tool = _send_tool()
-    await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), **bound)
-    assert len(last_hub.bodies) == 1 and primary_hub.bodies == []
+    caplog.set_level(logging.WARNING)
+    await _in_session(lambda: tool({"chatId": PEER, "text": "a-private-argument"}), **bound)
+    assert primary_hub.left == [("33333333_primary", PEER, "a-private-argument")]
+    assert alpha_hub.bodies == [] and last_hub.bodies == []
+    misses = _misses(caplog)
+    assert len(misses) == 1 and "chatlytics_send" in misses[0]
+    assert "a-private-argument" not in caplog.text and PEER not in caplog.text
+
+
+@pytest.mark.parametrize("bound", NO_PROFILE)
+async def test_no_profile_and_no_default_is_not_connected_among_several(bound: Dict[str, str], caplog: Any) -> None:
+    _, alpha_hub, _ = _profile_bot("alpha", ALPHA_SESSION)
+    _, bravo_hub, _ = _profile_bot("bravo", BRAVO_SESSION)
+    tool = _send_tool()
+    caplog.set_level(logging.WARNING)
+    out = await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), **bound)
+    assert "not connected" in json.loads(out)["error"]
+    assert alpha_hub.bodies == [] and bravo_hub.bodies == []
+    misses = _misses(caplog)
+    assert len(misses) == 1 and "chatlytics_send" in misses[0] and "not connected" in misses[0]
+
+
+async def test_the_lookup_through_a_ctx_entry_borrows_nothing_either() -> None:
+    _, alpha_hub, _ = _profile_bot("alpha", ALPHA_SESSION)
+    _, bravo_hub, _ = _profile_bot("bravo", BRAVO_SESSION)
+    tool = _send_tool(SimpleNamespace(platforms={"chatlytics": SimpleNamespace(adapter=None)}))
+    out = await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), platform="chatlytics", profile="nope")
+    assert "not connected" in json.loads(out)["error"]
+    assert alpha_hub.bodies == [] and bravo_hub.bodies == []
 
 
 async def test_a_ctx_entry_without_an_adapter_still_picks_the_turns_profile() -> None:
@@ -439,7 +528,7 @@ async def test_an_adapter_that_changes_profile_leaves_its_old_entry() -> None:
     _register_live_adapter(_profile_bot("bravo", BRAVO_SESSION, live=False)[0])
     tool = _send_tool()
     await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), platform="chatlytics", profile="alpha")
-    assert alpha_hub.bodies == []  # alpha's entry is gone, so this is the slot
+    assert alpha_hub.bodies == []  # alpha's entry is gone, so this turn has no adapter
     await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), platform="chatlytics", profile="charlie")
     assert len(alpha_hub.bodies) == 1 and bravo_hub.bodies == []
 
@@ -524,6 +613,11 @@ async def test_two_connected_gateways_send_on_the_bearer_of_the_turns_profile(
         await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), platform="chatlytics", profile="bravo")
         assert send.calls[-1].request.headers["authorization"] == f"Bearer {token_b}"
 
+        # A turn naming nothing, and neither is the default profile's: bravo's bearer isn't used for it.
+        calls = len(send.calls)
+        out = await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), platform="", profile="")
+        assert "not connected" in json.loads(out)["error"] and len(send.calls) == calls
+
         # bravo goes down: alpha keeps its own bearer, and nothing closed is chosen.
         await bravo.disconnect()
         await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), platform="chatlytics", profile="alpha")
@@ -534,3 +628,34 @@ async def test_two_connected_gateways_send_on_the_bearer_of_the_turns_profile(
 
         await alpha.disconnect()
     assert _LIVE_BY_PROFILE == {}
+
+
+async def test_a_cron_job_sends_on_the_default_bearer_when_another_connected_last(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cron job binds platform and profile to "". Read at the request's Authorization header."""
+    token_default, token_b = "sk_bot_" + "A" * 43, "sk_bot_" + "B" * 43
+
+    async def _idle(_self: Any, _conn: Any) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(ChatlyticsAdapter, "_inbound_loop", _idle)
+
+    def _make(token: str, profile: Optional[str]) -> ChatlyticsAdapter:
+        adapter = ChatlyticsAdapter(
+            FakePlatformConfig(extra={"base_url": BASE_URL, "bot_token": token, "inbound_mode": "longpoll"})
+        )
+        adapter.set_owner_profile(profile)
+        return adapter
+
+    primary, bravo = _make(token_default, None), _make(token_b, "bravo")
+    tool = _send_tool()
+    with respx.mock(base_url=BASE_URL, assert_all_called=False) as router:
+        _mock_gateway(router)
+        send = router.post("/api/v1/send").mock(return_value=httpx.Response(200, json={"success": True}))
+        assert await primary.connect() is True
+        assert await bravo.connect() is True
+        await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), platform="", profile="")
+        assert send.calls[-1].request.headers["authorization"] == f"Bearer {token_default}"
+        await bravo.disconnect()
+        await primary.disconnect()

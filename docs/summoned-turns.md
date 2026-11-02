@@ -159,11 +159,30 @@ ERROR in the log.
 With `multiplex_profiles`, each profile has its own adapter, and a tool runs on the adapter of its own
 turn. A summon's tools find theirs by the scope key. If that adapter is gone, as after a disconnect or a
 restart, every `chatlytics_*` tool of the summon is refused and nothing is sent. An ordinary turn's tools
-find theirs by `HERMES_SESSION_PROFILE`. They use the last-connected adapter, as they did before, only when
-nothing names a profile (a cron job) or the profile has no connected adapter. So an ordinary turn whose own
-adapter is reconnecting, or a route that runs a bot's turn under a profile with no adapter, can still use
-another bot's bearer. A gateway with one adapter is not affected. The host's `send_message` doesn't use any
-of this: it resolves the active profile's adapter itself.
+find theirs by `HERMES_SESSION_PROFILE`:
+
+| The turn | Several adapters live | One adapter live |
+|---|---|---|
+| Names a profile that has an adapter | That adapter | That adapter |
+| Names a profile with no adapter | Not connected | The last-connected adapter |
+| Names no profile, and the default profile's adapter is live | The default profile's, with a WARNING | The default profile's |
+| Names no profile, and the default profile's adapter isn't live | Not connected, with a WARNING | The last-connected adapter |
+
+"Not connected" is the tool's usual error, and nothing is sent. The WARNING names the tool, not its
+arguments. A summon doesn't use this table. A gateway with one adapter behaves as it did. The host's
+`send_message` doesn't use any of this: it resolves the active profile's adapter itself.
+
+What this still allows:
+
+- **A cron job names no profile**, because the host binds no session to it, and one gateway runs every
+  profile's jobs. A job of the default profile uses the default profile's adapter, whichever connected
+  last. A job of another profile can't be told apart from that, so it uses the default profile's bearer
+  too, or is not connected if the default profile has no adapter. The WARNING is how to find it.
+- **"One adapter live" is counted when the tool runs.** On a gateway of two bots, while one reconnects, its
+  turn takes the other's bearer if the other connected last. If the other connected first the last-connected
+  entry is empty, and the turn is not connected.
+- **A `profile_routes` entry that moves bot A's turn to profile B, where B has an adapter, uses B's bearer.**
+  The turn names B, so B's adapter is its own, and the hub moves its sends to B's number.
 
 On the legacy operator-key path a summon names its session and leaves the chat's session alone. This
 needs a hub that marks summons with `trigger_source` (6.247.0 or later).

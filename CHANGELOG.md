@@ -27,8 +27,10 @@
 - **On a gateway with several profiles, a tool uses its own turn's bot** (chatlytics#956). Every profile's
   `chatlytics_*` tools ran on the bearer of the profile that connected last, on ordinary turns too, so the
   hub moved their sends to that bot's number. A summon's tools now use the adapter it arrived on, and are
-  refused if that adapter is gone. An ordinary turn's use its profile's adapter, or the last-connected one
-  when no profile is known or that profile has no connected adapter. A gateway with one adapter is unchanged.
+  refused if that adapter is gone. An ordinary turn's use its profile's adapter. With several adapters live
+  a turn never takes another bot's because it connected last: a profile with no adapter gets the tool's
+  not-connected error, and a turn naming no profile (a cron job, or lost context) uses the default profile's,
+  or is not connected, with a WARNING naming the tool. A gateway with one adapter is unchanged.
 - **A summon sends only through the plugin's own tools** (chatlytics#956). On a gateway with the hub's
   MCP server connected, the hub's tools that send or act (`send_message`, `send_media`, `send_poll`,
   `send_reaction`, `chatlytics_dispatch_action`, `manage_group`, and its access, gate, short-link and

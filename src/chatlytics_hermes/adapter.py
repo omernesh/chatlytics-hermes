@@ -5611,15 +5611,27 @@ def _note_summon_adapter(key: str, adapter: "ChatlyticsAdapter") -> None:
         _SUMMON_ADAPTERS.popitem(last=False)
 
 
-def _live_adapter_of_turn() -> Optional["ChatlyticsAdapter"]:
-    """The adapter of the running turn's profile, else the slot.
+def _live_adapter_of_turn(tool: str) -> Optional["ChatlyticsAdapter"]:
+    """The adapter of the running turn's profile; a turn that names none gets the default profile's.
 
-    The slot stays for a turn whose profile is unknown or has no adapter of its own (a cron job, a
-    Telegram profile with no Chatlytics). On a gateway with one adapter they are the same adapter.
+    chatlytics#956: DO NOT use the slot while several adapters are live. It holds whichever connected
+    last, so a turn with no adapter of its own would run on another bot's bearer and the hub would move
+    its send to that bot's number. No adapter is the tool's not-connected error. The slot stays for the
+    one-adapter gateway, whose adapter may serve a turn of a profile it isn't keyed under.
     """
     profile = read_scope.tool_turn_profile()
-    adapter = _LIVE_BY_PROFILE.get(profile) if profile is not None else None
-    return adapter if adapter is not None else _LIVE_ADAPTERS.get("chatlytics")
+    adapter = _LIVE_BY_PROFILE.get("" if profile is None else profile)
+    several = len(_LIVE_BY_PROFILE) > 1
+    if profile is None and several:
+        # A cron job binds no session, and neither does a thread that lost the context. Whose turn this
+        # is can't be known here, so a wrong pick has to show. DO NOT add the tool's arguments.
+        logger.warning(
+            "chatlytics#956: tool %s has no profile on its turn with %d adapters live, using %s",
+            tool, len(_LIVE_BY_PROFILE), "the default profile's" if adapter is not None else "none (not connected)",
+        )
+    if adapter is not None:
+        return adapter
+    return None if several else _LIVE_ADAPTERS.get("chatlytics")
 
 
 def _make_tool_handler(ctx: Any, name: str, handler: Any) -> Any:
@@ -5723,13 +5735,13 @@ def _make_tool_handler(ctx: Any, name: str, handler: Any) -> Any:
         if entry is None:
             # v4.5.2: real hermes PluginContexts (>=0.16) have neither
             # accessor — fall back to the registry connect() populates.
-            return _live_adapter_of_turn()
+            return _live_adapter_of_turn(name)
         # Both attribute and dict accessors used by various harnesses.
         adapter_inst = getattr(entry, "adapter", None)
         if adapter_inst is None and isinstance(entry, dict):
             adapter_inst = entry.get("adapter")
         if adapter_inst is None:
-            adapter_inst = _live_adapter_of_turn()
+            adapter_inst = _live_adapter_of_turn(name)
         return adapter_inst
 
     async def _bound(args: Optional[Dict[str, Any]] = None, **kwargs: Any) -> str:
