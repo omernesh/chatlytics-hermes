@@ -5,17 +5,21 @@
 - **The owner's memory stays out of a turn the owner summoned from their own number**
   (chatlytics#952). The reply to such a turn reaches the other people in that chat. An
   `llm_request` middleware now removes the `<memory-context>` fences, including replayed
-  ones, and the MEMORY, USER PROFILE and memory-provider blocks from the system prompt.
-  It acts only on requests whose system prompt carries the summoned-turn context line.
-  Memory tools stay available, so the owner can still ask for something from memory.
+  ones, and the MEMORY, USER PROFILE and memory-provider blocks from the system prompt,
+  and the stored entries a failed `memory` write returned in earlier tool results. It acts
+  only on requests whose system prompt carries the summoned-turn context line after its
+  frozen part, so a memory entry quoting that line changes nothing. Memory tools stay
+  available, so the owner can still ask for something from memory.
 
 ### Changed
 
-- **A summoned turn is refused when memory cannot be kept out of it.** At the first summon
-  the plugin runs hermes-agent's real memory renderers through the strip. If the host has
-  no `llm_request` middleware or its memory format changed, the summoned turn is not
-  dispatched and an ERROR is logged. Other turns are unaffected. Verified on hermes-agent
-  0.22.5; hermes-agent 2026.5.16 (0.14) has no such middleware, so summons are refused there.
+- **A summoned turn is refused when memory cannot be kept out of it.** At each summon the
+  plugin checks that hermes-agent's real memory renderers still go through the strip and
+  that its live middleware chain still applies it. If the host has no `llm_request`
+  middleware, the callback was unloaded or its memory format changed, the summoned turn is
+  not dispatched and an ERROR is logged. A failed check is retried at the next summon. Other
+  turns are unaffected. Verified on hermes-agent 0.22.5; hermes-agent 2026.5.16 (0.14) has no
+  such middleware, so summons are refused there.
 
 ## [5.2.0] - 2026-11-01
 

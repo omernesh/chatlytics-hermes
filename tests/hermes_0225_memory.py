@@ -7,15 +7,13 @@ to read the new code, update the strip and add the new shape next to this one.
 Sources, by section: ``agent/memory_context.py``, ``tools/memory_tool_store.py``,
 ``agent/turn_context.py``, and ``hermes_cli/plugins_dispatch.py`` with
 ``hermes_cli/middleware.py`` for the middleware chain. ``_drop_repeated_recall_lines``
-and the surrounding classes are left out. The next line is what ``_probe_host`` looks
-for in ``agent/turn_api_request.py``:
-
-    from hermes_cli.middleware import apply_llm_request_middleware
+and the surrounding classes are left out.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable, List, Optional
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, List, Optional
 
 # --- agent/memory_context.py -------------------------------------------------------
 
@@ -103,3 +101,24 @@ def apply_request_chain(callbacks: List[Callable[..., Any]], request: dict) -> d
         if isinstance(ret, dict) and isinstance(ret.get("request"), dict):
             current = ret["request"]
     return current
+
+
+# What ``apply_llm_request_middleware`` and ``has_middleware`` read: the registered callbacks.
+MIDDLEWARE: Dict[str, List[Callable[..., Any]]] = {}
+
+
+def has_middleware(kind: str) -> bool:
+    return bool(MIDDLEWARE.get(kind))
+
+
+def apply_llm_request_middleware(request: dict, **context: Any) -> Any:
+    callbacks = MIDDLEWARE.get("llm_request", [])
+    current = request
+    for cb in callbacks:
+        try:
+            ret = cb(request=current, original_request=request, **context)
+        except (Exception, SystemExit):
+            continue
+        if isinstance(ret, dict) and isinstance(ret.get("request"), dict):
+            current = ret["request"]
+    return SimpleNamespace(payload=current, original_payload=request)

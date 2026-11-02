@@ -247,8 +247,8 @@ See [docs/features.md](docs/features.md) for the full behavior contracts.
   system prompt are removed from that turn's requests. Memory tools stay available:
   the model can look something up when the owner's message asks for it. Summons are
   refused, with an ERROR in the log, on a hermes-agent without `llm_request`
-  middleware or with a memory format this plugin does not recognise. Verified on
-  hermes-agent 0.22.5. Other turns are untouched.
+  middleware, after that middleware is unloaded, or with a memory format this plugin
+  does not recognise. Verified on hermes-agent 0.22.5. Other turns are untouched.
 - **Tools work everywhere (v4.5.2/v4.5.3)** — a module-level live-adapter
   registry fixed "adapter is not connected" on hermes 0.16 longpoll
   gateways, and host-injected kwargs (e.g. `task_id`) are now filtered to

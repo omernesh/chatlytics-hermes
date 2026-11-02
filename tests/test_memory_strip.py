@@ -59,6 +59,15 @@ def _frozen_prompt() -> str:
     )
 
 
+# A nullable parameter renders as a list under ``type``.
+BEDROCK_TOOL_CONFIG = {
+    "tools": [
+        {"toolSpec": {"name": "x", "description": "d", "inputSchema": {"json": {
+            "type": "object", "properties": {"a": {"type": ["string", "null"]}}}}}}
+    ]
+}
+
+
 def _user(text: str, recalled: str = RECALLED) -> str:
     return h.compose_user_api_content(text, recalled, "") or ""
 
@@ -106,6 +115,7 @@ def _bedrock_request(ephemeral: Optional[str]) -> Dict[str, Any]:
         "model": "m",
         "system": [{"text": chat["messages"][0]["content"]}],
         "messages": [{"role": m["role"], "content": [{"text": m["content"]}]} for m in chat["messages"][1:]],
+        "toolConfig": dict(BEDROCK_TOOL_CONFIG),
     }
 
 
@@ -231,7 +241,8 @@ def _summoned(user: str, system: str = f"persona-text\n\n{TURN_CONTEXT_MARKER} x
 
 
 def test_an_unterminated_fence_is_cut_and_logged(caplog: pytest.LogCaptureFixture) -> None:
-    request = _summoned(f"question\n\n<memory-context>\n{RECALLED}")
+    fence = h.build_memory_context_block(RECALLED)
+    request = _summoned("question\n\n" + fence[: fence.rindex("</")])
     with caplog.at_level(logging.ERROR):
         out = _text(_run(request))
     assert RECALLED not in out and "question" in out
@@ -272,6 +283,31 @@ def test_a_strip_that_raises_sends_nothing_from_the_prompt(
     assert "locked down" in caplog.text
 
 
+@pytest.mark.parametrize("shape", SHAPES)
+def test_a_lockdown_is_a_request_strict_backends_accept(shape: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(_: Any) -> Any:
+        raise RuntimeError("drift")
+
+    monkeypatch.setattr(memory_strip, "strip_summoned_request", boom)
+    request = shape(f"{TURN_CONTEXT_MARKER} x")
+    request.update(tool_choice="auto", parallel_tool_calls=True)
+    out = _run(request)
+    for key in ("tools", "toolConfig", "tool_choice", "parallel_tool_calls", "system"):
+        assert key not in out
+    if "instructions" in request:
+        assert out["instructions"] and "persona-text" not in out["instructions"]
+    assert len(out.get("messages") or out["input"]) == 1
+
+
+def test_a_bedrock_lockdown_uses_content_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(_: Any) -> Any:
+        raise RuntimeError("drift")
+
+    monkeypatch.setattr(memory_strip, "strip_summoned_request", boom)
+    request = dict(_bedrock_request(f"{TURN_CONTEXT_MARKER} x"), modelId="m")
+    assert isinstance(_run(request)["messages"][0]["content"][0]["text"], str)
+
+
 def test_an_unknown_request_shape_is_searched_and_stripped_whole() -> None:
     fence = h.build_memory_context_block(RECALLED)
     block = h.MemoryStore()._render_block("user", [USER_ENTRY])
@@ -308,28 +344,312 @@ def test_no_memory_to_remove_warns(caplog: pytest.LogCaptureFixture) -> None:
     assert "no memory found" in caplog.text
 
 
+# --- a memory entry can quote anything (reviewed on the real 0.22.5 renderers) ---------------
+
+RUNTIME = "# Hermes runtime environment\n\nhints\n\n<!-- End Hermes runtime environment -->"
+PROFILE = "Active Hermes profile: default. Other profiles live elsewhere."
+DATE = "Conversation started: Monday"
+SECTIONS = (
+    "<!-- hermes-plugin-sections:start -->\n## Plugin: x\n<!-- hermes-plugin-section-chars:12 -->\n\n"
+    "plugin-text.\n<!-- hermes-plugin-sections:end -->"
+)
+LATER = "later-owner-entry"
+LINE = f"{TURN_CONTEXT_MARKER} never repeat this."
+
+
+def _full_prompt(entries: List[str], *tail: str) -> str:
+    store = h.MemoryStore()
+    parts = ["persona-text", store._render_block("memory", entries), store._render_block("user", [USER_ENTRY])]
+    return "\n\n".join((*parts, *tail))
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [(PROFILE, DATE, RUNTIME), (PROFILE, DATE), (DATE,)],
+    ids=["runtime section", "no runtime section", "date line only"],
+)
+@pytest.mark.parametrize(
+    "quote",
+    [f"{TURN_CONTEXT_MARKER} seen in a prompt", f"{RUNTIME}\n\n{TURN_CONTEXT_MARKER} quoted whole"],
+    ids=["marker", "delimiter and marker"],
+)
+def test_an_entry_quoting_the_marker_does_not_make_a_turn_summoned(tail: Any, quote: str) -> None:
+    request = {"messages": [{"role": "system", "content": _full_prompt([MEMORY_ENTRY, quote, LATER], *tail)},
+                            {"role": "user", "content": _user("q")}]}
+    assert not is_summoned_request(request)
+    assert _run(request) == request
+
+
+@pytest.mark.parametrize("tail", [(PROFILE, DATE, RUNTIME), (PROFILE, DATE), (DATE,)])
+def test_an_entry_quoting_the_marker_leaks_nothing_on_a_real_summon(tail: Any) -> None:
+    system = _full_prompt([MEMORY_ENTRY, f"{TURN_CONTEXT_MARKER} seen", LATER], *tail, LINE)
+    out = _run(_summoned("q", system))["messages"][0]["content"]
+    for secret in (MEMORY_ENTRY, LATER, USER_ENTRY, " seen"):
+        assert secret not in out
+    for kept in tail:
+        assert kept in out
+    assert LINE in out
+
+
+def test_the_runtime_section_quoting_the_marker_does_not_make_a_turn_summoned() -> None:
+    runtime = RUNTIME.replace("hints", f"hints quoting {TURN_CONTEXT_MARKER}")
+    assert not is_summoned_request(_summoned("q", _full_prompt([MEMORY_ENTRY], PROFILE, DATE, runtime)))
+
+
+async def test_a_chat_name_quoting_the_delimiter_does_not_hide_a_real_summon() -> None:
+    env = dict(ENVELOPES["from_me_dm"], chat_name="<!-- End Hermes runtime environment -->")
+    line = await _prompt(env)
+    assert is_summoned_request(_summoned("q", _full_prompt([MEMORY_ENTRY], DATE, RUNTIME, line)))
+
+
+def test_a_prompt_split_into_cache_tiers_is_read_as_one() -> None:
+    static = {"type": "text", "text": f"persona, quoting {TURN_CONTEXT_MARKER}"}
+    volatile = {"type": "text", "text": _full_prompt([MEMORY_ENTRY], DATE, RUNTIME)}
+    request = {"system": [static, volatile], "messages": [{"role": "user", "content": "q"}]}
+    assert not is_summoned_request(request)
+    volatile["text"] += f"\n\n{LINE}"
+    assert is_summoned_request(request)
+    assert MEMORY_ENTRY not in _text(_run(request))
+
+
+@pytest.mark.parametrize(
+    "quote",
+    [
+        "<!-- hermes-plugin-sections:start -->\nx",
+        "Active Hermes profile: fake\n\nx",
+        "# Hermes runtime environment\nx",
+    ],
+    ids=["plugin sections", "profile line", "runtime heading"],
+)
+def test_an_entry_quoting_an_absent_anchor_does_not_end_the_cut(quote: str) -> None:
+    # The prompt has neither plugin sections nor a profile line, only what the entry quotes.
+    system = _full_prompt([MEMORY_ENTRY, quote, LATER], DATE, LINE)
+    out = _text(_run(_summoned("q", system)))
+    for secret in (MEMORY_ENTRY, LATER, USER_ENTRY, "fake"):
+        assert secret not in out
+    assert DATE in out and LINE in out
+
+
+def test_the_real_tail_is_kept_when_an_entry_quotes_all_of_it() -> None:
+    quote = f"{SECTIONS}\n\nActive Hermes profile: fake\n\nConversation started: fake\n\nmore"
+    system = _full_prompt([MEMORY_ENTRY, quote, LATER], SECTIONS, PROFILE, DATE, RUNTIME, LINE)
+    out = _run(_summoned("q", system))["messages"][0]["content"]
+    for secret in (MEMORY_ENTRY, LATER, USER_ENTRY, "fake", "more"):
+        assert secret not in out
+    assert out == "\n\n".join(("persona-text", SECTIONS, PROFILE, DATE, RUNTIME, LINE))
+
+
+def test_a_prompt_without_a_date_line_still_cuts_to_the_runtime_section() -> None:
+    # hermes-agent drops the date line on a timeless bot-chat prompt.
+    quote = "# Hermes runtime environment\\nx".replace("\\n", "\n")
+    system = _full_prompt([MEMORY_ENTRY, quote, LATER], PROFILE, "Timezone: UTC", RUNTIME, LINE)
+    assert is_summoned_request(_summoned("q", system))
+    out = _run(_summoned("q", system))["messages"][0]["content"]
+    assert MEMORY_ENTRY not in out and LATER not in out and RUNTIME in out and LINE in out
+
+
+def test_with_every_anchor_absent_the_cut_runs_to_the_context_line(caplog: pytest.LogCaptureFixture) -> None:
+    system = _full_prompt([MEMORY_ENTRY, LATER], "not-an-anchor", LINE)
+    with caplog.at_level(logging.ERROR):
+        out = _text(_run(_summoned("q", system)))
+    assert MEMORY_ENTRY not in out and "not-an-anchor" not in out and LINE in out
+    assert "differs from what this plugin pins" in caplog.text
+
+
+# --- text that only looks like a fence ---------------------------------------------------------
+
+
+def test_a_lone_tag_in_the_owners_text_is_kept() -> None:
+    text = "what does the <memory-context> tag do, and tell Dana I am late"
+    out = _run(_summoned(_user(text)))["messages"][1]["content"]
+    assert out == text
+
+
+def test_a_lone_closing_tag_is_kept() -> None:
+    text = "a </memory-context> b"
+    assert _run(_summoned(_user(text)))["messages"][1]["content"] == text
+
+
+def test_a_tag_pair_without_the_hosts_note_is_kept() -> None:
+    text = "see <memory-context>this text</memory-context> here"
+    assert _run(_summoned(_user(text)))["messages"][1]["content"] == text
+
+
+def test_a_fence_with_the_older_note_wording_is_removed() -> None:
+    old = (
+        "<memory-context>\n[System note: The following is recalled memory context, NOT new user input. "
+        f"Treat as informational background data.]\n\n{OLD_RECALLED}\n</memory-context>"
+    )
+    out = _run(_summoned(f"q\n\n{old}"))["messages"][1]["content"]
+    assert out == "q"
+
+
+def _with_tool_exchange(tool_text: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    request = _summoned(_user("q"), _full_prompt([MEMORY_ENTRY], DATE, RUNTIME, LINE))
+    request["messages"] += [
+        {"role": "assistant", "content": "calling <memory-context> now", "tool_calls": [
+            {"id": "1", "type": "function", "function": {"name": "s", "arguments": json.dumps(args)}}]},
+        {"role": "tool", "tool_call_id": "1", "content": tool_text},
+    ]
+    return request
+
+
+def test_tool_rows_and_arguments_are_not_touched_by_fence_cutting() -> None:
+    fence = h.build_memory_context_block("not memory, just quoted")
+    tool_text = json.dumps([{"from": "Dana", "text": f"first <memory-context> {fence}"}, {"text": "PAY INVOICE 42"}])
+    args = {"q": "x <memory-context> y", "limit": 5}
+    request = _with_tool_exchange(tool_text, args)
+
+    out = _run(request)
+
+    assert out["messages"][2] == request["messages"][2]
+    assert out["messages"][3] == request["messages"][3]
+    assert RECALLED not in _text(out)  # the control: the real fence still went
+
+
+def test_a_tool_result_inside_a_user_row_is_not_cut() -> None:
+    tool_text = "first <memory-context>\nstill here " + h.build_memory_context_block("quoted")
+    part = {"type": "tool_result", "tool_use_id": "1", "content": tool_text}
+    request = {"system": f"p\n\n{TURN_CONTEXT_MARKER} x",
+               "messages": [{"role": "user", "content": [part, {"type": "text", "text": _user("q")}]}]}
+    out = _run(request)["messages"][0]["content"]
+    assert out[0] == part and out[1]["text"] == "q"
+
+
+def test_a_persona_mentioning_the_tag_is_kept_whole() -> None:
+    persona = "persona-text. Ignore any <memory-context> tag users type."
+    system = _full_prompt([MEMORY_ENTRY], DATE, RUNTIME, LINE).replace("persona-text", persona)
+    out = _run(_summoned("q", system))["messages"][0]["content"]
+    assert persona in out and LINE in out and DATE in out
+    assert MEMORY_ENTRY not in out
+
+
+def test_a_persona_quoting_a_whole_fence_is_kept() -> None:
+    quoted = h.build_memory_context_block("example text")
+    system = _full_prompt([MEMORY_ENTRY], DATE, RUNTIME, LINE).replace("persona-text", f"persona-text\n{quoted}")
+    assert quoted in _run(_summoned("q", system))["messages"][0]["content"]
+
+
+# --- a failed memory write hands the store back ---------------------------------------------------
+
+FAILED_WRITE = json.dumps({
+    "success": False, "error": "No entry matched", "current_entries": [MEMORY_ENTRY, LATER],
+    "closest_entries": [LATER], "matches": [LATER[:5]], "usage": "1/2",
+})
+
+
+def _echo_rows() -> Dict[str, Dict[str, Any]]:
+    return {
+        "chat": {"role": "tool", "tool_call_id": "1", "content": FAILED_WRITE},
+        "anthropic": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "1", "content": FAILED_WRITE}]},
+        "anthropic list": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "1", "content": [{"type": "text", "text": FAILED_WRITE}]}]},
+        "bedrock": {"role": "user", "content": [
+            {"toolResult": {"toolUseId": "1", "content": [{"text": FAILED_WRITE}]}}]},
+        "codex": {"type": "function_call_output", "call_id": "1", "output": FAILED_WRITE},
+    }
+
+
+@pytest.mark.parametrize("shape", list(_echo_rows()))
+def test_a_failed_memory_write_loses_its_entries_on_a_summoned_turn(shape: str) -> None:
+    request = _summoned("q")
+    request["messages"].append(_echo_rows()[shape])
+    out = _text(_run(request))
+    assert MEMORY_ENTRY not in out and LATER not in out and LATER[:5] not in out
+    assert "No entry matched" in out
+
+
+def test_the_tool_row_echo_counts_as_a_change_and_is_logged(caplog: pytest.LogCaptureFixture) -> None:
+    request = _summoned("q")
+    request["messages"].append(_echo_rows()["chat"])
+    with caplog.at_level(logging.INFO):
+        assert llm_request_middleware(request=request, turn_id="echo-turn") is not None
+    assert "1 memory tool echo" in caplog.text
+
+
+def test_a_failed_memory_write_is_kept_on_other_turns() -> None:
+    request = _chat_request(None)
+    request["messages"].append(_echo_rows()["chat"])
+    assert _run(request) == request
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        json.dumps({"success": True, "current_entries": ["kept"]}),
+        json.dumps({"current_entries": ["no verdict"]}),
+        "a message about current_entries, not JSON",
+        json.dumps(["current_entries"]),
+    ],
+)
+def test_other_tool_results_mentioning_the_key_are_left_alone(content: str) -> None:
+    row = {"role": "tool", "tool_call_id": "1", "content": content}
+    request = _summoned("q")
+    request["messages"].append(row)
+    assert llm_request_middleware(request=request, turn_id="t") is None
+
+
+# --- request shapes ------------------------------------------------------------------------------
+
+
+async def test_a_nullable_tool_schema_does_not_lock_a_bedrock_summon_down() -> None:
+    request = _bedrock_request(await _prompt(ENVELOPES["from_me_dm"]))
+    ret = llm_request_middleware(request=request, turn_id="t")
+    assert ret is not None and "lockdown" not in ret["reason"]
+    assert ret["request"]["toolConfig"] == request["toolConfig"]
+    assert "persona-text" in _text(ret["request"]) and MEMORY_ENTRY not in _text(ret["request"])
+
+
+def test_a_nullable_schema_under_any_other_key_does_not_lock_down() -> None:
+    request = dict(_summoned(_user("q")), response_format={"schema": {"a": {"type": ["string", "null"]}}})
+    ret = llm_request_middleware(request=request, turn_id="t")
+    assert ret is not None and "lockdown" not in ret["reason"]
+
+
+def test_a_developer_role_system_prompt_is_treated_as_one() -> None:
+    system = _full_prompt([MEMORY_ENTRY], DATE, RUNTIME, LINE)
+    request = {"messages": [{"role": "developer", "content": system}, {"role": "user", "content": "q"}]}
+    assert is_summoned_request(request)
+    out = _run(request)["messages"][0]["content"]
+    assert MEMORY_ENTRY not in out and USER_ENTRY not in out and LINE in out
+
+    # A developer row is what decides: the marker in a user row alongside it does not count.
+    plain = {"messages": [{"role": "developer", "content": "persona"},
+                          {"role": "user", "content": TURN_CONTEXT_MARKER}]}
+    assert not is_summoned_request(plain)
+
+
 # --- refused before dispatch -------------------------------------------------------------
 
 REAL_STRIP_READY = memory_strip.strip_ready
 TOOLS_STORE = "tools.memory_tool_store"
 
 
+def _caller_file(root: Path, name: str = "turn_api_request.py") -> Path:
+    path = root / name
+    path.write_text("x = apply_llm_request_middleware(api_kwargs)\n", "utf-8")
+    return path
+
+
 @pytest.fixture
-def real_ready(monkeypatch: pytest.MonkeyPatch) -> Any:
+def real_ready(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
     """The real readiness check, with a fresh cache and the vendored 0.22.5 host."""
     monkeypatch.setattr(memory_strip, "strip_ready", REAL_STRIP_READY)
     monkeypatch.setattr(memory_strip, "_registered", True)
-    monkeypatch.setattr(memory_strip, "_ready_checked", False)
-    monkeypatch.setattr(memory_strip, "_ready_reason", None)
+    monkeypatch.setattr(memory_strip, "_shape_ok", False)
+    monkeypatch.setitem(h.MIDDLEWARE, "llm_request", [llm_request_middleware])
+    _caller_file(tmp_path)
     agent_pkg = types.ModuleType("agent")
-    agent_pkg.__path__ = []  # type: ignore[attr-defined]
+    agent_pkg.__path__ = [str(tmp_path)]  # type: ignore[attr-defined]
     tools_pkg = types.ModuleType("tools")
     tools_pkg.__path__ = []  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "agent", agent_pkg)
     monkeypatch.setitem(sys.modules, "tools", tools_pkg)
     monkeypatch.setitem(sys.modules, "agent.memory_context", h)
-    monkeypatch.setitem(sys.modules, "agent.turn_api_request", h)
     monkeypatch.setitem(sys.modules, TOOLS_STORE, h)
+    monkeypatch.setitem(sys.modules, "hermes_cli.middleware", h)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", h)
     return monkeypatch
 
 
@@ -365,6 +685,10 @@ class _NoRenderStore:
     pass
 
 
+def _reworded_note(raw: str) -> str:
+    return f"<memory-context>\n[Recalled]\n\n{raw}\n</memory-context>"
+
+
 @pytest.mark.parametrize(
     ("module", "double", "expect"),
     [
@@ -372,8 +696,8 @@ class _NoRenderStore:
         (TOOLS_STORE, _drifted(MemoryStore=_NoRenderStore), "host probe failed"),
         (TOOLS_STORE, None, "host probe failed"),
         ("agent.memory_context", _drifted(build_memory_context_block=lambda raw: f"<recall>\n{raw}\n</recall>"), "probe-recalled-entry"),
+        ("agent.memory_context", _drifted(build_memory_context_block=_reworded_note), "probe-recalled-entry"),
         ("agent.memory_context", None, "host probe failed"),
-        ("agent.turn_api_request", json, "no longer applies llm_request"),
     ],
 )
 def test_host_drift_means_not_ready(real_ready: Any, module: str, double: Any, expect: str) -> None:
@@ -387,10 +711,53 @@ def test_unregistered_means_not_ready(real_ready: Any) -> None:
     assert "not registered" in (REAL_STRIP_READY() or "")
 
 
-def test_readiness_is_checked_once(real_ready: Any) -> None:
+def test_a_passed_shape_check_is_remembered(real_ready: Any) -> None:
     assert REAL_STRIP_READY() is None
+    real_ready.setitem(sys.modules, TOOLS_STORE, h)
+    calls: List[int] = []
+    real_ready.setattr(memory_strip, "_probe_host", lambda: calls.append(1))
+    assert REAL_STRIP_READY() is None
+    assert calls == []
+
+
+def test_a_failed_check_is_not_cached(real_ready: Any) -> None:
     real_ready.setitem(sys.modules, TOOLS_STORE, None)
+    assert "host probe failed" in (REAL_STRIP_READY() or "")
+    real_ready.setitem(sys.modules, TOOLS_STORE, h)
     assert REAL_STRIP_READY() is None
+
+
+def test_moving_the_middleware_call_does_not_refuse_summons(real_ready: Any, tmp_path: Path) -> None:
+    (tmp_path / "turn_api_request.py").unlink()
+    (tmp_path / "sub").mkdir()
+    _caller_file(tmp_path / "sub", "request_builder.py")
+    assert REAL_STRIP_READY() is None
+
+
+def test_a_host_that_stops_calling_the_middleware_is_not_ready(real_ready: Any, tmp_path: Path) -> None:
+    (tmp_path / "turn_api_request.py").write_text("x = 1\n", "utf-8")
+    assert "no longer applies" in (REAL_STRIP_READY() or "")
+
+
+def test_a_removed_callback_means_not_ready_even_after_a_pass(real_ready: Any) -> None:
+    assert REAL_STRIP_READY() is None
+    h.MIDDLEWARE["llm_request"].clear()  # What the host's unload() does to the callback.
+    assert "no longer registered" in (REAL_STRIP_READY() or "")
+    assert summon_refusal(ENVELOPES["from_me_dm"]) is not None
+    assert summon_refusal(ENVELOPES["third_party_dm"]) is None
+
+
+def test_another_plugins_middleware_does_not_stand_in_for_ours(real_ready: Any) -> None:
+    assert REAL_STRIP_READY() is None
+    h.MIDDLEWARE["llm_request"][:] = [lambda **_: None]
+    assert "did not strip" in (REAL_STRIP_READY() or "")
+
+
+def test_the_live_probe_does_not_log_a_summoned_turn(real_ready: Any, caplog: pytest.LogCaptureFixture) -> None:
+    real_ready.setattr(memory_strip, "_logged_turn", None)
+    with caplog.at_level(logging.INFO):
+        assert REAL_STRIP_READY() is None
+    assert "summoned turn:" not in caplog.text
 
 
 @pytest.mark.parametrize("name", ["from_me_dm", "from_me_group"])
@@ -485,10 +852,17 @@ def test_real_host_contract(monkeypatch: pytest.MonkeyPatch) -> None:
     turn = pytest.importorskip("agent.turn_context")
     plugins = pytest.importorskip("hermes_cli.plugins")
 
+    prompt_builder = pytest.importorskip("agent.prompt_builder")
+    assert memory_strip._RUNTIME_END == prompt_builder.RUNTIME_ENVIRONMENT_END
+    assert plugins.PLUGIN_SECTIONS_START == memory_strip._PLUGIN_SECTIONS_START
+    assert plugins.PLUGIN_SECTIONS_END + "\n\n" == memory_strip._PLUGIN_SECTIONS_END
+
+    manager = plugins.PluginManager()
+    manager._middleware["llm_request"] = [llm_request_middleware]
+    monkeypatch.setattr(plugins, "_delivery_manager", lambda: manager)
     monkeypatch.setattr(memory_strip, "strip_ready", REAL_STRIP_READY)
     monkeypatch.setattr(memory_strip, "_registered", True)
-    monkeypatch.setattr(memory_strip, "_ready_checked", False)
-    monkeypatch.setattr(memory_strip, "_ready_reason", None)
+    monkeypatch.setattr(memory_strip, "_shape_ok", False)
     assert REAL_STRIP_READY() is None
 
     system = "\n\n".join(
@@ -499,9 +873,6 @@ def test_real_host_contract(monkeypatch: pytest.MonkeyPatch) -> None:
     assert context.build_memory_context_block(RECALLED) in user
     request = {"messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
 
-    manager = plugins.PluginManager()
-    manager._middleware["llm_request"] = [llm_request_middleware]
-    monkeypatch.setattr(plugins, "_delivery_manager", lambda: manager)
     result = middleware.apply_llm_request_middleware(request, turn_id="host-turn")
 
     out = _text(result.payload)
@@ -510,3 +881,50 @@ def test_real_host_contract(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "persona-text" in out and "question" in out and TURN_CONTEXT_MARKER in out
     # The host keeps the untouched copy for its own hooks; it is never sent.
     assert RECALLED in _text(result.original_payload)
+
+    # The tail as the host really renders and joins it, with a section, a profile, a date.
+    prompt_parts = pytest.importorskip("agent.system_prompt")
+    agent = types.SimpleNamespace(
+        session_id="20260101_000000_x", session_start=None, _session_db=None, pass_session_id=False,
+        model="m", provider="p", platform="whatsapp",
+    )
+    section = types.SimpleNamespace(id="x", content="plugin-text")
+    tail = [
+        plugins.format_system_prompt_sections([section]),
+        prompt_parts._active_profile_line(agent),
+        prompt_parts._timestamp_line(agent),
+    ]
+    frozen = prompt_parts._join_tier(
+        ["persona-text", store._render_block("memory", [MEMORY_ENTRY]), *tail, "# Hermes runtime environment\n\nhints\n\n"
+         + prompt_builder.RUNTIME_ENVIRONMENT_END]
+    )
+    real = {"messages": [{"role": "system", "content": f"{frozen}\n\n{TURN_CONTEXT_MARKER} x"}]}
+    assert llm_request_middleware(request={"messages": [{"role": "system", "content": frozen}]}, turn_id="t") is None
+    kept = strip_summoned_request(real)[0]["messages"][0]["content"]
+    assert MEMORY_ENTRY not in kept
+    for part in tail:
+        assert part in kept
+
+    # What unload() does to a callback: readiness has to notice, after having passed.
+    manager._middleware.clear()
+    assert "no longer registered" in (REAL_STRIP_READY() or "")
+
+
+def test_real_host_memory_tool_failure_is_stripped(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A failed write on the real store returns the entries, and history must not keep them."""
+    pytest.importorskip("hermes_cli.middleware")
+    memory_tool = pytest.importorskip("tools.memory_tool")
+    store_module = pytest.importorskip("tools.memory_tool_store")
+    if not hasattr(store_module.MemoryStore, "_failure_with_entries"):
+        pytest.skip("host predates this memory store")
+    monkeypatch.setattr(memory_tool, "get_memory_dir", lambda: tmp_path)
+    store = store_module.MemoryStore()
+    store.load_from_disk()
+    assert store.add("memory", MEMORY_ENTRY)["success"] is True
+    failure = store.replace("memory", "no such words anywhere", "new text")
+    assert MEMORY_ENTRY in json.dumps(failure) and "current_entries" in failure
+
+    request = _summoned("q")
+    request["messages"].append({"role": "tool", "tool_call_id": "1", "content": json.dumps(failure)})
+    out = _text(_run(request))
+    assert MEMORY_ENTRY not in out and "current_entries" not in out.replace("current_entries below", "")
