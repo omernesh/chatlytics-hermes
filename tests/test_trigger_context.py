@@ -63,6 +63,7 @@ async def test_from_me_dm_reaches_the_model_as_owner_with_the_chat_and_session()
     assert '"Dana Levi"' in prompt
     assert "That other person reads it" in prompt
     assert "unless this message asks for them" in prompt
+    assert "look it up with a memory tool only if this message asks" in prompt
 
 
 async def test_from_me_group_reaches_the_model_with_the_group_audience() -> None:

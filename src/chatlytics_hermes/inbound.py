@@ -27,6 +27,7 @@ from typing import Any, Callable, Dict, Optional
 
 from aiohttp import web
 
+from .memory_strip import log_summon_refused, summon_refusal
 from .trigger_context import with_trigger_context
 from .owner import (
     apply_owner_access,
@@ -294,6 +295,16 @@ def make_webhook_handler(adapter: Any) -> Callable[[web.Request], Any]:
         _owner_pinned = apply_owner_access(
             event, _owner_extra, sender_authenticated=bool(secret)
         )
+
+        # chatlytics#952 — same as adapter._dispatch_envelope (keep in sync). Only
+        # a signed webhook can summon. Outside the try below on purpose: this one
+        # must stop the turn, while prompt injection must never break dispatch.
+        if secret:
+            refusal = summon_refusal(payload)
+            if refusal:
+                log_summon_refused(event.source.chat_id, refusal)
+                # 200, not 5xx: a retry cannot change this answer.
+                return web.json_response({"status": "accepted"}, status=200)
 
         # v4.5.0 (chatlytics v5.4 P8): per-channel prompt injection — same
         # pattern as adapter._dispatch_envelope (keep the two in sync).
