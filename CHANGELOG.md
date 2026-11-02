@@ -31,6 +31,10 @@
   unaffected. Verified on hermes-agent 0.22.5; hermes-agent 2026.5.16 (0.14) has no such
   middleware, so summons are refused there.
 
+### Fixed
+
+- **A summoned direct chat is read by phone, never across sessions** (chatlytics#956). The context line now says to read a direct chat with `search_messages` using the envelope's `chat_phone` as the contact, direct chats only, in the owner's session. It continues only on a non-ambiguous, exact match on that number, and stops in every other case. A group is read by `chat_id` and session. A direct chat without `chat_phone` reads by `chat_id` and session. Searching all sessions is never allowed. A `chat_phone` that isn't 1 to 15 ASCII digits is dropped.
+
 ## [5.2.0] - 2026-11-01
 
 ### Added
