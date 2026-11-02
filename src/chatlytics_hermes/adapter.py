@@ -3037,13 +3037,20 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         session_key: str,
         description: str = "dangerous command",
         metadata: Optional[Dict[str, Any]] = None,
+        request_id: Optional[str] = None,
+        **_host_options: Any,
     ) -> SendResult:  # type: ignore[name-defined]
         """Route a dangerous-command approval to the chatlytics owner-DM flow.
 
-        The hermes runner feature-detects this method ON THE CLASS
-        (``getattr(type(adapter), "send_exec_approval", None)`` in
-        gateway/run.py) and calls it with exactly these kwargs when a
-        dangerous command is pending. Returning ``SendResult(success=True)``
+        The hermes runner feature-detects this method ON THE CLASS and calls
+        it with keywords when a dangerous command is pending. It swallows a
+        TypeError into the text fallback described below, so an unaccepted
+        keyword silently kills approvals; ``_host_options`` takes
+        ``allow_permanent``/``allow_session``/``smart_denied`` and whatever a
+        newer host adds. They only narrow the choices offered, and the owner
+        DM offers only the narrowest (once or deny). ``request_id`` is the
+        host's id for this approval (hermes-agent 0.22.6+), used to answer
+        exactly this one. Returning ``SendResult(success=True)``
         makes the runner wait; the agent thread unblocks when
         ``tools.approval.resolve_gateway_approval(session_key, choice)``
         fires — which :meth:`_control_question_resolved` does when the
@@ -3063,12 +3070,13 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # v4.5.1 (review-d3 X15): register BEFORE the POST so a
         # question_resolved envelope racing the POST response can never
         # orphan the owner's reply.
-        request_id = uuid.uuid4().hex
+        question_id = uuid.uuid4().hex
         self._register_pending_question(
-            request_id,
+            question_id,
             {
                 "kind": "approval",
                 "session_key": session_key,
+                "approval_request_id": request_id,
                 "clarify_id": None,
                 "future": None,
                 "chat_id": chat_id,
@@ -3079,7 +3087,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             "approval",
             text,
             chat_id,
-            request_id=request_id,
+            request_id=question_id,
             # ttl aligned to the runner's gateway-side approval wait (+60 s
             # margin) instead of the server's much longer default.
             ttl_s=_question_ttl_s(_GATEWAY_QUESTION_WAIT_S),
@@ -3088,7 +3096,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             if outcome == _QPOST_FAILED:
                 # Definitive rejection — the question does NOT exist
                 # server-side; the entry can never resolve. Pop it.
-                self._pending_questions.pop(request_id, None)
+                self._pending_questions.pop(question_id, None)
             # _QPOST_UNKNOWN keeps the entry: the POST may have landed and
             # the owner may still /approve — resolve_gateway_approval would
             # then unblock the runner's wait. Registry TTL/cap cleans up.
@@ -3109,10 +3117,10 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         logger.info(
             "send_exec_approval: approval question %s routed to owner DM "
             "(chat %s)",
-            request_id,
+            question_id,
             chat_id,
         )
-        return SendResult(success=True, message_id=request_id)
+        return SendResult(success=True, message_id=question_id)
 
     async def send_clarify(
         self,
@@ -3347,8 +3355,14 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                         request_id,
                     )
                     return
+                # Without the host's id the resolver takes the session's
+                # oldest approval, which may be a different command. A host
+                # that never sends an id keeps that behaviour.
+                host_request_id = entry.get("approval_request_id")
                 resolved_count = resolve_gateway_approval(
-                    entry.get("session_key") or "", choice
+                    entry.get("session_key") or "",
+                    choice,
+                    **({"request_id": host_request_id} if host_request_id else {}),
                 )
                 if resolved_count == 0:
                     logger.warning(

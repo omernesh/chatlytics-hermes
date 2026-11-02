@@ -346,6 +346,86 @@ async def test_question_resolved_approval_maps_resolution_to_choice(
     assert rid not in adapter._pending_questions
 
 
+# The exact keywords gateway/run_turn_runner.py passes to adapter.send_exec_approval. A
+# keyword the adapter doesn't accept is a TypeError, which the runner swallows into its text
+# fallback; chatlytics intercepts that fallback's typed /approve, so the approval times out.
+_RUNNER_APPROVAL_FLAGS = {"allow_permanent": True, "allow_session": False, "smart_denied": False}
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        pytest.param(_RUNNER_APPROVAL_FLAGS, id="hermes-0.22.5"),
+        pytest.param({**_RUNNER_APPROVAL_FLAGS, "request_id": "host-req-1"}, id="hermes-0.22.6"),
+        pytest.param({**_RUNNER_APPROVAL_FLAGS, "request_id": None}, id="no-request-id"),
+        pytest.param({"a_keyword_from_a_future_host": 1}, id="future-host"),
+    ],
+)
+async def test_send_exec_approval_accepts_the_runner_call(extra: Dict[str, Any]) -> None:
+    adapter, fake = _adapter_with_client()
+
+    result = await adapter.send_exec_approval(
+        chat_id=CHAT_ID,
+        command="echo",
+        session_key=SESSION_KEY,
+        description="dangerous command",
+        metadata=None,
+        **extra,
+    )
+
+    assert result.success is True
+    assert len(fake.post_calls) == 1
+
+
+async def test_send_exec_approval_host_id_is_not_the_question_id() -> None:
+    """The server validates request_id's charset, and the host's id is not ours to send."""
+    adapter, fake = _adapter_with_client()
+
+    result = await adapter.send_exec_approval(
+        chat_id=CHAT_ID,
+        command="echo",
+        session_key=SESSION_KEY,
+        request_id="host id with spaces",
+    )
+
+    sent = fake.post_calls[0]["json"]["request_id"]
+    assert _REQUEST_ID_RE.fullmatch(sent)
+    assert result.message_id == sent
+
+
+async def test_question_resolved_answers_the_approval_it_was_asked_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two approvals pending in one session: without the host's id, the upstream resolver pops
+    the oldest, so approving the second command would run the first."""
+    adapter, _fake = _adapter_with_client()
+    for host_id in ("host-first", "host-second"):
+        await adapter.send_exec_approval(
+            chat_id=CHAT_ID,
+            command=host_id,
+            session_key=SESSION_KEY,
+            request_id=host_id,
+        )
+    second = list(adapter._pending_questions)[1]
+
+    # tools/approval.py resolve_gateway_approval: FIFO, unless request_id names one.
+    queue = ["host-first", "host-second"]
+    approved: List[str] = []
+
+    def resolve(session_key, choice, resolve_all=False, reason=None, request_id=None):
+        target = request_id if request_id else queue[0]
+        queue.remove(target)
+        approved.append(target)
+        return 1
+
+    monkeypatch.setattr("tools.approval.resolve_gateway_approval", resolve)
+
+    await adapter._handle_control_envelope(_resolved_envelope(second, "approved"))
+
+    assert approved == ["host-second"]
+    assert queue == ["host-first"]
+
+
 async def test_question_resolved_clarify_answered_delivers_answer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
