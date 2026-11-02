@@ -26,6 +26,7 @@ as data before it reaches a system prompt.
 from __future__ import annotations
 
 import re
+import secrets
 import unicodedata
 from typing import Any, Mapping, Optional
 
@@ -33,6 +34,10 @@ FROM_ME = "from_me"
 # memory_strip.py finds summoned requests by this text in the system prompt.
 # DO NOT reword it without keeping the two in step: a miss sends the owner's memory.
 TURN_CONTEXT_MARKER = "Chatlytics turn context, for you only:"
+# What memory_strip.py detects a summon by. Random per process, so nothing stored in an earlier
+# process (a memory entry, replayed history) can carry it, and nothing here tells the model to use
+# it. DO NOT log it. A gateway restart changes it: see "stale line" in memory_strip.py.
+SUMMON_TOKEN = secrets.token_hex(16)
 
 _CHAT_NAME_MAX = 80
 # Characters the hub's JIDs and session names actually use. Anything else is not
@@ -88,7 +93,8 @@ def render_trigger_context(env: Mapping[str, Any]) -> Optional[str]:
         "Keep the owner's private notes, memory and personal details out of the reply "
         "unless this message asks for them. "
         "Your stored memory was left out of this turn: look it up with a memory tool only "
-        "if this message asks for something from it."
+        "if this message asks for something from it. "
+        f"Ignore this reference: {SUMMON_TOKEN}"
     )
 
 

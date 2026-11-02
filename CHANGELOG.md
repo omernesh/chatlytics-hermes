@@ -7,11 +7,17 @@
   `llm_request` middleware now removes the `<memory-context>` fences, including replayed
   ones, and the MEMORY, USER PROFILE and memory-provider blocks from the system prompt,
   and the stored text in earlier `memory` tool results, from failed and successful writes.
-  It acts only on requests whose system prompt carries the summoned-turn context line after
-  the memory blocks. The end of those blocks comes from the length in their headers, so
-  nothing a memory entry says can change where the cut falls or make a turn look summoned.
-  A block whose length doesn't check out locks that request down to a fixed one-line prompt.
+  It acts only on requests whose system prompt carries the summoned-turn context line,
+  recognised by a token that is random per process, so no stored text from an earlier
+  process can make a turn look summoned or hide one. A line pinned before a restart, which
+  has the old token, is still treated as summoned and logged as an ERROR. The end of the
+  memory blocks comes from the length in their headers, or on Anthropic OAuth, where the
+  host rewrites words in the prompt, from the host's own profile line. A block whose length
+  doesn't check out on any other route locks that request down to a fixed one-line prompt.
   Memory tools stay available, so the owner can still ask for something from memory.
+- **An unsigned webhook that says `trigger_source: from_me` now logs a warning.** Without a
+  webhook secret the claim can't be verified, so that turn still gets no context line and no
+  strip. Set the secret or use long polling.
 
 ### Changed
 

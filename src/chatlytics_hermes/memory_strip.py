@@ -13,14 +13,24 @@ the gateway never passes it, and the frozen prompt outlives any single turn. The
 supported point that covers all of it is ``llm_request`` middleware, which sees the
 final provider request and runs again for every attempt, including after a fallback
 to another model. So the rewrite happens here, and only when the request itself says
-the turn is summoned: the context line rides ``channel_prompt`` into the system
-prompt, after the frozen part, so its marker is found only past the memory blocks.
+the turn is summoned: the context line rides ``channel_prompt`` into the system prompt,
+after the frozen part, and carries a token random per process (``SUMMON_TOKEN``).
+
+Detection is that token anywhere in the system strings, and no length is read to decide
+it, so a forged block length can only make the cut bigger. A line without the current
+token is a "stale line": the gateway pins a channel prompt, persists the pin, and hands
+it back to synthetic turns after a restart (``_pinned_channel_inputs``). That still means
+a third party may read the reply, so it counts when it sits past the prompt's tail, and it
+is logged as an ERROR. An entry quoting the marker sits before the tail and changes nothing.
 
 Memory entries are attacker-influenced text, so nothing here reads them to find where
 they end. Each block's header carries the length of its content, computed by the host
 (``MemoryStore._render_block``), and the cut is taken from that number. The middleware
 can't compare against the store itself: it isn't given one, and a resumed session sends
 the prompt frozen when the session began, which differs from the store after any write.
+On Anthropic OAuth the host rewrites words in the prompt, so no length means anything:
+the cut there runs from the first header to the host's own profile line, which comes
+after every entry whatever an entry says.
 
 Fail closed, because a silent no-op after a hermes-agent upgrade is the main risk:
 
@@ -29,8 +39,9 @@ Fail closed, because a silent no-op after a hermes-agent upgrade is the main ris
 - :func:`strip_ready` runs the real host renderers through the strip, and a probe
   through the host's live middleware chain, once per chain of callbacks. If either
   fails, :func:`summon_refusal` drops the summoned turn before it is dispatched;
-- a block whose length doesn't check out, or a header line that isn't a whole block
-  header, raises :class:`MemoryShapeError`, which locks the request down;
+- on a prompt the host did not rewrite, a block whose length doesn't check out, or a
+  header line that isn't a whole block header, raises :class:`MemoryShapeError`, which
+  locks the request down;
 - a ``memory`` tool result that can't be parsed is replaced with a fixed error.
 
 DO NOT widen this to other turns without an explicit decision (chatlytics#952).
@@ -45,7 +56,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, List, Mapping, Optional, Tuple
 
-from .trigger_context import FROM_ME, TURN_CONTEXT_MARKER, render_trigger_context
+from .trigger_context import FROM_ME, SUMMON_TOKEN, TURN_CONTEXT_MARKER, render_trigger_context
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +69,10 @@ _FENCE_OPEN = r"\s*<\s*memory-context\s*>\s*\[System note:\s*The following is re
 # The closing tag as the host's sanitizer defines it (``_FENCE_TAG_RE``). Text it leaves in
 # a recall is not a close, so ``< /memory-context>`` doesn't end the fence. The cut runs to
 # the LAST close: that sanitizer makes one pass, so a recall can rebuild a real tag from two
-# pieces. What can follow a fence in the string is plugin context, never the owner's text.
+# pieces. What follows the host's fence in the string is plugin context. The cut starts at the
+# FIRST open for the same reason, so contact text holding the tag and note ahead of the owner's
+# text in one string costs the owner's text too. Nothing here can tell that open from the real
+# one without reading the recall, so it stays: a lost question, not a leak.
 _FENCE = re.compile(_FENCE_OPEN + r"[\s\S]*</\s*memory-context\s*>", re.IGNORECASE)
 _UNTERMINATED_FENCE = re.compile(_FENCE_OPEN, re.IGNORECASE)
 # hermes-agent tools/memory_tool_store.py: MEMORY_BLOCK_HEADERS and _render_block.
@@ -77,12 +91,15 @@ _BLOCK_HEADER = re.compile(
 _RUNTIME_END = "<!-- End Hermes runtime environment -->"
 _RUNTIME_HEADING = re.compile(r"^# Hermes runtime environment", re.MULTILINE)
 _DATE_LINE = re.compile(r"^Conversation started:", re.MULTILINE)
-_PROFILE_LINE = re.compile(r"^Active Hermes profile:[^\n]*\n\n", re.MULTILINE)
+# Always written, and after every memory part, so the last one is past every entry.
+_PROFILE_LINE = re.compile(r"^Active Hermes profile:", re.MULTILINE)
 _PLUGIN_SECTIONS_START = "<!-- hermes-plugin-sections:start -->"
 _PLUGIN_SECTIONS_END = "<!-- hermes-plugin-sections:end -->\n\n"
 _SYSTEM_ROLES = frozenset({"system", "developer"})
 _SIGNED_KEYS = ("signature", "encrypted_content")
 _SIGNED_TYPES = frozenset({"thinking", "redacted_thinking", "reasoning"})
+# agent/anthropic_adapter.py ``_CLAUDE_CODE_SYSTEM_PREFIX``, its own block on an OAuth request.
+_OAUTH_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
 # Tool schemas. They are not prompt text, and they hold keys like ``type: ["string", "null"]``.
 _TOOL_KEYS = frozenset({"tools", "toolConfig"})
 # hermes-agent tools/memory_tool.py, tools/memory_tool_store.py and agent/tool_guardrails.py:
@@ -94,9 +111,31 @@ _MEMORY_RESULT_KEYS = frozenset({
 })
 # On a row whose tool can't be identified, these say it may be a ``memory`` result.
 _STORE_KEY_HINTS = ("_entries", "_entry", "matches")
-_MEMORY_RESULT_LOST = json.dumps(
-    {"success": False, "error": "Memory tool result withheld on this turn."}, ensure_ascii=False
+_MEMORY_ERROR_WITHHELD = "Memory tool result withheld on this turn."
+_MEMORY_RESULT_LOST = json.dumps({"success": False, "error": _MEMORY_ERROR_WITHHELD}, ensure_ascii=False)
+# The ``error`` texts of tools/memory_tool_store.py that are safe to show: their only free text is
+# what the model itself sent as old_text and content. ``_stale_entry_message`` holds a whole stored
+# entry, and any wording not listed here is treated the same way.
+_SAFE_MEMORY_ERROR = re.compile(
+    r"(?:Operation \d+ \(\w+\): )?(?:"
+    r"No entry matched '[\s\S]*'\.(?: old_text must come from ONE entry \('§' separates entries\); use one op per entry\.)?"
+    r" Retry the \w+ with old_text copied verbatim from the intended entry(?: \(closest_entries below\))?\."
+    r"|Multiple entries matched '[\s\S]*'\. Be more specific\."
+    r"|'[\s\S]*' appears \d+ times in the matched entry, and patch edits one span\. Include more surrounding text so old_text occurs once\."
+    r"|'[\s\S]*' matched multiple distinct entries -- be more specific\."
+    r"|Patch is a no-op: '[\s\S]*' -> '[\s\S]*' leaves the entry unchanged\."
+    r"|Memory consolidation failed \d+ times this turn\. Stop retrying memory calls [^\n']*"
+    r"|(?:Content|old_text|new_content|new_text) cannot be empty\.[^\n']*"
+    r"|Memory at [\d,]+/[\d,]+ chars; adding this entry \(\d+ chars\) would exceed the limit by [\d,]+ chars\.[^\n]*"
+    r"|Patch would put memory at [\d,]+/[\d,]+ chars\.[^\n]*"
+    r"|Applying all \d+ operations would put memory at [\d,]+/[\d,]+ chars[^\n]*"
+    r"|(?:Blocked|Stopped) \w+: [^\n']*"
+    r")(?: No operations were applied \(batch is all-or-nothing\)\.)?"
 )
+# agent/tool_guardrails.py ``append_toolguard_guidance`` and the identical-call notice: a repeated
+# failure's stop instructions, plain text after the JSON. The host's only stop for a failure with
+# no retry cap (``ambiguous``).
+_GUARDRAIL_TAIL = re.compile(r"(?:\n\n\[(?:Tool loop (?:hard stop|warning): \w+; count=\d+; |hermes note: )[^\n]*\])+\Z")
 # agent/anthropic_adapter.py renames the tool on OAuth requests (``mcp__context_notes``).
 _MEMORY_TOOL_NAMES = frozenset({"memory", "context_notes"})
 # agent/anthropic_message_convert.py, what the host fills an empty user row with.
@@ -143,13 +182,13 @@ def _strip_fences(text: str, report: StripReport) -> str:
     return text
 
 
-def _scrub_memory_result(text: str, report: StripReport) -> str:
-    """A ``memory`` tool result without stored text. Fail closed if it can't be read.
+def _safe_error(value: Any) -> bool:
+    return value == _MEMORY_ERROR_WITHHELD or (
+        isinstance(value, str) and _SAFE_MEMORY_ERROR.fullmatch(value) is not None
+    )
 
-    The host's tool loop guardrail appends plain text to a repeated failure
-    (``append_toolguard_guidance``), and a long result can be truncated, so a row can hold
-    the store and still not parse.
-    """
+
+def _scrub_memory_json(text: str, report: StripReport) -> str:
     try:
         result = json.loads(text)
     except ValueError:
@@ -157,11 +196,27 @@ def _scrub_memory_result(text: str, report: StripReport) -> str:
     if not isinstance(result, dict):
         report.store_echoes += 1
         return _MEMORY_RESULT_LOST
-    if all(key in _MEMORY_RESULT_KEYS for key in result):
+    if all(key in _MEMORY_RESULT_KEYS for key in result) and ("error" not in result or _safe_error(result["error"])):
         return text
     report.store_echoes += 1
     kept = {k: v for k, v in result.items() if k in _MEMORY_RESULT_KEYS}
+    if "error" in kept and not _safe_error(kept["error"]):
+        kept["error"] = _MEMORY_ERROR_WITHHELD
     return json.dumps(kept, ensure_ascii=False)
+
+
+def _scrub_memory_result(text: str, report: StripReport) -> str:
+    """A ``memory`` tool result without stored text. Fail closed if it can't be read.
+
+    The host's tool loop guardrail appends plain text to a repeated failure, and that stop
+    instruction is kept. It only counts when what precedes it is one line of JSON, since the
+    host's JSON escapes every newline, so stored text can't pose as the tail. A long result
+    can be truncated, so a row can hold the store and still not parse.
+    """
+    tail = _GUARDRAIL_TAIL.search(text)
+    if tail is not None and "\n" not in text[: tail.start()] and text.startswith("{"):
+        return _scrub_memory_json(text[: tail.start()], report) + tail.group()
+    return _scrub_memory_json(text, report)
 
 
 def _last(pattern: "re.Pattern[str]", text: str, start: int, end: int) -> Optional["re.Match[str]"]:
@@ -171,49 +226,61 @@ def _last(pattern: "re.Pattern[str]", text: str, start: int, end: int) -> Option
     return found
 
 
-def _memory_extent(text: str) -> Optional[Tuple[int, int, int]]:
-    """``(start, end, blocks)`` of the built-in memory blocks, or None when there are none.
+def _memory_extent(text: str, limit: int) -> Optional[Tuple[int, int, int]]:
+    """``(start, end, blocks)`` of the built-in memory blocks before ``limit``, or None.
 
     Taken from the headers' length field, so an entry's content can't move it. The content
-    of each block is skipped, so nothing it quotes is read. A block whose length doesn't
-    land on the blank line the host joins parts with means a transform changed the text
-    (agent/anthropic_adapter.py rewrites words on OAuth requests), and the number can't be
-    trusted. A title line outside any block means memory in a shape this can't bound.
+    of each block is skipped, so nothing it quotes is read. A length that runs past the
+    context line can only be forged, and it ends at the line, which over-cuts. A length that
+    doesn't land on the blank line the host joins parts with means a transform changed the
+    text, and the number can't be trusted. A title line outside any block means memory in a
+    shape this can't bound. Text past the line is never memory: the prompt is frozen before it.
     """
     start = end = None
     blocks = pos = 0
-    while (header := _BLOCK_HEADER.search(text, pos)) is not None:
-        stop = header.end() + int(header.group(1).replace(",", ""))
-        if stop > len(text) or (stop < len(text) and not text.startswith("\n\n", stop)):
-            raise MemoryShapeError("a memory block's length does not match its text")
+    has_line = limit < len(text)
+    while (header := _BLOCK_HEADER.search(text, pos, limit)) is not None:
         if _BLOCK_TITLE.search(text, pos, header.start()):
             raise MemoryShapeError("a memory block header without a length")
+        stop = header.end() + int(header.group(1).replace(",", ""))
         start = header.start() if start is None else start
-        end, pos = stop, stop
         blocks += 1
-    if _BLOCK_TITLE.search(text, pos):
+        if has_line and stop >= limit:
+            return start, limit, blocks
+        if stop > len(text) or (stop < len(text) and not text.startswith("\n\n", stop)):
+            raise MemoryShapeError("a memory block's length does not match its text")
+        end, pos = stop, stop
+    if _BLOCK_TITLE.search(text, pos, limit):
         raise MemoryShapeError("a memory block header without a length")
     return None if start is None or end is None else (start, end, blocks)
 
 
-def _block_end(text: str, after: int, report: StripReport) -> int:
+def _tail_start(text: str, start: int, end: int) -> Optional[int]:
+    """Where the host's tail starts in ``text[start:end]``, past anything an entry can write.
+
+    The last profile line is the host's own, and it is written after every memory part. On a
+    host without one, the later of the last date line and runtime heading, which may lose the
+    date line; the earlier one could be an entry's.
+    """
+    profile = _last(_PROFILE_LINE, text, start, end)
+    if profile is not None:
+        return profile.start()
+    found = [m.start() for p in (_DATE_LINE, _RUNTIME_HEADING) if (m := _last(p, text, start, end)) is not None]
+    return max(found) if found else None
+
+
+def _block_end(text: str, after: int, limit: int, report: StripReport) -> int:
     """Where the tail of the prompt starts: everything from ``after`` up to here goes.
 
     ``after`` is past the entries, so what is searched is the provider block and the real
-    tail. The date line (the last one) is the anchor, and the profile line and plugin
-    sections count only when they sit right before it, the way the host joins them.
+    tail. Plugin sections count only when they sit right before the tail, the way the host
+    joins them.
     """
-    marker = text.rfind(TURN_CONTEXT_MARKER, after)
-    bound = text.rfind("\n", after, marker) + 1 if marker >= 0 else len(text)
-    bound = max(bound, after)
-    anchor = _last(_DATE_LINE, text, after, bound) or _last(_RUNTIME_HEADING, text, after, bound)
-    if anchor is None:
+    bound = max(limit, after)
+    end = _tail_start(text, after, bound)
+    if end is None:
         report.unanchored += 1
         return bound
-    end = anchor.start()
-    profile = _last(_PROFILE_LINE, text, after, end)
-    if profile is not None and profile.end() == end:
-        end = profile.start()
     if text.endswith(_PLUGIN_SECTIONS_END, after, end):
         sections = text.rfind(_PLUGIN_SECTIONS_START, after, end)
         if sections >= 0 and text[sections - 1] == "\n":
@@ -221,15 +288,39 @@ def _block_end(text: str, after: int, report: StripReport) -> int:
     return end
 
 
-def _strip_system(text: str, report: StripReport) -> str:
-    extent = _memory_extent(text)
-    if extent is None:
-        return text
-    start, after, blocks = extent
+def _rewritten_extent(text: str, limit: int) -> Optional[Tuple[int, int, int]]:
+    """The memory parts of a prompt the host rewrote, where no block length can be trusted.
+
+    From the first header to the tail, so an entry's headers, dates and frames all go with it.
+    Plugin sections go too: an entry can imitate one, and here nothing says where it ended.
+    """
+    first = _BLOCK_HEADER.search(text, 0, limit)
+    if _BLOCK_TITLE.search(text, 0, first.start() if first is not None else limit):
+        raise MemoryShapeError("a memory block header without a length")
+    if first is None:
+        return None
+    end = _tail_start(text, first.end(), limit)
+    if end is None:
+        raise MemoryShapeError("a rewritten prompt with no tail to cut to")
+    return first.start(), end, sum(1 for _ in _BLOCK_HEADER.finditer(text, first.start(), end))
+
+
+def _strip_system(text: str, report: StripReport, rewritten: bool = False) -> str:
+    limit = _context_line_start(text, rewritten)
+    if rewritten:
+        extent = _rewritten_extent(text, limit)
+        if extent is None:
+            return text
+        start, end, blocks = extent
+    else:
+        extent = _memory_extent(text, limit)
+        if extent is None:
+            return text
+        start, after, blocks = extent
+        # One cut from the first block to the tail. If a length were off by a transform that
+        # still lands on a blank line, what is left of an entry goes with the provider block.
+        end = _block_end(text, after, limit, report)
     report.blocks += blocks
-    # One cut from the first block to the tail. If a length were off by a transform that
-    # still lands on a blank line, what is left of an entry goes with the provider block.
-    end = _block_end(text, after, report)
     head, tail = text[:start].rstrip(), text[end:]
     return f"{head}\n\n{tail}" if head and tail else head or tail
 
@@ -279,29 +370,70 @@ def _strings(value: Any) -> List[str]:
     return found
 
 
-def _past_the_memory_blocks(system: str) -> str:
-    """The part of a system prompt no memory entry can reach.
+def _line_start(text: str, at: int) -> int:
+    return text.rfind("\n", 0, at) + 1
 
-    The context line is added after the frozen prompt, so it is after the last block. Text
-    after it (a channel prompt, skills) can say anything: only the blocks' lengths count.
-    A prompt whose lengths don't check out is searched whole: a false positive costs memory,
-    and on a summon the strip locks that request down.
+
+def _token_line_start(text: str) -> Optional[int]:
+    """Where the context line holding the token starts. A token outside such a line (the model
+    wrote it into an entry) is no boundary: the rest of that entry would count as past it."""
+    at = text.rfind(SUMMON_TOKEN)
+    if at < 0:
+        return None
+    start = _line_start(text, at)
+    return start if text.startswith(TURN_CONTEXT_MARKER, start) else None
+
+
+def _stale_line_at(text: str, rewritten: bool) -> Optional[int]:
+    """The last marker in ``text``, when it is past what memory can reach; else None.
+
+    Only reached with no current token. An entry quoting the marker comes before the host's
+    tail, and that holds whatever its length says, so an ordinary turn stays byte-identical.
+    The lengths are a second opinion for text past the line that imitates the tail. They mean
+    nothing on a rewritten prompt, and with no tail and no usable length the answer is yes.
     """
+    at = text.rfind(TURN_CONTEXT_MARKER)
+    if at < 0:
+        return None
+    found = [m.start() for p in (_PROFILE_LINE, _DATE_LINE, _RUNTIME_HEADING) if (m := _last(p, text, 0, len(text)))]
+    if found and at > max(found):
+        return at
+    if rewritten:
+        return at if not found else None
     try:
-        extent = _memory_extent(system)
+        extent = _memory_extent(text, len(text))
     except MemoryShapeError:
-        return system
-    return system if extent is None else system[extent[1] :]
+        return at if not found else None
+    return at if extent is None or at >= extent[1] else None
 
 
-def is_summoned_request(request: Mapping[str, Any]) -> bool:
-    """Does the system prompt carry the context line, past its frozen part?
+def _context_line_start(text: str, rewritten: bool) -> int:
+    """Where the context line starts in ``text``, or its end when it holds no such line."""
+    start = _token_line_start(text)
+    if start is not None:
+        return start
+    at = _stale_line_at(text, rewritten)
+    return _line_start(text, at) if at is not None else len(text)
 
-    Neither a contact pasting the marker into a chat nor a memory entry quoting it can
-    switch memory off. Text the operator controls can (a provider block or runtime hint
-    quoting the marker), and that is accepted: a false positive costs memory, not privacy.
-    When no system prompt can be located the shape is new to us, so the whole request is
-    searched, for the same reason.
+
+def _is_rewritten(request: Mapping[str, Any]) -> bool:
+    """Did the host's OAuth transform rewrite this prompt? Its prefix is a whole block of its
+    own, which no prompt text can make. Other rewrites aren't known, so they lock down."""
+    system = request.get("system")
+    return isinstance(system, (list, tuple)) and any(
+        isinstance(part, dict) and part.get("text") == _OAUTH_SYSTEM_PREFIX for part in system
+    )
+
+
+_LINE, _STALE, _TOKEN_ONLY = "line", "stale", "token only"
+
+
+def _summon_evidence(request: Mapping[str, Any]) -> Optional[str]:
+    """What says this request is summoned, or None for every other turn.
+
+    Only the system strings count: history and tool results can hold any token, including
+    this process's if the model repeated it. When no system prompt can be located the shape
+    is new to us, so the whole request is searched: a false positive costs memory, not privacy.
     """
     system: List[str] = []
     located = False
@@ -317,9 +449,17 @@ def is_summoned_request(request: Mapping[str, Any]) -> bool:
                 system += _strings(item)
     if not located:
         rest = _strings({k: v for k, v in request.items() if k not in _TOOL_KEYS})
-        return any(TURN_CONTEXT_MARKER in text for text in rest)
+        return _LINE if any(TURN_CONTEXT_MARKER in text or SUMMON_TOKEN in text for text in rest) else None
     # Joined: a provider may split the prompt into cache tiers.
-    return TURN_CONTEXT_MARKER in _past_the_memory_blocks("\n\n".join(system))
+    joined = "\n\n".join(system)
+    if SUMMON_TOKEN in joined:
+        return _LINE if _token_line_start(joined) is not None else _TOKEN_ONLY
+    return _STALE if _stale_line_at(joined, _is_rewritten(request)) is not None else None
+
+
+def is_summoned_request(request: Mapping[str, Any]) -> bool:
+    """Does the system prompt say this turn's reply reaches a third party?"""
+    return _summon_evidence(request) is not None
 
 
 def _tool_names(request: Mapping[str, Any]) -> dict:
@@ -428,12 +568,13 @@ def _fill_emptied(before: Mapping[str, Any], after: dict) -> dict:
 def strip_summoned_request(request: Mapping[str, Any]) -> Tuple[dict, StripReport]:
     """A copy of ``request`` without memory. ``tools`` are not touched (see README)."""
     report = StripReport()
+    rewritten = _is_rewritten(request)
 
     def fences(text: str) -> str:
         return _strip_fences(text, report)
 
     def blocks(text: str) -> str:
-        return _strip_system(text, report)
+        return _strip_system(text, report, rewritten)
 
     names = _tool_names(request)
 
@@ -519,8 +660,16 @@ def llm_request_middleware(**kwargs: Any) -> Optional[dict]:
         )
         return None
     try:
-        if not is_summoned_request(request):
+        evidence = _summon_evidence(request)
+        if evidence is None:
             return None
+        if evidence != _LINE:
+            logger.error(
+                "chatlytics#952: treating a turn as summoned (%s): the system prompt has the "
+                "context line without this process's token, or the token without the line. Usually "
+                "a channel prompt pinned before a restart or upgrade, otherwise text quoting them. "
+                "Memory is removed from it. turn=%s", evidence, kwargs.get("turn_id"),
+            )
         stripped, report = strip_summoned_request(request)
     except Exception:  # noqa: BLE001 -- the host would swallow it and send memory on
         logger.exception("chatlytics#952: strip failed on a summoned turn; request locked down")
@@ -559,13 +708,15 @@ def _probe_request() -> dict:
     from tools.memory_tool_store import MemoryStore
 
     store = MemoryStore()
+    line = render_trigger_context({"trigger_source": FROM_ME, "entity_jid": "probe@c.us", "session_id": "probe"})
     system = "\n\n".join(
         (
             "probe-persona",
             store._render_block("memory", ["probe-memory-entry"]),
             store._render_block("user", ["probe-user-entry"]),
+            "Active Hermes profile: probe",
             "Conversation started: probe",
-            f"{TURN_CONTEXT_MARKER} probe",
+            line or "",
         )
     )
     user = "probe-user-text\n\n" + build_memory_context_block("probe-recalled-entry")
@@ -577,7 +728,7 @@ def _probe_result_problem(result: Any) -> Optional[str]:
     leaked = [s for s in ("probe-memory-entry", "probe-user-entry", "probe-recalled-entry") if s in text]
     if leaked:
         return f"memory shape changed, not removed: {', '.join(leaked)}"
-    lost = [s for s in ("probe-persona", "probe-user-text", TURN_CONTEXT_MARKER) if s not in text]
+    lost = [s for s in ("probe-persona", "probe-user-text", "Active Hermes profile", TURN_CONTEXT_MARKER) if s not in text]
     if lost:
         return f"strip removes too much: {', '.join(lost)}"
     return None
@@ -603,7 +754,7 @@ def _probe_host() -> Optional[str]:
     if not _host_calls_the_middleware():
         return "agent no longer applies llm_request middleware"
     request = _probe_request()
-    if not is_summoned_request(request):
+    if _summon_evidence(request) != _LINE:
         return "the context line is not recognised in a system prompt"
     stripped, report = strip_summoned_request(request)
     problem = _probe_result_problem(stripped)
