@@ -149,7 +149,7 @@ async def test_the_result_check_holds_a_limited_turn_too() -> None:
 
 @pytest.mark.parametrize("tool,args,reason", [
     ("session_search", {"query": "x"}, "transcripts_of_other_chats"),
-    ("chatlytics_read", {"chatId": OTHER_CHAT}, "chatlytics_reads_another_account"),
+    ("chatlytics_read", {"chatId": OTHER_CHAT}, "chat_not_summon"),
     ("mcp__hub__read_messages", {"chatId": OTHER_CHAT}, "chatlytics_reads_another_account"),
     ("mcp__hub__chatlytics_dispatch_action", {"action": "getMessages"}, "chatlytics_read_action"),
     ("execute_code", {"code": "print(open('/home/x/.hermes/.env').read())"}, "names_the_archive_or_host_store"),
@@ -159,6 +159,166 @@ async def test_the_result_check_holds_a_limited_turn_too() -> None:
 async def test_the_other_read_routes_are_refused(tool: str, args: Dict[str, Any], reason: str) -> None:
     await _limited(THIRD_DM)
     assert _reason(_hook(tool, args)) == reason
+
+
+# --- the plugin's chatlytics_read of this chat ----------------------------------------------------
+
+
+READ = "chatlytics_read"
+PEER_PHONE = PEER.split("@")[0]
+PEER_LID = "200000000000002@lid"
+LID_DM_WITH_PHONE = _env(PEER_LID, PEER_LID, chat_phone=PEER_PHONE)
+LID_DM_NO_PHONE = _env(PEER_LID, PEER_LID)
+
+
+@pytest.mark.parametrize("env,chat_id", [
+    pytest.param(THIRD_DM, PEER, id="DM by its JID"),
+    pytest.param(THIRD_DM, PEER.upper(), id="DM, another case"),
+    pytest.param(THIRD_DM, f"{PEER_PHONE}@s.whatsapp.net", id="DM, the other phone JID"),
+    pytest.param(THIRD_DM, PEER_PHONE, id="DM, bare phone"),
+    pytest.param(THIRD_DM, f"+{PEER_PHONE}", id="DM, + phone"),
+    pytest.param(MEMBER_GROUP, GROUP, id="group by its JID"),
+    pytest.param(MEMBER_GROUP, GROUP.upper(), id="group, another case"),
+    pytest.param(OWNER_GROUP, GROUP, id="owner in a group"),
+    pytest.param(LID_DM_WITH_PHONE, PEER_LID, id="lid DM by its lid"),
+    pytest.param(LID_DM_WITH_PHONE, PEER, id="lid DM by the envelope's phone"),
+])
+async def test_a_limited_turn_reads_its_own_chat_with_chatlytics_read(env: Dict[str, Any], chat_id: str) -> None:
+    await _limited(env)
+    assert _hook(READ, {"chatId": chat_id}) is None
+    assert _hook(READ, {"chatId": chat_id, "limit": 20}) is None
+    # Null optional fields, as models send them, are not arguments.
+    assert _hook(READ, {"chatId": chat_id, "limit": None}) is None
+
+
+@pytest.mark.parametrize("env,args,reason", [
+    pytest.param(THIRD_DM, {"chatId": OTHER_CHAT}, "chat_not_summon", id="DM, another phone"),
+    pytest.param(THIRD_DM, {"chatId": GROUP}, "chat_not_summon", id="DM, a group"),
+    pytest.param(THIRD_DM, {"chatId": OWNER_LID}, "chat_not_summon", id="DM, a lid the envelope didn't give"),
+    pytest.param(MEMBER_GROUP, {"chatId": PEER}, "chat_not_summon", id="group, a person"),
+    pytest.param(MEMBER_GROUP, {"chatId": "120363000000000099@g.us"}, "chat_not_summon", id="group, another group"),
+    pytest.param(LID_DM_NO_PHONE, {"chatId": PEER}, "chat_not_summon", id="lid DM with no phone, a phone"),
+    pytest.param(THIRD_DM, {"chatId": "Peer Name"}, "chat_not_summon", id="DM, a name"),
+    pytest.param(MEMBER_GROUP, {"chatId": "Family group"}, "chat_not_summon", id="group, a name"),
+    pytest.param(MEMBER_GROUP, {"chatId": GROUP.split("@")[0] + " x"}, "chat_not_summon", id="group, id-like name"),
+    # send_target calls these this chat, and they aren't an id: the hub reads the string as written.
+    pytest.param(THIRD_DM, {"chatId": f"+{PEER_PHONE[:3]} {PEER_PHONE[3:]}"}, "chat_not_summon", id="phone with a space"),
+    pytest.param(THIRD_DM, {"chatId": f"{PEER_PHONE[:3]}-{PEER_PHONE[3:]}"}, "chat_not_summon", id="phone with a dash"),
+    pytest.param(THIRD_DM, {"chatId": f"{PEER} "}, "chat_not_summon", id="a JID with a trailing space"),
+    pytest.param(THIRD_DM, {}, "chat_missing", id="no chat"),
+    pytest.param(THIRD_DM, {"limit": 5}, "chat_missing", id="only a limit"),
+    pytest.param(THIRD_DM, {"chatId": None}, "chat_missing", id="a null chat"),
+    pytest.param(THIRD_DM, {"chatId": ""}, "chat_not_summon", id="an empty chat"),
+    pytest.param(THIRD_DM, {"chatId": [PEER]}, "chat_not_summon", id="a list"),
+    pytest.param(THIRD_DM, {"chatId": PEER, "session": "all"}, "arg_not_allowed", id="an argument it doesn't take"),
+    pytest.param(THIRD_DM, "{not json", "args_unreadable", id="unreadable"),
+])
+async def test_chatlytics_read_of_anything_else_is_refused(env: Dict[str, Any], args: Any, reason: str) -> None:
+    await _limited(env)
+    assert _reason(_hook(READ, args)) == reason
+
+
+async def test_chatlytics_read_goes_through_tool_call_the_same() -> None:
+    await _limited(MEMBER_GROUP)
+    assert _hook("tool_call", {"calls": [{"name": READ, "arguments": {"chatId": GROUP}}]}) is None
+    assert _hook("tool_call", {"calls": json.dumps([{"name": READ, "arguments": json.dumps({"chatId": GROUP})}])}) is None
+    assert _hook("tool_call", {"name": READ, "arguments": {"chatId": GROUP}}) is None
+    for arguments in ({"chatId": OTHER_CHAT}, {"chatId": "Family group"}):
+        assert _reason(_hook("tool_call", {"calls": [{"name": READ, "arguments": arguments}]})) == "chat_not_summon"
+    assert _reason(_hook("tool_call", {"calls": [{"name": READ, "arguments": {}}]})) == "chat_missing"
+    # One entry out of scope refuses the whole call.
+    both = [{"name": READ, "arguments": {"chatId": GROUP}}, {"name": READ, "arguments": {"chatId": OTHER_CHAT}}]
+    assert _reason(_hook("tool_call", {"calls": both})) == "chat_not_summon"
+
+
+async def test_chatlytics_read_by_the_context_variables() -> None:
+    await _dispatch(_bot(), dict(MEMBER_GROUP))  # What a delegated subagent has: nothing bound by id.
+    in_chat = {"platform": "chatlytics", "chat_id": GROUP}
+    assert _in_context(lambda: _hook(READ, {"chatId": GROUP}), **in_chat) is None
+    assert _reason(_in_context(lambda: _hook(READ, {"chatId": OTHER_CHAT}), **in_chat)) == "chat_not_summon"
+    # A Chatlytics turn this process didn't dispatch knows no chat.
+    lost = {"platform": "chatlytics", "chat_id": OTHER_CHAT}
+    assert _reason(_in_context(lambda: _hook(READ, {"chatId": OTHER_CHAT}), **lost)) == "no_scope_for_this_turn"
+
+
+@pytest.mark.parametrize("name,tool", [
+    ("from_me_dm", READ),
+    ("from_me_group", READ),
+    ("from_me_dm", "mcp__hub__read_messages"),
+])
+async def test_chatlytics_read_stays_refused_on_a_summon_in_its_own_chat(name: str, tool: str) -> None:
+    env = ENVELOPES[name]
+    await _limited(env)
+    args = {"chatId": env["entity_jid"]}
+    assert _reason(_hook(tool, args)) == "chatlytics_reads_another_account"
+    assert _reason(_hook("tool_call", {"calls": [{"name": tool, "arguments": args}]})) == "chatlytics_reads_another_account"
+
+
+@pytest.mark.parametrize("tool", [
+    "mcp__hub__read_messages",
+    "mcp_chatlytics_read_messages",
+    "mcp__hub__chatlytics_read",
+    "mcp_chatlytics_chatlytics_read",
+    "read_messages",
+])
+async def test_the_hubs_read_stays_refused_on_a_limited_turn_for_its_own_chat(tool: str) -> None:
+    # An MCP server's bearer may be another bot's, so this isn't the bot's own number.
+    await _limited(MEMBER_GROUP)
+    assert _reason(_hook(tool, {"chatId": GROUP})) == "chatlytics_reads_another_account"
+    assert _reason(_hook("tool_call", {"calls": [{"name": tool, "arguments": {"chatId": GROUP}}]})) == "chatlytics_reads_another_account"
+
+
+async def test_chatlytics_read_is_refused_where_the_session_isnt_known() -> None:
+    # An unsigned webhook can claim any chat, and this would read that chat on the bot's number.
+    adapter = _wh_adapter(secret=False, allow_admin_from=[OWNER])
+    _request((await _post(adapter, _hook_payload(PEER, PEER), sign=False))[0])
+    assert _reason(_hook(READ, {"chatId": PEER})) == "no_scope_for_this_turn"
+    # An envelope on a session that isn't this bearer's.
+    adapter, _hub, conn = _hub_adapter()
+    _request(await _deliver(adapter, _env(PEER, PEER, session=OWNER_SESSION), conn), "s2", "s2")
+    assert _reason(_hook(READ, {"chatId": PEER}, "s2", "s2")) == "no_scope_for_this_turn"
+
+
+async def test_chatlytics_read_in_the_owners_dm_is_as_before() -> None:
+    _request(await _dispatch(_bot(), dict(OWNER_DM)))
+    assert _hook(READ, {"chatId": OTHER_CHAT}) is None
+
+
+async def test_chatlytics_read_is_logged_like_any_other_read(caplog: pytest.LogCaptureFixture) -> None:
+    await _limited(MEMBER_GROUP)
+    with caplog.at_level(logging.INFO, logger="chatlytics_hermes"):
+        _hook(READ, {"chatId": GROUP})
+        _hook(READ, {"chatId": OTHER_CHAT})
+    assert "chat read allowed kind=chat tool=chatlytics_read" in caplog.text
+    assert "chat read refused kind=chat tool=chatlytics_read reason=chat_not_summon" in caplog.text
+    assert OTHER_CHAT not in caplog.text
+
+
+async def test_the_result_of_chatlytics_read_is_not_replaced() -> None:
+    # The hub's rows have no chat field, and they're this chat's by the id the check let through.
+    await _limited(MEMBER_GROUP)
+    rows = json.dumps({"success": True, "data": [{"id": "m1", "from": MEMBER, "body": "x"}]})
+    assert transform_tool_result(tool_name=READ, result=rows, session_id=SID, task_id=SID) is None
+
+
+@pytest.mark.parametrize("env", [THIRD_DM, MEMBER_GROUP, OWNER_GROUP])
+async def test_the_line_and_a_refusal_name_chatlytics_read_for_a_bot_with_no_lextrove(env: Dict[str, Any]) -> None:
+    how = f"chatlytics_read with chatId {env['entity_jid']}"
+    event = await _limited(env)
+    assert how in event.channel_prompt
+    assert how in _hook(READ, {"chatId": OTHER_CHAT})["message"]
+
+
+async def test_a_summons_line_and_refusal_dont_offer_chatlytics_read() -> None:
+    env = ENVELOPES["from_me_dm"]
+    event = await _limited(env)
+    assert "use chatlytics_read" not in event.channel_prompt
+    assert "use chatlytics_read" not in _hook(READ, {"chatId": env["entity_jid"]})["message"]
+
+
+async def test_an_unreadable_turn_isnt_told_to_use_chatlytics_read() -> None:
+    event = await _limited(_env(PEER, PEER, session=""))
+    assert "use chatlytics_read" not in event.channel_prompt and "no readable chat" in event.channel_prompt
 
 
 # --- who the owner is ----------------------------------------------------------------------------

@@ -327,7 +327,8 @@ The enforcement above, unchanged: [Lextrove tools](#lextrove-tools), [Other rout
 
 Two things are worth saying because they are new for an ordinary turn:
 
-- `chatlytics_read` and the hub's `read_messages` are refused even for this chat, as on a summon. On a bot with no Lextrove server, such a turn can read only its history.
+- The plugin's `chatlytics_read` runs when its `chatId` is this chat, in any form the envelope knows, written as an id: the JID in any case, `@s.whatsapp.net`, or in a DM whose phone is known, that phone bare or with `+`. Any other `chatId`, a missing one, a name, a phone with spaces, any other argument, and a turn whose session isn't known or believed are refused. This is how a bot with no Lextrove server reads its own chat. The prompt line says so. No result check applies: the hub's rows have no chat field. From the hub's source, `readMessages` passes `chatId` to the transport as written, with no name resolution, so the check on the id is what holds the read to this chat. A bare phone passes this check but isn't a JID, so what it returns is the transport's answer. None of this has been run against a live hub yet: see row C5.
+- On a summon `chatlytics_read` stays refused, in its own chat too, because it reads the bot's number and the summon's chat is on the owner's. The hub's `read_messages`, and a `chatlytics_read` served over MCP, stay refused on every limited turn, because an MCP server's bearer may be another bot's.
 - A tool is taken for Lextrove's by its name, on any MCP server. On a limited turn another server's `list_messages` or `get_contact` gets the same refusal.
 
 ### What doesn't change
@@ -343,6 +344,7 @@ As above: this stops a confused model, not a hostile one. [What this does not st
 - **A host that can't run the hooks keeps the turn.** Unlike a summon, the turn isn't dropped, because that would silence the bot for everyone. Reads are as wide as they were before this scope, and the log has one ERROR: `chat read scope cannot be enforced on this host`.
 - **`execute_code` without the middleware.** Its tool calls are found by the ids that the `llm_request` middleware binds. On a host without it, only the context variables are left, which don't reach that thread.
 - **Two bots in one chat on one gateway.** A subagent finds its scope by the chat alone, so during an overlap it can get the other bot's session. It is still that chat.
+- **`chatlytics_read` on an extra bot.** An ordinary turn's tools use the primary's bearer, and the hub pins a read to the bearer's session. So on a gateway with several bots, an extra bot's turn reads this chat id as the primary's number sees it. On the legacy operator key the tool names no session, so the hub reads on its default account. See row C5.
 
 ### The log
 
@@ -384,3 +386,4 @@ What can't be decided without a real hub and real accounts. Each row says what d
 | C2 | The owner types the trigger in a group where the bot's own account is a member. Same question. | The same as C1, with the text tagged `[owner reply]`. The reply leaves from the bot's number. |
 | C3 | Someone other than the owner DMs the bot. Same question, then ask about the DM itself. | The wide read is refused, and the read of this DM on the bot's session runs. The turn still has its earlier history. |
 | C4 | The owner DMs the bot from their usual device. Have the model read `session: all`. | The log has `no chat scope, the owner's own DM`, and the read runs. If it has `chat scope opened` instead, the hub delivered a form that isn't listed: compare `sender_jid` and `entity_jid` with `allow_admin_from`. |
+| C5 | On a bot with no Lextrove server, a group member triggers the bot and asks what was said here. Have the model call `chatlytics_read` with the group's JID, then with another chat's id, then with a contact's name. On a gateway with several bots, repeat on an extra bot. | The first returns this group's messages and only them, and the log has `chat read allowed kind=chat tool=chatlytics_read`. The other two return no messages, and the log has `chat read refused kind=chat tool=chatlytics_read reason=chat_not_summon`. On the extra bot, record whose view of the chat came back. |

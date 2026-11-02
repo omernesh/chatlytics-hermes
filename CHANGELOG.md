@@ -36,9 +36,11 @@
   group with the bot, may read only its chat on the bot's own session, under the same checks as a summon. It
   keeps its session, history, memory, account and send tools. The owner is the existing `allow_admin_from`
   check, so **a bot with no `allow_admin_from` is limited on every turn**, and an owner reached under an
-  unlisted `@lid` or `@c.us` form is limited in that DM. On a limited turn `chatlytics_read`, the hub's
-  `read_messages` and `session_search` are refused, and another MCP server's tool with a Lextrove tool's name
-  gets the same refusal. Telegram, CLI and cron turns are not affected. See docs/summoned-turns.md.
+  unlisted `@lid` or `@c.us` form is limited in that DM. On a limited turn the plugin's `chatlytics_read` runs
+  for this chat, by its id, so a bot with no Lextrove server still reads its own chat, and is refused for any
+  other chat, a name or no chat. It stays refused on a summon. The hub's `read_messages` and `session_search`
+  are refused, and another MCP server's tool with a Lextrove tool's name gets the same refusal. Telegram, CLI
+  and cron turns are not affected. See docs/summoned-turns.md.
 - **Summon and limited turns don't repeat ids to people** (chatlytics#956). Their prompt lines say to call a
   limit "this chat" and never to repeat session ids or phone numbers. A tool's refusal keeps the ids, for the
   model's next call.

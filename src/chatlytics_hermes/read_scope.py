@@ -40,6 +40,8 @@ has ``kind`` chat, lives in its own tables, its key is not in the summon format,
 near ``source.thread_id``. A hook finds it by the ids bound from its own line
 (:func:`note_chat_request`), or by the chat in the gateway's context variables, which is what reaches
 a delegated subagent. Turns with no Chatlytics context (Telegram, CLI, cron) never reach any of this.
+Its one read a summon doesn't have is the plugin's ``chatlytics_read`` of this chat: see
+:func:`_plugin_read_problem`.
 """
 
 from __future__ import annotations
@@ -897,6 +899,10 @@ LEXTROVE_RULES: Dict[str, Callable[[Mapping[str, Any], SummonScope], Optional[st
 _ALWAYS_REFUSED = {"session_search": "transcripts_of_other_chats"}
 # The hub's read of the bot's own number: another account, by name under either surface.
 _CHATLYTICS_READS = frozenset({"chatlytics_read", "read_messages"})
+_PLUGIN_READ = "chatlytics_read"
+_PLUGIN_READ_ARGS = frozenset({"chatId", "limit"})
+# An id, as the hub's looksLikeJidOrPhone means it. Its readMessages passes chatId to the transport as written.
+_CHAT_ID_FORM = re.compile(r"\+?[0-9]{6,}|\S+@\S+")
 _CHATLYTICS_DISPATCH = frozenset({"chatlytics_dispatch", "chatlytics_dispatch_action"})
 _READ_ACTION = re.compile(r"^(get|read|list|search|fetch|export|find|load)|messages|history|overview", re.IGNORECASE)
 # DO NOT REMOVE a name without reading src/mcp-server.ts on the hub. Every tool there that can send or
@@ -1008,6 +1014,36 @@ def _as_args(raw: Any) -> Optional[Dict[str, Any]]:
     return {k: v for k, v in raw.items() if v is not None}
 
 
+def _is_plugin_read(tool_name: Any) -> bool:
+    base, is_mcp = _base_name(tool_name)
+    return base == _PLUGIN_READ and not is_mcp
+
+
+def _plugin_read_problem(args: Optional[Mapping[str, Any]], scope: SummonScope) -> Optional[str]:
+    """A limited turn's ``chatlytics_read``: this chat by an id form, and nothing else.
+
+    A bot's reading of its own chat is core behaviour for a bot without Lextrove. DO NOT let a summon or
+    an MCP tool reach this: a summon's chat is on the owner's number and this reads the bot's, and an MCP
+    server's bearer may be another bot's. DO NOT drop the id form: ``send_target`` reads a spaced phone as
+    this chat, which suits a send, but here the hub doesn't resolve anything: it reads the string it is
+    given. There is no result check to add: the hub's rows have no chat field (``readMessages`` in its
+    channel.ts). That the id alone keeps a read in this chat is from the source: see row C5.
+    """
+    if scope.session is None:
+        return "no_scope_for_this_turn"
+    if args is None:
+        return "args_unreadable"
+    problem = _unknown_args(args, _PLUGIN_READ_ARGS)
+    if problem:
+        return problem
+    if "chatId" not in args:
+        return "chat_missing"
+    chat = args["chatId"]
+    if not isinstance(chat, str) or _CHAT_ID_FORM.fullmatch(chat) is None or not chat_in_scope(scope, chat):
+        return "chat_not_summon"
+    return None
+
+
 def _check_one(tool_name: Any, raw_args: Any, scope: SummonScope) -> Optional[Refusal]:
     label = _LOGGABLE_NAME.sub("?", str(tool_name or ""))[:64]
     base, is_mcp = _base_name(tool_name)
@@ -1043,6 +1079,9 @@ def _check_one(tool_name: Any, raw_args: Any, scope: SummonScope) -> Optional[Re
         return Refusal(_ALWAYS_REFUSED[base], label)
     verb = _chatlytics_verb(base, is_mcp)
     if verb in _CHATLYTICS_READS:
+        if scope.kind == KIND_CHAT and _is_plugin_read(tool_name):
+            reason = _plugin_read_problem(args, scope)
+            return Refusal(reason, label) if reason else None
         return Refusal("chatlytics_reads_another_account", label)
     if verb in _CHATLYTICS_DISPATCH:
         action = (args or {}).get("action")
@@ -1065,13 +1104,15 @@ def _check_one(tool_name: Any, raw_args: Any, scope: SummonScope) -> Optional[Re
 def _how_to_read(scope: SummonScope) -> str:
     if scope.session is None:
         return "This turn has no readable chat."
+    # A bot with no Lextrove has only this one, and must be told: the line below names tools it doesn't have.
+    plugin = f"To read this chat use chatlytics_read with chatId {scope.chat_id}. " if scope.kind == KIND_CHAT else ""
     if scope.is_group:
-        return (f"To read this chat use list_messages with chat_id {scope.chat_id} and session {scope.session}, "
+        return (f"{plugin}To read this chat use list_messages with chat_id {scope.chat_id} and session {scope.session}, "
                 f"or search_messages with group_name {scope.chat_id}, session {scope.session} and mode fts.")
     if scope.phone:
-        return (f"To read this chat use search_messages with contact_name {scope.phone}, chat_type dm, "
+        return (f"{plugin}To read this chat use search_messages with contact_name {scope.phone}, chat_type dm, "
                 f"session {scope.session}, mode fts and no query.")
-    return f"To read this chat use list_messages with chat_id {scope.chat_id} and session {scope.session}."
+    return f"{plugin}To read this chat use list_messages with chat_id {scope.chat_id} and session {scope.session}."
 
 
 def _refusal_text(reason: str, scope: SummonScope) -> str:
@@ -1129,7 +1170,7 @@ def pre_tool_call(
         )
         return {"action": "block", "message": _refusal_text("check_failed", scope)}
     if refusal is None:
-        if _lextrove_tool(tool_name) is not None:
+        if _lextrove_tool(tool_name) is not None or _is_plugin_read(tool_name):
             logger.info("chatlytics#956: %s allowed%s tool=%s scope=%s turn=%s", _read_label(scope), _kind_tag(scope),
                         _LOGGABLE_NAME.sub("?", str(tool_name))[:64], scope.key, turn_id)
         return None
