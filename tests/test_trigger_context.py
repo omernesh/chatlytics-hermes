@@ -77,6 +77,21 @@ async def test_from_me_group_reaches_the_model_with_the_group_audience() -> None
 
 
 @pytest.mark.parametrize("name", ["from_me_dm", "from_me_group"])
+async def test_history_instruction_points_at_a_session_archive_not_chatlytics_read(
+    name: str,
+) -> None:
+    env = ENVELOPES[name]
+    prompt = _prompt(await _dispatch(_adapter(), dict(env)))
+
+    assert f"list_messages with chat_id {env['entity_jid']} and session {env['session_id']}" in prompt
+    assert "chatlytics_read only reads your own number" in prompt
+    assert "do not use it here" in prompt
+    assert "say you cannot read this chat" in prompt
+    # The old wording promised a read chatlytics_read cannot do.
+    assert "read history for chat id" not in prompt
+
+
+@pytest.mark.parametrize("name", ["from_me_dm", "from_me_group"])
 async def test_context_stays_out_of_the_message_text_and_native_metadata(
     hermes_0225: Any, name: str  # noqa: F811
 ) -> None:
