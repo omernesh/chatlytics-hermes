@@ -337,6 +337,33 @@ def turn_key_for_tool(task_id: Any) -> Optional[str]:
     return LOST_KEY if scope is _NO_SCOPE else scope.key
 
 
+def profile_key(name: Any) -> str:
+    """A profile's name as the live adapters are keyed: "" for the primary, however it is spelled.
+
+    The host calls the primary's profile "default" or nothing (``set_owner_profile``).
+    """
+    text = name.strip() if isinstance(name, str) else ""
+    return "" if text == "default" else text
+
+
+def tool_turn_profile() -> Optional[str]:
+    """The :func:`profile_key` of the turn a tool runs in, or None when nothing says.
+
+    The host binds ``source.profile or ""``, so on a turn of the primary the profile is empty and the
+    platform is what shows a turn is bound. DO NOT read an empty profile alone as the primary: a cron job
+    binds no platform and may belong to any profile. A surface with no platform (TUI, desktop) names its
+    profile.
+    """
+    try:
+        from gateway.session_context import get_session_env
+    except ImportError:
+        return None
+    profile = profile_key(get_session_env("HERMES_SESSION_PROFILE", ""))
+    if profile:
+        return profile
+    return "" if (get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip() else None
+
+
 def _norm(value: Any) -> Optional[str]:
     return value.strip().casefold() if isinstance(value, str) and value.strip() else None
 

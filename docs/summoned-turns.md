@@ -151,9 +151,19 @@ DM, even to say something that was meant for another chat of theirs: use an ordi
 **Several bots on one gateway.** Everything a summon sends uses the bearer it arrived on: the reply,
 media, typing, the bubble, and the `chatlytics_*` tools, whichever chat they send to, each naming that
 bot's own session when it isn't the summon's. With another bot's bearer the hub would move the send to
-that bot's number. A summon doesn't move the chat's other sends to its bot, and an ordinary turn's tools
-stay on the primary as before. A `/retry` of a summon takes the bearer of the summon it repeats. If that
-isn't known and the gateway has several bots, the retry is refused, with an ERROR in the log.
+that bot's number. A summon doesn't move the chat's other sends to its bot, and within one adapter an
+ordinary turn's tools stay on its primary bot as before. A `/retry` of a summon takes the bearer of the
+summon it repeats. If that isn't known and the gateway has several bots, the retry is refused, with an
+ERROR in the log.
+
+With `multiplex_profiles`, each profile has its own adapter, and a tool runs on the adapter of its own
+turn. A summon's tools find theirs by the scope key. If that adapter is gone, as after a disconnect or a
+restart, every `chatlytics_*` tool of the summon is refused and nothing is sent. An ordinary turn's tools
+find theirs by `HERMES_SESSION_PROFILE`. They use the last-connected adapter, as they did before, only when
+nothing names a profile (a cron job) or the profile has no connected adapter. So an ordinary turn whose own
+adapter is reconnecting, or a route that runs a bot's turn under a profile with no adapter, can still use
+another bot's bearer. A gateway with one adapter is not affected. The host's `send_message` doesn't use any
+of this: it resolves the active profile's adapter itself.
 
 On the legacy operator-key path a summon names its session and leaves the chat's session alone. This
 needs a hub that marks summons with `trigger_source` (6.247.0 or later).

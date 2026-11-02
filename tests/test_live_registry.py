@@ -14,22 +14,31 @@ ctx probes; ``disconnect()`` unregisters (identity-guarded).
 
 from __future__ import annotations
 
+import asyncio
 import json
-from typing import Any, Dict
+import logging
+from types import SimpleNamespace
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 import pytest
 import respx
+from gateway import session_context as sc
 
+from chatlytics_hermes import read_scope
 from chatlytics_hermes.adapter import (
     ChatlyticsAdapter,
     _LIVE_ADAPTERS,
+    _LIVE_BY_PROFILE,
     _make_tool_handler,
     _register_live_adapter,
+    _SUMMON_ADAPTERS,
     _unregister_live_adapter,
 )
-from chatlytics_hermes.tools import chatlytics_health, chatlytics_login
+from chatlytics_hermes.tools import TOOLS, chatlytics_health, chatlytics_login, chatlytics_send
 from tests._fixtures import FakePlatformConfig
+from tests.test_summon_outbound import _adapter, _deliver, _Hub
+from tests.test_trigger_context import ENVELOPES, OWNER_SESSION, PEER
 
 pytestmark = pytest.mark.asyncio
 
@@ -213,3 +222,315 @@ async def test_degraded_no_credential_connect_registers() -> None:
     assert payload["success"] is False
     await adapter.disconnect()
     assert "chatlytics" not in _LIVE_ADAPTERS
+
+
+# --- chatlytics#956: a tool runs on the adapter of its own turn ---------------------------------
+#
+# Each profile of a gateway with multiplex_profiles has its own adapter, and the last to connect held
+# the slot. A summon on bot A sent with bot B's bearer, and the hub re-pinned it to B's number.
+
+ALPHA_SESSION = "11111111_alpha"
+BRAVO_SESSION = "22222222_bravo"
+
+
+@pytest.fixture
+def _clean_scopes() -> Any:
+    yield
+    read_scope._bound.clear()
+    read_scope._scopes.clear()
+
+
+def _profile_bot(profile: Optional[str], session: str, *, live: bool = True) -> Tuple[Any, Any, Any]:
+    adapter, hub, conn = _adapter(_Hub(own=session), own=session)
+    if profile:
+        adapter.set_owner_profile(profile)
+    if live:
+        _register_live_adapter(adapter)
+    return adapter, hub, conn
+
+
+def _send_tool(ctx: Any = None) -> Any:
+    return _make_tool_handler(ctx or _BareCtx(), "chatlytics_send", chatlytics_send)
+
+
+async def _in_session(call: Any, **bound: Any) -> Any:
+    """``call`` in a task of its own, with exactly these session variables, as the gateway binds them."""
+
+    async def run() -> Any:
+        sc.reset_session_vars()
+        if bound:
+            sc.set_session_vars(**bound)
+        return await call()
+
+    return await asyncio.create_task(run())
+
+
+async def _on_route(adapter: Any, hub: Any, conn: Any) -> str:
+    summon = await _deliver(adapter, ENVELOPES["from_me_dm"], conn)
+    hub.routes[PEER] = OWNER_SESSION
+    return summon.source.thread_id
+
+
+@pytest.mark.parametrize("profile", ["alpha", ""])
+async def test_a_summons_tool_uses_its_own_adapter_when_another_connected_last(
+    profile: str, _clean_scopes: Any
+) -> None:
+    alpha, alpha_hub, alpha_conn = _profile_bot("alpha", ALPHA_SESSION)
+    key = await _on_route(alpha, alpha_hub, alpha_conn)
+    _, bravo_hub, _ = _profile_bot("bravo", BRAVO_SESSION)
+    tool = _send_tool()
+    out = await _in_session(
+        lambda: tool({"chatId": PEER, "text": "x"}), platform="chatlytics", thread_id=key, profile=profile
+    )
+    assert json.loads(out)["success"] is True
+    assert alpha_hub.left == [(OWNER_SESSION, PEER, "x")]
+    assert alpha_hub.bodies[0][1]["session"] == OWNER_SESSION
+    assert bravo_hub.bodies == []
+
+
+async def test_a_summons_tool_found_by_its_task_id_uses_its_own_adapter(_clean_scopes: Any) -> None:
+    alpha, alpha_hub, alpha_conn = _profile_bot("alpha", ALPHA_SESSION)
+    key = await _on_route(alpha, alpha_hub, alpha_conn)
+    _, bravo_hub, _ = _profile_bot("bravo", BRAVO_SESSION)
+    read_scope.note_request(True, f"x:{key}", "s1", "task-1")
+    tool = _send_tool()
+    await _in_session(lambda: tool({"chatId": PEER, "text": "x"}, task_id="task-1"))
+    assert alpha_hub.left == [(OWNER_SESSION, PEER, "x")] and bravo_hub.bodies == []
+
+
+@pytest.mark.parametrize(
+    "platform,profile,expected",
+    [
+        ("chatlytics", "alpha", "alpha"),
+        ("chatlytics", "bravo", "bravo"),
+        ("chatlytics", "", "primary"),
+        ("chatlytics", "default", "primary"),
+        # A turn of that profile on another platform, or on a surface with no platform.
+        ("telegram", "alpha", "alpha"),
+        ("telegram", "", "primary"),
+        ("", "alpha", "alpha"),
+    ],
+)
+async def test_an_ordinary_turns_tool_uses_its_profiles_adapter(platform: str, profile: str, expected: str) -> None:
+    primary, primary_hub, _ = _profile_bot(None, "33333333_primary")
+    alpha, alpha_hub, _ = _profile_bot("alpha", ALPHA_SESSION)
+    bravo, bravo_hub, _ = _profile_bot("bravo", BRAVO_SESSION)
+    hubs = {"primary": primary_hub, "alpha": alpha_hub, "bravo": bravo_hub}
+    sessions = {"primary": "33333333_primary", "alpha": ALPHA_SESSION, "bravo": BRAVO_SESSION}
+    tool = _send_tool()
+    await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), platform=platform, profile=profile)
+    for name, hub in hubs.items():
+        assert len(hub.bodies) == (1 if name == expected else 0), name
+    assert hubs[expected].left == [(sessions[expected], PEER, "x")]
+
+
+@pytest.mark.parametrize(
+    "bound",
+    [
+        {},  # no session context at all
+        {"platform": "chatlytics", "profile": "no-such-profile"},
+        {"platform": "", "profile": ""},  # a cron job binds neither, and may be any profile's
+    ],
+)
+async def test_an_ordinary_turn_with_no_adapter_for_its_profile_uses_the_slot(bound: Dict[str, str]) -> None:
+    _, primary_hub, _ = _profile_bot(None, "33333333_primary")
+    _, last_hub, _ = _profile_bot("bravo", BRAVO_SESSION)
+    tool = _send_tool()
+    await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), **bound)
+    assert len(last_hub.bodies) == 1 and primary_hub.bodies == []
+
+
+async def test_a_ctx_entry_without_an_adapter_still_picks_the_turns_profile() -> None:
+    _, alpha_hub, _ = _profile_bot("alpha", ALPHA_SESSION)
+    _, bravo_hub, _ = _profile_bot("bravo", BRAVO_SESSION)
+    ctx = SimpleNamespace(platforms={"chatlytics": SimpleNamespace(adapter=None)})
+    tool = _send_tool(ctx)
+    await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), platform="chatlytics", profile="alpha")
+    assert len(alpha_hub.bodies) == 1 and bravo_hub.bodies == []
+
+
+async def test_a_summon_with_no_owning_adapter_is_refused_and_nothing_is_sent(caplog: Any) -> None:
+    _, alpha_hub, _ = _profile_bot("alpha", ALPHA_SESSION)
+    _, bravo_hub, _ = _profile_bot("bravo", BRAVO_SESSION)
+    tool = _send_tool()
+    caplog.set_level(logging.ERROR)
+    out = await _in_session(
+        lambda: tool({"chatId": PEER, "text": "x"}),
+        platform="chatlytics", profile="alpha", thread_id=read_scope.LOST_KEY,
+    )
+    assert json.loads(out) == {"success": False, "error": read_scope.SummonScopeLost.error}
+    assert alpha_hub.bodies == [] and bravo_hub.bodies == []
+    assert "summon send refused, summon_scope_lost" in caplog.text
+
+
+async def test_every_tool_refuses_a_summon_with_no_owning_adapter() -> None:
+    _, hub, _ = _profile_bot("alpha", ALPHA_SESSION)
+    assert len(TOOLS) == 24
+    for name, _schema, handler in TOOLS:
+        tool = _make_tool_handler(_BareCtx(), name, handler)
+        out = await _in_session(lambda: tool({}), platform="chatlytics", thread_id=read_scope.LOST_KEY)
+        assert json.loads(out) == {"success": False, "error": read_scope.SummonScopeLost.error}, name
+    assert hub.bodies == []
+
+
+async def test_a_summon_whose_adapter_disconnected_is_refused_and_doesnt_use_the_slot(_clean_scopes: Any) -> None:
+    alpha, alpha_hub, alpha_conn = _profile_bot("alpha", ALPHA_SESSION)
+    key = await _on_route(alpha, alpha_hub, alpha_conn)
+    _, bravo_hub, _ = _profile_bot("bravo", BRAVO_SESSION)
+    _unregister_live_adapter(alpha)
+    tool = _send_tool()
+    out = await _in_session(
+        lambda: tool({"chatId": PEER, "text": "x"}), platform="chatlytics", profile="alpha", thread_id=key
+    )
+    assert json.loads(out)["error"] == read_scope.SummonScopeLost.error
+    assert alpha_hub.bodies == [] and bravo_hub.bodies == []
+
+
+async def test_a_media_tool_gets_the_summons_adapter_and_its_client(_clean_scopes: Any) -> None:
+    alpha, alpha_hub, alpha_conn = _profile_bot("alpha", ALPHA_SESSION)
+    key = await _on_route(alpha, alpha_hub, alpha_conn)
+    _profile_bot("bravo", BRAVO_SESSION)
+    seen: Dict[str, Any] = {}
+
+    async def _media(client: Any, adapter: Any = None) -> Dict[str, Any]:
+        seen.update(client=client, adapter=adapter)
+        return {"success": True}
+
+    tool = _make_tool_handler(_BareCtx(), "chatlytics_send_image", _media)
+    await _in_session(lambda: tool({}), platform="chatlytics", thread_id=key)
+    assert seen == {"client": alpha_hub, "adapter": alpha}
+
+
+async def test_the_summon_owners_are_bounded_like_the_scopes(
+    monkeypatch: pytest.MonkeyPatch, _clean_scopes: Any
+) -> None:
+    monkeypatch.setattr(read_scope, "_SCOPES_MAX", 3)
+    alpha, _, conn = _profile_bot("alpha", ALPHA_SESSION)
+    for _i in range(5):
+        await _deliver(alpha, ENVELOPES["from_me_dm"], conn)
+    assert len(_SUMMON_ADAPTERS) == 3
+    assert list(_SUMMON_ADAPTERS) == list(read_scope._scopes)
+
+
+async def test_a_summon_stays_on_its_adapters_turns() -> None:
+    alpha, _, conn = _profile_bot("alpha", ALPHA_SESSION)
+    bravo, _, _ = _profile_bot("bravo", BRAVO_SESSION)
+    summon = await _deliver(alpha, ENVELOPES["from_me_dm"], conn)
+    assert summon.source.thread_id in alpha._summon_turns and bravo._summon_turns == {}
+    read_scope._scopes.clear()
+
+
+async def test_a_reconnect_moves_the_profiles_entry_to_the_new_adapter() -> None:
+    old, old_hub, _ = _profile_bot("alpha", ALPHA_SESSION)
+    _, bravo_hub, _ = _profile_bot("bravo", BRAVO_SESSION)
+    new, new_hub, _ = _profile_bot("alpha", ALPHA_SESSION)
+    _register_live_adapter(_profile_bot("bravo", BRAVO_SESSION, live=False)[0])
+    _unregister_live_adapter(old)  # the old one's late disconnect leaves the new one's entry
+    tool = _send_tool()
+    await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), platform="chatlytics", profile="alpha")
+    assert len(new_hub.bodies) == 1 and old_hub.bodies == [] and bravo_hub.bodies == []
+
+
+async def test_an_adapter_that_changes_profile_leaves_its_old_entry() -> None:
+    alpha, alpha_hub, _ = _profile_bot("alpha", ALPHA_SESSION)
+    _, bravo_hub, _ = _profile_bot("bravo", BRAVO_SESSION)
+    alpha.set_owner_profile("charlie")
+    _register_live_adapter(alpha)
+    _register_live_adapter(_profile_bot("bravo", BRAVO_SESSION, live=False)[0])
+    tool = _send_tool()
+    await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), platform="chatlytics", profile="alpha")
+    assert alpha_hub.bodies == []  # alpha's entry is gone, so this is the slot
+    await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), platform="chatlytics", profile="charlie")
+    assert len(alpha_hub.bodies) == 1 and bravo_hub.bodies == []
+
+
+async def test_a_disconnected_profile_is_never_chosen() -> None:
+    alpha, alpha_hub, _ = _profile_bot("alpha", ALPHA_SESSION)
+    bravo, bravo_hub, _ = _profile_bot("bravo", BRAVO_SESSION)
+    tool = _send_tool()
+    # The slot's holder goes first: alpha's turn keeps alpha, a turn of nothing known has no adapter.
+    _unregister_live_adapter(bravo)
+    await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), platform="chatlytics", profile="alpha")
+    assert len(alpha_hub.bodies) == 1
+    out = await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), platform="chatlytics", profile="bravo")
+    assert "not connected" in json.loads(out)["error"] and bravo_hub.bodies == []
+    out = await _in_session(lambda: tool({"chatId": PEER, "text": "x"}))
+    assert "not connected" in json.loads(out)["error"]
+    _unregister_live_adapter(alpha)
+    out = await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), platform="chatlytics", profile="alpha")
+    assert "not connected" in json.loads(out)["error"] and len(alpha_hub.bodies) == 1
+
+
+async def test_a_superseded_adapters_disconnect_doesnt_remove_the_newer_one_of_its_profile() -> None:
+    old, _, _ = _profile_bot("alpha", ALPHA_SESSION)
+    new, new_hub, _ = _profile_bot("alpha", ALPHA_SESSION)
+    _unregister_live_adapter(old)
+    assert _LIVE_BY_PROFILE["alpha"] is new
+    tool = _send_tool()
+    await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), platform="chatlytics", profile="alpha")
+    assert len(new_hub.bodies) == 1
+
+
+@pytest.mark.parametrize(
+    "bound",
+    [
+        {},
+        {"platform": "chatlytics"},
+        {"platform": "telegram", "profile": "routed-elsewhere"},
+    ],
+)
+async def test_one_adapter_behaves_as_it_did(bound: Dict[str, str], _clean_scopes: Any) -> None:
+    adapter, hub, conn = _profile_bot(None, ALPHA_SESSION)
+    tool = _send_tool()
+    await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), **bound)
+    assert hub.left == [(ALPHA_SESSION, PEER, "x")]
+    key = await _on_route(adapter, hub, conn)
+    await _in_session(lambda: tool({"chatId": PEER, "text": "y"}), **{**bound, "thread_id": key})
+    assert hub.left[-1] == (OWNER_SESSION, PEER, "y")
+    _unregister_live_adapter(adapter)
+    out = await _in_session(lambda: tool({"chatId": PEER, "text": "z"}), **bound)
+    assert "not connected" in json.loads(out)["error"]
+
+
+async def test_two_connected_gateways_send_on_the_bearer_of_the_turns_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Through real connect() and disconnect(), read at the request's Authorization header."""
+    token_a, token_b = "sk_bot_" + "A" * 43, "sk_bot_" + "B" * 43
+
+    async def _idle(_self: Any, _conn: Any) -> None:
+        # This test is about the bearer. Two real poll loops against respx hung it.
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(ChatlyticsAdapter, "_inbound_loop", _idle)
+
+    def _make(token: str, profile: str) -> ChatlyticsAdapter:
+        adapter = ChatlyticsAdapter(
+            FakePlatformConfig(extra={"base_url": BASE_URL, "bot_token": token, "inbound_mode": "longpoll"})
+        )
+        adapter.set_owner_profile(profile)
+        return adapter
+
+    alpha, bravo = _make(token_a, "alpha"), _make(token_b, "bravo")
+    tool = _send_tool()
+    with respx.mock(base_url=BASE_URL, assert_all_called=False) as router:
+        _mock_gateway(router)
+        send = router.post("/api/v1/send").mock(return_value=httpx.Response(200, json={"success": True}))
+        assert await alpha.connect() is True
+        assert await bravo.connect() is True
+
+        await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), platform="chatlytics", profile="alpha")
+        assert send.calls[-1].request.headers["authorization"] == f"Bearer {token_a}"
+        await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), platform="chatlytics", profile="bravo")
+        assert send.calls[-1].request.headers["authorization"] == f"Bearer {token_b}"
+
+        # bravo goes down: alpha keeps its own bearer, and nothing closed is chosen.
+        await bravo.disconnect()
+        await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), platform="chatlytics", profile="alpha")
+        assert send.calls[-1].request.headers["authorization"] == f"Bearer {token_a}"
+        calls = len(send.calls)
+        out = await _in_session(lambda: tool({"chatId": PEER, "text": "x"}), platform="chatlytics", profile="bravo")
+        assert "not connected" in json.loads(out)["error"] and len(send.calls) == calls
+
+        await alpha.disconnect()
+    assert _LIVE_BY_PROFILE == {}

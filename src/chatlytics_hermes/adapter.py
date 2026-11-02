@@ -1610,6 +1610,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # and its owner, and would leave on the chat's bot.
         while len(self._summon_turns) > read_scope._SCOPES_MAX:
             self._summon_turns.popitem(last=False)
+        _note_summon_adapter(scope.key, self)
         return scope, None
 
     def _conn_of_earlier_summon(self, env: Dict[str, Any]) -> Optional["_BotConn"]:
@@ -5568,16 +5569,57 @@ async def _standalone_send(text: str, **kwargs: Any) -> Dict[str, Any]:
 # prevents an overlapping reconnect from clobbering the live entry.
 _LIVE_ADAPTERS: Dict[str, "ChatlyticsAdapter"] = {}
 
+# chatlytics#956: DO NOT resolve a tool's adapter from the slot alone. With ``multiplex_profiles`` each
+# profile has its own adapter and the last to connect holds the slot, so every profile's tools ran on
+# that one bot's bearer. A summon's send named the right session, the hub re-pinned it to the bearer's
+# bot, and only a missing pairing stopped it leaving from the wrong number. So a tool takes the adapter
+# of its own turn: a summon by its scope key, any other turn by its profile.
+_LIVE_BY_PROFILE: Dict[str, "ChatlyticsAdapter"] = {}
+_SUMMON_ADAPTERS: "OrderedDict[str, ChatlyticsAdapter]" = OrderedDict()
+
 
 def _register_live_adapter(adapter: "ChatlyticsAdapter") -> None:
-    """Record ``adapter`` as the process-wide live chatlytics adapter."""
+    """Record ``adapter`` as the process-wide live chatlytics adapter, and as its profile's."""
     _LIVE_ADAPTERS["chatlytics"] = adapter
+    for profile in [p for p, live in _LIVE_BY_PROFILE.items() if live is adapter]:
+        _LIVE_BY_PROFILE.pop(profile, None)
+    _LIVE_BY_PROFILE[read_scope.profile_key(getattr(adapter, "_owner_profile", None))] = adapter
 
 
 def _unregister_live_adapter(adapter: "ChatlyticsAdapter") -> None:
-    """Drop ``adapter`` from the registry — only if it is still the live one."""
+    """Drop ``adapter`` from the registry — only if it is still the live one.
+
+    The summons it owns go with it. The same keys after a reconnect are refused, which costs a tool call;
+    a closed client or another bot's bearer would cost more. A newer adapter of the profile keeps its entry.
+    """
     if _LIVE_ADAPTERS.get("chatlytics") is adapter:
         _LIVE_ADAPTERS.pop("chatlytics", None)
+    for profile in [p for p, live in _LIVE_BY_PROFILE.items() if live is adapter]:
+        _LIVE_BY_PROFILE.pop(profile, None)
+    for key in [k for k, owner in _SUMMON_ADAPTERS.items() if owner is adapter]:
+        _SUMMON_ADAPTERS.pop(key, None)
+
+
+def _note_summon_adapter(key: str, adapter: "ChatlyticsAdapter") -> None:
+    """Record which adapter owns this summon. Process-wide, unlike ``_summon_turns``, which ``/stop`` and
+    ``/retry`` read as this adapter's own.
+
+    DO NOT shorten below the scopes': a summon with a scope and no entry here is refused its tools.
+    """
+    _SUMMON_ADAPTERS[key] = adapter
+    while len(_SUMMON_ADAPTERS) > read_scope._SCOPES_MAX:
+        _SUMMON_ADAPTERS.popitem(last=False)
+
+
+def _live_adapter_of_turn() -> Optional["ChatlyticsAdapter"]:
+    """The adapter of the running turn's profile, else the slot.
+
+    The slot stays for a turn whose profile is unknown or has no adapter of its own (a cron job, a
+    Telegram profile with no Chatlytics). On a gateway with one adapter they are the same adapter.
+    """
+    profile = read_scope.tool_turn_profile()
+    adapter = _LIVE_BY_PROFILE.get(profile) if profile is not None else None
+    return adapter if adapter is not None else _LIVE_ADAPTERS.get("chatlytics")
 
 
 def _make_tool_handler(ctx: Any, name: str, handler: Any) -> Any:
@@ -5681,13 +5723,13 @@ def _make_tool_handler(ctx: Any, name: str, handler: Any) -> Any:
         if entry is None:
             # v4.5.2: real hermes PluginContexts (>=0.16) have neither
             # accessor — fall back to the registry connect() populates.
-            return _LIVE_ADAPTERS.get("chatlytics")
+            return _live_adapter_of_turn()
         # Both attribute and dict accessors used by various harnesses.
         adapter_inst = getattr(entry, "adapter", None)
         if adapter_inst is None and isinstance(entry, dict):
             adapter_inst = entry.get("adapter")
         if adapter_inst is None:
-            adapter_inst = _LIVE_ADAPTERS.get("chatlytics")
+            adapter_inst = _live_adapter_of_turn()
         return adapter_inst
 
     async def _bound(args: Optional[Dict[str, Any]] = None, **kwargs: Any) -> str:
@@ -5716,7 +5758,16 @@ def _make_tool_handler(ctx: Any, name: str, handler: Any) -> Any:
                 )
                 for _k in _dropped:
                     kwargs.pop(_k)
-        adapter_inst = _lookup_adapter()
+        # chatlytics#956: DO NOT let a summon fall back to the profile or the slot. Any other adapter's
+        # bearer moves its send to that bot's number, whichever session it names, so with no owner it stops.
+        if _turn_key:
+            adapter_inst = _SUMMON_ADAPTERS.get(_turn_key)
+            if adapter_inst is None:
+                _lost = read_scope.SummonScopeLost(_turn_key)
+                read_scope.log_send_refused(_lost, kwargs.get("chatId"), _turn_key)
+                return json.dumps({"success": False, "error": _lost.error}, ensure_ascii=False)
+        else:
+            adapter_inst = _lookup_adapter()
         # v4.1.5 (telegram-style onboarding): if the adapter loaded WITHOUT a
         # bot token (degraded no-credential state), every DATA tool returns the
         # relayable get-a-token prompt instead of a generic "not connected"

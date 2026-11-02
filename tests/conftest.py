@@ -87,9 +87,12 @@ def _clear_live_adapter_registry():
     """
     from chatlytics_hermes import adapter as _adapter_mod
 
-    _adapter_mod._LIVE_ADAPTERS.clear()
+    registries = (_adapter_mod._LIVE_ADAPTERS, _adapter_mod._LIVE_BY_PROFILE, _adapter_mod._SUMMON_ADAPTERS)
+    for registry in registries:
+        registry.clear()
     yield
-    _adapter_mod._LIVE_ADAPTERS.clear()
+    for registry in registries:
+        registry.clear()
 
 
 @pytest.fixture(scope="session", autouse=True)
