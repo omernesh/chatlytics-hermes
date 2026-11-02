@@ -12,8 +12,9 @@
   process can make a turn look summoned or hide one. A line pinned before a restart, which
   has the old token, is still treated as summoned and logged as an ERROR. The end of the
   memory blocks comes from the length in their headers, or on Anthropic OAuth, where the
-  host rewrites words in the prompt, from the host's own profile line. A block whose length
-  doesn't check out on any other route locks that request down to a fixed one-line prompt.
+  host rewrites words in the prompt, from the latest of the host's own lines that follow
+  memory; that route also loses the profile line. A block whose length doesn't check out on
+  any other route locks that request down to a fixed one-line prompt.
   Memory tools stay available, so the owner can still ask for something from memory.
 - **An unsigned webhook that says `trigger_source: from_me` now logs a warning.** Without a
   webhook secret the claim can't be verified, so that turn still gets no context line and no

@@ -29,8 +29,9 @@ they end. Each block's header carries the length of its content, computed by the
 can't compare against the store itself: it isn't given one, and a resumed session sends
 the prompt frozen when the session began, which differs from the store after any write.
 On Anthropic OAuth the host rewrites words in the prompt, so no length means anything:
-the cut there runs from the first header to the host's own profile line, which comes
-after every entry whatever an entry says.
+the cut there runs from the first header to the latest tail anchor (:func:`_tail_start`).
+Every entry comes before the host's own anchors, so an entry's copy of one can't be the
+latest while a real one exists. The profile line goes with the cut on that route.
 
 Fail closed, because a silent no-op after a hermes-agent upgrade is the main risk:
 
@@ -88,11 +89,19 @@ _BLOCK_HEADER = re.compile(
 )
 # What follows the memory parts in hermes-agent agent/system_prompt.py, in this order:
 # plugin sections (optional), profile line, date line, runtime section (optional).
+# A prompt frozen by an older host has no profile line. A timeless bot-chat prompt has a
+# timezone line in place of the date line.
 _RUNTIME_END = "<!-- End Hermes runtime environment -->"
 _RUNTIME_HEADING = re.compile(r"^# Hermes runtime environment", re.MULTILINE)
 _DATE_LINE = re.compile(r"^Conversation started:", re.MULTILINE)
-# Always written, and after every memory part, so the last one is past every entry.
+_ZONE_LINE = re.compile(r"^Timezone:", re.MULTILINE)
 _PROFILE_LINE = re.compile(r"^Active Hermes profile:", re.MULTILINE)
+# agent/system_prompt.py ``_timestamp_line``: only the host's own keys, so an entry's date line
+# with its text under it is not this.
+_STAMP_PARAGRAPH = re.compile(
+    r"(?:Conversation started:|Timezone:)[^\n]*"
+    r"(?:\n(?:Today's date \(|Session ID: |Model: |Provider: |Platform: )[^\n]*)*\n\n"
+)
 _PLUGIN_SECTIONS_START = "<!-- hermes-plugin-sections:start -->"
 _PLUGIN_SECTIONS_END = "<!-- hermes-plugin-sections:end -->\n\n"
 _SYSTEM_ROLES = frozenset({"system", "developer"})
@@ -255,18 +264,34 @@ def _memory_extent(text: str, limit: int) -> Optional[Tuple[int, int, int]]:
     return None if start is None or end is None else (start, end, blocks)
 
 
-def _tail_start(text: str, start: int, end: int) -> Optional[int]:
+def _tail_start(text: str, start: int, end: int, keep_profile: bool = True) -> Optional[int]:
     """Where the host's tail starts in ``text[start:end]``, past anything an entry can write.
 
-    The last profile line is the host's own, and it is written after every memory part. On a
-    host without one, the later of the last date line and runtime heading, which may lose the
-    date line; the earlier one could be an entry's.
+    No one anchor can be trusted alone: a host may not write that one, and then the last copy
+    is an entry's, with the rest of the entries after it. So the cut goes to the latest of all
+    four. The host writes each of them after every memory part, so that is past every entry as
+    long as the prompt holds any real one. A later copy in text past the tail only over-cuts.
+
+    From there it steps back over what the host joins directly before: the date or timezone
+    paragraph before the runtime section, when it holds only the host's keys, then, with
+    ``keep_profile``, a single profile line. A step back can't be told from an entry whose last
+    line copies that shape, so ``keep_profile`` is only for a caller that starts past the
+    entries. Neither 0.22.5 nor 2026.5.16 writes a prompt with no real anchor: a timeless prompt
+    has its timezone line, and an older one its date line.
     """
-    profile = _last(_PROFILE_LINE, text, start, end)
-    if profile is not None:
-        return profile.start()
-    found = [m.start() for p in (_DATE_LINE, _RUNTIME_HEADING) if (m := _last(p, text, start, end)) is not None]
-    return max(found) if found else None
+    marks = {p: m.start() for p in (_PROFILE_LINE, _DATE_LINE, _ZONE_LINE, _RUNTIME_HEADING)
+             if (m := _last(p, text, start, end)) is not None}
+    if not marks:
+        return None
+    at = max(marks.values())
+    stamp = max((marks[p] for p in (_DATE_LINE, _ZONE_LINE) if p in marks), default=None)
+    if at == marks.get(_RUNTIME_HEADING) and stamp is not None and _STAMP_PARAGRAPH.fullmatch(text, stamp, at):
+        at = stamp
+    profile = marks.get(_PROFILE_LINE)
+    if keep_profile and profile is not None and profile < at:
+        if text.endswith("\n\n", profile, at) and "\n" not in text[profile:at - 2]:
+            at = profile
+    return at
 
 
 def _block_end(text: str, after: int, limit: int, report: StripReport) -> int:
@@ -292,14 +317,15 @@ def _rewritten_extent(text: str, limit: int) -> Optional[Tuple[int, int, int]]:
     """The memory parts of a prompt the host rewrote, where no block length can be trusted.
 
     From the first header to the tail, so an entry's headers, dates and frames all go with it.
-    Plugin sections go too: an entry can imitate one, and here nothing says where it ended.
+    Plugin sections and the profile line go too: an entry can imitate either, and here nothing
+    says where the entries ended.
     """
     first = _BLOCK_HEADER.search(text, 0, limit)
     if _BLOCK_TITLE.search(text, 0, first.start() if first is not None else limit):
         raise MemoryShapeError("a memory block header without a length")
     if first is None:
         return None
-    end = _tail_start(text, first.end(), limit)
+    end = _tail_start(text, first.end(), limit, keep_profile=False)
     if end is None:
         raise MemoryShapeError("a rewritten prompt with no tail to cut to")
     return first.start(), end, sum(1 for _ in _BLOCK_HEADER.finditer(text, first.start(), end))

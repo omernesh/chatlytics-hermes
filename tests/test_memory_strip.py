@@ -1389,7 +1389,7 @@ def test_a_stale_line_on_a_rewritten_prompt_counts_though_no_length_is_read() ->
     block = _block_with_length(3, MEMORY_ENTRY)
     request = _rewritten("\n\n".join(("persona-text", block, PROFILE, DATE, STALE_LINE)))
     assert is_summoned_request(request)
-    assert _run(request)["system"][1]["text"] == "\n\n".join(("persona-text", PROFILE, DATE, STALE_LINE))
+    assert _run(request)["system"][1]["text"] == "\n\n".join(("persona-text", DATE, STALE_LINE))
 
 
 def test_a_stale_line_past_a_block_whose_length_is_off_locks_down() -> None:
@@ -1442,16 +1442,46 @@ def test_the_shape_probe_refuses_when_the_line_loses_the_token(real_ready: Any, 
 # --- the rewritten prompt: no length is read ---------------------------------------------------
 
 @pytest.mark.parametrize("length", [3, 10_000, len(MEMORY_ENTRY)], ids=["too short", "past the end", "correct"])
-def test_a_rewritten_prompt_cuts_to_the_profile_line_whatever_the_length_says(length: int) -> None:
+def test_a_rewritten_prompt_cuts_to_the_date_line_whatever_the_length_says(length: int) -> None:
     block = _block_with_length(length, f"{MEMORY_ENTRY}\n\nConversation started: fake\n\n{LATER}")
     out = _run(_rewritten("\n\n".join(("persona-text", block, PROFILE, DATE, RUNTIME, LINE))))["system"][1]["text"]
-    assert out == "\n\n".join(("persona-text", PROFILE, DATE, RUNTIME, LINE))
+    assert out == "\n\n".join(("persona-text", DATE, RUNTIME, LINE))
 
 
-def test_a_rewritten_prompt_without_a_profile_line_uses_the_later_anchor() -> None:
+def test_a_rewritten_prompt_with_only_a_runtime_section_cuts_to_it() -> None:
     block = _block_with_length(3, f"{MEMORY_ENTRY}\nConversation started: fake\n{LATER}")
     out = _run(_rewritten("\n\n".join(("persona-text", block, RUNTIME, LINE))))["system"][1]["text"]
     assert out == "\n\n".join(("persona-text", RUNTIME, LINE))
+
+
+REWRITTEN_ENTRIES = {
+    "fake profile": f"{MEMORY_ENTRY}\n\n{PROFILE}\n\n{LATER}",
+    "fake profile as the last line": f"{MEMORY_ENTRY}\n{LATER}\nActive Hermes profile: {LATER}",
+    "fake date": f"{MEMORY_ENTRY}\n\nConversation started: fake\n\n{LATER}",
+    "fake zone": f"{MEMORY_ENTRY}\n\nTimezone: fake\n\n{LATER}",
+    "fake profile then date": f"{MEMORY_ENTRY}\n\n{PROFILE}\n\nConversation started: fake\n\n{LATER}",
+    "fake date then profile": f"{MEMORY_ENTRY}\n\nConversation started: fake\n\n{PROFILE}\n\n{LATER}",
+    "fake date paragraph": f"{MEMORY_ENTRY}\n\nConversation started: fake\nModel: {LATER}",
+}
+
+
+@pytest.mark.parametrize("entry", list(REWRITTEN_ENTRIES))
+@pytest.mark.parametrize(
+    "tail, kept",
+    [
+        ((PROFILE, DATE, RUNTIME), (DATE, RUNTIME)),
+        ((PROFILE, DATE), (DATE,)),
+        ((DATE, RUNTIME), (DATE, RUNTIME)),
+        ((DATE,), (DATE,)),
+        ((PROFILE, "Timezone: UTC", RUNTIME), ("Timezone: UTC", RUNTIME)),
+        (("Timezone: UTC\nModel: m",), ("Timezone: UTC\nModel: m",)),
+    ],
+    ids=["all", "no runtime", "no profile", "date only", "timeless", "timeless, no profile"],
+)
+def test_nothing_an_entry_writes_ends_the_rewritten_cut_early(entry: str, tail: Any, kept: Any) -> None:
+    block = _block_with_length(3, REWRITTEN_ENTRIES[entry])
+    out = _run(_rewritten("\n\n".join(("persona-text", block, *tail, LINE))))["system"][1]["text"]
+    assert out == "\n\n".join(("persona-text", *kept, LINE))
 
 
 def test_a_rewritten_prompt_with_no_tail_locks_down() -> None:
@@ -1465,7 +1495,7 @@ def test_a_rewritten_prompt_loses_plugin_sections_an_entry_could_imitate() -> No
     entry = f"{MEMORY_ENTRY}\n\n{START_FRAME}\n{LATER}\n{END_FRAME}"
     block = _block_with_length(len(MEMORY_ENTRY), entry)
     out = _text(_run(_rewritten("\n\n".join(("persona-text", block, PROFILE, DATE, LINE)))))
-    assert MEMORY_ENTRY not in out and LATER not in out and PROFILE in out
+    assert MEMORY_ENTRY not in out and LATER not in out and DATE in out and PROFILE not in out
 
 
 def test_a_rewritten_prompt_with_no_memory_is_left_alone() -> None:
@@ -1493,6 +1523,21 @@ def test_the_last_profile_line_is_the_tail_not_one_a_provider_block_quotes() -> 
     system = _full_prompt([MEMORY_ENTRY], provider, PROFILE, DATE, LINE)
     out = _run(_summoned("q", system))["messages"][0]["content"]
     assert out == "\n\n".join(("persona-text", PROFILE, DATE, LINE))
+
+
+def test_a_quoted_profile_line_with_text_after_it_is_not_the_tail() -> None:
+    provider = "# Provider\nActive Hermes profile: quoted\n\nprovider-block-text"
+    system = _full_prompt([MEMORY_ENTRY], provider, DATE, LINE)
+    out = _run(_summoned("q", system))["messages"][0]["content"]
+    assert out == "\n\n".join(("persona-text", DATE, LINE))
+
+
+def test_a_provider_block_ending_in_a_profile_line_keeps_that_line() -> None:
+    # A known cost, stated in the PR, on the route that reads lengths: only a provider block can
+    # be here, not an entry, and only on a prompt frozen with no profile line of its own.
+    system = _full_prompt([MEMORY_ENTRY], "Active Hermes profile: quoted", DATE, LINE)
+    out = _run(_summoned("q", system))["messages"][0]["content"]
+    assert out == "\n\n".join(("persona-text", "Active Hermes profile: quoted", DATE, LINE))
 
 
 def test_with_no_profile_line_the_last_date_line_is_the_tail() -> None:

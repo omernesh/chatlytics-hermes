@@ -7,6 +7,8 @@ runs this file automatically: run it against the hermes-agent source a release t
 from __future__ import annotations
 
 import json
+import logging
+import re
 import types
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
@@ -518,7 +520,7 @@ def test_a_line_pinned_before_a_restart_fails_closed_on_the_real_oauth_transform
     system = _oauth_system(f"{agent._build_system_prompt()}\n\n{STALE_LINE}")
     out = host.chain({"model": "m", "system": system, "messages": [{"role": "user", "content": "q"}]}).payload
     agent._memory_store = None
-    assert out["system"] == _oauth_system(f"{agent._build_system_prompt()}\n\n{STALE_LINE}")
+    assert out["system"] == _oauth_system(f"{_without_profile_line(agent._build_system_prompt())}\n\n{STALE_LINE}")
 
 
 def test_the_real_host_pins_and_rehydrates_the_channel_prompt() -> None:
@@ -576,6 +578,14 @@ def _oauth_text(system: List[Dict[str, Any]]) -> str:
     return "\n\n".join(block["text"] for block in system)
 
 
+def _without_profile_line(prompt: str) -> str:
+    """The host's own profile line out of ``prompt``. An entry's is not matched: only the real one
+    says ``default.``. Used for what OAuth keeps, and for a prompt frozen by a host with no such line."""
+    cut, count = re.subn(r"^Active Hermes profile: default\.[^\n]*\n\n", "", prompt, flags=re.MULTILINE)
+    assert count == 1
+    return cut
+
+
 _TIMELESS_CASES = ["fake date", "date and marker", "grows onto a blank line, fake date"]
 
 
@@ -599,7 +609,7 @@ def test_the_real_oauth_transform_keeps_exactly_the_prompt_built_without_memory(
     for needle in needles:
         assert needle not in _text(out)
     agent._memory_store = None
-    assert out["system"] == _oauth_system(f"{agent._build_system_prompt()}\n\n{LINE}")
+    assert out["system"] == _oauth_system(f"{_without_profile_line(agent._build_system_prompt())}\n\n{LINE}")
 
     # The same stored text, not summoned: not one byte changes.
     ordinary = {"model": "m", "system": _oauth_system(prompt), "messages": [{"role": "user", "content": "q"}]}
@@ -640,7 +650,75 @@ def test_the_whole_real_oauth_request_builder(host: Any) -> None:
 
     assert "SEC-M1" not in out and "SEC-U1" not in out
     system = _oauth_text(result["system"])
-    assert LINE in system and "Conversation started" in system and "Active Hermes profile" in system
+    assert LINE in system and "Conversation started" in system and "Active Hermes profile" not in system
+
+
+# Run with the host's profile line and, for a session resumed from a host that wrote none, without it.
+FAKE_TAILS: Dict[str, Tuple[List[str], List[str]]] = {
+    "fake profile": (["SEC-M1", "Active Hermes profile: x", "SEC-M2"], ["SEC-U1"]),
+    "fake profile as the last entry": (["SEC-M1"], ["SEC-U1", "Active Hermes profile: SEC-P"]),
+    "fake date": (["SEC-M1", "Conversation started: x", "SEC-M2"], ["SEC-U1"]),
+    "fake date as the last entry": (["SEC-M1"], ["SEC-U1", "Conversation started: SEC-D"]),
+    "fake zone": (["SEC-M1", "Timezone: x", "SEC-M2"], ["SEC-U1"]),
+    "fake profile, then date": (["SEC-M1", "Active Hermes profile: x\n\nConversation started: y\n\nSEC-M2"], ["SEC-U1"]),
+    "fake date, then profile": (["SEC-M1", "Conversation started: y\n\nActive Hermes profile: x\n\nSEC-M2"], ["SEC-U1"]),
+    "rewritten name, fake profile, then date": (
+        ["SEC-M1 Hermes Agent", "Active Hermes profile: x\n\nConversation started: y\n\nSEC-M2"], ["SEC-U1"]),
+}
+
+
+@pytest.mark.parametrize("timeless", [False, True], ids=["dated", "timeless"])
+@pytest.mark.parametrize("real_profile", [False, True], ids=["no profile line", "profile line"])
+@pytest.mark.parametrize("name", list(FAKE_TAILS))
+def test_a_fake_tail_in_an_entry_never_ends_the_cut(
+    host: Any, name: str, real_profile: bool, timeless: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    memory, user = FAKE_TAILS[name]
+    agent = host.agent(memory, user, timeless=timeless)
+    built = agent._build_system_prompt()
+    prompt = built if real_profile else _without_profile_line(built)
+    needles = _needles(memory + user)
+    agent._memory_store = None
+    clean = agent._build_system_prompt()
+    assert ("Conversation started" in clean) != timeless and ("Timezone:" in clean) == timeless  # the real shape
+    for needle in needles:
+        assert needle in prompt  # the control
+
+    system = _oauth_system(f"{prompt}\n\n{LINE}")
+    with caplog.at_level(logging.WARNING, logger="chatlytics_hermes"):
+        oauth = host.chain({"model": "m", "system": system, "messages": [{"role": "user", "content": "q"}]}).payload
+        chat = host.chain(_system_request(f"{prompt}\n\n{LINE}")).payload["messages"][0]["content"]
+    for needle in needles:
+        assert needle not in _text(oauth) and needle not in chat
+    assert oauth["system"] == _oauth_system(f"{_without_profile_line(clean)}\n\n{LINE}")
+    assert chat == f"{clean if real_profile else _without_profile_line(clean)}\n\n{LINE}"
+    assert not [row for row in caplog.records if row.levelno >= logging.ERROR]
+
+
+def test_a_prompt_restored_with_no_profile_line_through_the_real_host(host: Any) -> None:
+    conversation_loop = pytest.importorskip("agent.conversation_loop")
+    memory, user = FAKE_TAILS["fake profile, then date"]
+    frozen = _without_profile_line(host.agent(memory, user)._build_system_prompt())
+
+    class Db:
+        def get_session(self, _session_id: str) -> Dict[str, str]:
+            return {"system_prompt": frozen}
+
+        def __getattr__(self, _name: str) -> Any:
+            return lambda *_a, **_k: None
+
+    agent = host.agent(memory, user)
+    agent._session_db, agent._cached_system_prompt = Db(), None
+    history = [{"role": "user", "content": "earlier"}, {"role": "assistant", "content": "ok"}]
+    conversation_loop._restore_or_build_system_prompt(agent, None, history)
+    assert agent._cached_system_prompt == frozen  # the control: the host reused it
+
+    system = _oauth_system(f"{agent._cached_system_prompt}\n\n{LINE}")
+    needles = _needles(memory + user)
+    for needle in needles:
+        assert needle in _oauth_text(system)
+    out = _oauth_text(host.chain({"model": "m", "system": system, "messages": [{"role": "user", "content": "q"}]}).payload["system"])
+    _assert_summon_cut(out, [*needles, "Active Hermes profile"])
 
 
 def test_the_oauth_prefix_is_the_real_one() -> None:

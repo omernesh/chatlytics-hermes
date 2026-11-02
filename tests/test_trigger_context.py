@@ -9,11 +9,15 @@ renders it, so the two tests together cover envelope to model.
 from __future__ import annotations
 
 import json
+import re
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict
 
 import pytest
 
+from chatlytics_hermes import trigger_context
 from chatlytics_hermes.owner import OWNER_REPLY_PREFIX
 from chatlytics_hermes.trigger_context import (
     clean_chat_name,
@@ -230,3 +234,27 @@ def test_no_name_means_no_quoted_name_clause() -> None:
     assert line is not None
     assert "quoted name" not in line
     assert '"' not in line
+
+
+def _token_of_a_fresh_process() -> str:
+    # The file alone, so this reads the module's own line and nothing the package imports.
+    code = (
+        "import importlib.util as u, sys\n"
+        "s = u.spec_from_file_location('tc', sys.argv[1])\n"
+        "m = u.module_from_spec(s)\n"
+        "s.loader.exec_module(m)\n"
+        "print(m.SUMMON_TOKEN)\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", code, trigger_context.__file__], capture_output=True, text=True, check=True, timeout=60
+    )
+    return done.stdout.strip()
+
+
+def test_the_token_is_random_per_process() -> None:
+    # A constant would let anything stored in an earlier process, a memory entry included, pass
+    # as this turn's line. Every other test reads the value back, so none of them would notice.
+    tokens = {trigger_context.SUMMON_TOKEN, _token_of_a_fresh_process(), _token_of_a_fresh_process()}
+    assert len(tokens) == 3
+    for token in tokens:
+        assert re.fullmatch(r"[0-9a-f]{32}", token)
