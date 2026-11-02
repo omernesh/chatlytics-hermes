@@ -35,7 +35,8 @@ _CHAT_NAME_MAX = 80
 # Characters the hub's JIDs and session names actually use. Anything else is not
 # something we were sent by the hub, and it never reaches a system prompt.
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_.:@+-]{1,128}$")
-_PHONE = re.compile(r"[0-9]+")
+# E.164 tops out at 15 digits.
+_PHONE = re.compile(r"[0-9]{1,15}")
 _STRIPPED_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
 # Quotes and brackets would let a name close its own quoting or fake a marker.
 _NAME_PUNCTUATION = str.maketrans({c: " " for c in "\"'`[](){}<>\\"})
@@ -61,15 +62,26 @@ def _safe_phone(raw: Any) -> Optional[str]:
 
 
 def _read_instruction(env: Mapping[str, Any], chat_id: str, session: str) -> str:
-    """How to read this chat. A chat id filter is an exact string match and one
-    contact's chat is stored under several forms, so a DM reads by phone; a group
-    has one form and keeps its chat id (chatlytics#956)."""
+    """How to read this chat (chatlytics#956).
+
+    A DM with a phone uses search_messages limited to DMs. A chat id filter is an
+    exact string match and one contact's chat is stored under several forms, while
+    list_messages with a contact also returns that person's posts in groups. A
+    number with no contact row falls through to fuzzy matching and a sole candidate
+    comes back unflagged, so the model must check the match before it reads on. A
+    group has one form and keeps its chat id; so does a DM with no phone, which the
+    hub also sends for the owner's chat with themselves.
+    """
     is_group = env.get("chat_type") == "group"
     phone = None if is_group else _safe_phone(env.get("chat_phone"))
     if phone is not None:
         read = (
-            f"Lextrove list_messages with contact_name {phone} and session {session}. "
-            "Do not filter this chat by chat_id: that matches one stored form and misses messages. "
+            f"Lextrove search_messages with contact_name {phone}, chat_type dm, session {session}, "
+            "mode fts and no query. "
+            "Stop and say you cannot read this chat if that returns nothing, or if its resolved_entity "
+            f"is ambiguous, has a similarity_score below 1, or has an identifier that does not start with {phone}@. "
+            "Do not use list_messages or a chat_id filter for this chat: list_messages also returns "
+            "this person's posts in groups, and a chat_id filter matches one stored form and misses messages. "
         )
     else:
         read = f"Lextrove list_messages with chat_id {chat_id} and session {session}. "

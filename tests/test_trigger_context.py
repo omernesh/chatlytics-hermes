@@ -80,17 +80,45 @@ ALL_FROM_ME = ["from_me_dm", "from_me_group", "from_me_dm_lid", "from_me_dm_lid_
 
 
 @pytest.mark.parametrize("name", ["from_me_dm", "from_me_dm_lid"])
-async def test_dm_with_a_phone_reads_by_contact_name_never_chat_id(name: str) -> None:
+async def test_dm_with_a_phone_searches_direct_chats_only(name: str) -> None:
     env = ENVELOPES[name]
     prompt = _prompt(await _dispatch(_adapter(), dict(env)))
+    phone = env["chat_phone"]
 
     assert (
-        f"list_messages with contact_name {env['chat_phone']} and session {env['session_id']}" in prompt
+        f"Lextrove search_messages with contact_name {phone}, chat_type dm, "
+        f"session {env['session_id']}, mode fts and no query." in prompt
     )
-    assert "list_messages with chat_id" not in prompt
-    assert "If that returns nothing" not in prompt
+    assert "list_messages with" not in prompt
+    assert "Do not use list_messages or a chat_id filter for this chat" in prompt
+    assert "posts in groups" in prompt
     # The line still names the chat, for the reply.
     assert f"chat id {env['entity_jid']}" in prompt
+
+
+@pytest.mark.parametrize("name", ["from_me_dm", "from_me_dm_lid"])
+def test_dm_with_a_phone_stops_on_any_doubtful_match(name: str) -> None:
+    env = ENVELOPES[name]
+    line = render_trigger_context(env)
+    assert line is not None
+
+    assert "Stop and say you cannot read this chat if that returns nothing" in line
+    assert "resolved_entity is ambiguous" in line
+    assert "similarity_score below 1" in line
+    # With the @, a number that merely shares this prefix does not pass.
+    assert f"identifier that does not start with {env['chat_phone']}@" in line
+
+
+async def test_owners_own_chat_has_no_phone_so_it_reads_by_chat_id() -> None:
+    # The hub withholds chat_phone in the owner's chat with themselves: searching
+    # by the owner's number would return everything they sent in every chat.
+    env = {k: v for k, v in ENVELOPES["from_me_dm"].items() if k != "chat_phone"}
+    env["entity_jid"] = env["sender_jid"]
+    prompt = _prompt(await _dispatch(_adapter(), env))
+
+    assert f"list_messages with chat_id {env['entity_jid']} and session {env['session_id']}" in prompt
+    assert "If that returns nothing, say you cannot read this chat." in prompt
+    assert "contact_name" not in prompt
 
 
 async def test_group_reads_by_chat_id() -> None:
@@ -126,6 +154,7 @@ async def test_dm_without_a_phone_reads_by_chat_id_and_admits_an_empty_result() 
         "+972544000003",
         "972544000003@c.us",
         "٩٧٢٥٤٤",  # digits, but not ASCII ones
+        "1234567890123456",  # one digit past E.164
         "",
         972544000003,
         None,
@@ -138,6 +167,13 @@ def test_a_chat_phone_that_is_not_digits_is_dropped(bad: Any) -> None:
     assert "contact_name" not in line
     assert f"list_messages with chat_id {env['entity_jid']}" in line
     assert "SYSTEM" not in line
+
+
+def test_a_chat_phone_of_exactly_15_digits_is_kept() -> None:
+    env = dict(ENVELOPES["from_me_dm_lid"], chat_phone="123456789012345")
+    line = render_trigger_context(env)
+    assert line is not None
+    assert "contact_name 123456789012345," in line
 
 
 def test_the_first_sentence_is_unchanged_for_every_form() -> None:
@@ -157,7 +193,7 @@ async def test_history_instruction_points_at_a_session_archive_not_chatlytics_re
     env = ENVELOPES[name]
     prompt = _prompt(await _dispatch(_adapter(), dict(env)))
 
-    assert f"and session {env['session_id']}" in prompt
+    assert "use a message-archive tool that takes a session, such as Lextrove" in prompt
     assert "Never use session all for this chat" in prompt
     assert "mixes in other accounts' chats" in prompt
     assert "chatlytics_read only reads your own number" in prompt
