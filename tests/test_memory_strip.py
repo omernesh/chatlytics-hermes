@@ -496,9 +496,9 @@ def _with_tool_exchange(tool_text: str, args: Dict[str, Any]) -> Dict[str, Any]:
 
 def test_tool_rows_and_arguments_are_not_touched_by_fence_cutting() -> None:
     fence = h.build_memory_context_block("not memory, just quoted")
-    tool_text = json.dumps([{"from": "Dana", "text": f"first <memory-context> {fence}"}, {"text": "PAY INVOICE 42"}])
-    args = {"q": "x <memory-context> y", "limit": 5}
-    request = _with_tool_exchange(tool_text, args)
+    args = {"q": f"x <memory-context> y {fence}", "limit": 5}
+    request = _with_tool_exchange(f"Dana wrote <memory-context> and {fence} PAY INVOICE 42", args)
+    request["messages"][2]["content"] = f"quoting {fence} here"
 
     out = _run(request)
 
