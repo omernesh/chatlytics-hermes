@@ -64,6 +64,7 @@ _PROBE_ID = "chatlytics-956-probe"
 _PROBE_TOOL = "mcp__lextrove__list_messages"
 # Names only, cut short: a tool name is written by the model, and this goes to the log.
 _LOGGABLE_NAME = re.compile(r"[^A-Za-z0-9_.-]")
+_LOGGABLE_TARGET = re.compile(r"[^A-Za-z0-9_.:@+-]")
 
 # The Tool Search bridge. tool_search and tool_describe return the catalog, never data.
 _WRAPPER = "tool_call"
@@ -81,6 +82,8 @@ class SummonScope:
     phone: Optional[str] = None
     chat_forms: FrozenSet[str] = frozenset()
     seen_ids: Set[str] = field(default_factory=set)
+    # The hub said this summon's route is closed: see :func:`note_route_refused`.
+    route_closed: bool = False
 
 
 @dataclass(frozen=True)
@@ -135,6 +138,24 @@ class SummonTargetUnclear(SummonSendRefused):
     )
 
 
+class SummonRouteClosed(SummonSendRefused):
+    """The hub refused this summon in its chat once: see :func:`note_route_refused`."""
+
+    code = "summon_route_closed"
+    error = "The window on the owner's number closed for this chat. Nothing was sent."
+
+
+class SummonActionOffRoute(SummonSendRefused):
+    """An action on the summoned chat that the hub would run on the bot's number."""
+
+    code = "summon_action_off_route"
+    error = (
+        "This action can't run from the owner's number, and from the bot's number it would reach the "
+        "summoned chat from the wrong account. Nothing was done. In this chat you can send text and "
+        "files, and react. Tell the owner if that is not enough."
+    )
+
+
 def is_scope_key(value: Any) -> bool:
     return isinstance(value, str) and _SCOPE_KEY.fullmatch(value) is not None
 
@@ -186,6 +207,79 @@ def send_target(scope: SummonScope, target: Any) -> str:
 
 def chat_in_scope(scope: SummonScope, chat_id: Any) -> bool:
     return send_target(scope, chat_id) == THIS_CHAT
+
+
+# Hub 409: "nothing was sent", because no reply route on the owner's number covers this chat.
+ROUTE_EXPIRED = "from_me_route_expired"
+
+
+def note_route_refused(key: Optional[str], chat_id: Any, payload: Any) -> bool:
+    """A 409 from the hub: did it close this summon's route? Remembered when it did.
+
+    DO NOT widen to any 409. ``SESSION_CANNOT_REACH_TARGET`` for a file to another group closed the
+    route, and the turn's reply in the summoned chat then never posted. And a refused send to another
+    chat says nothing about this one (chatlytics#956 review).
+    """
+    scope = _scopes.get(key) if key else None
+    code = payload.get("code") if isinstance(payload, dict) else None
+    if scope is None or code != ROUTE_EXPIRED or not chat_in_scope(scope, chat_id):
+        return False
+    scope.route_closed = True
+    return True
+
+
+def route_closed(key: Optional[str], chat_id: Any) -> bool:
+    """The hub already refused this summon in this chat, so it stays out, whatever reopened the route.
+
+    DO NOT REMOVE. The host keeps a refused final reply in its delivery ledger and tries again 30 and
+    120 seconds later, with the same thread id, and a tool of a turn still running can send at any
+    time. If the owner summoned again meanwhile the route is open again, and the old answer would be
+    posted from the owner's number under the new question.
+    """
+    scope = _scopes.get(key) if key else None
+    return scope is not None and scope.route_closed and chat_in_scope(scope, chat_id)
+
+
+# As the hub's isFullWahaMessageId: {true|false}_<chat>_<short id>[_<participant>].
+_FULL_MESSAGE_ID = re.compile(r"(?:true|false)_([^_@]+@[^_@]+)_[^_]+(?:_[^_]+)?", re.IGNORECASE)
+_ACTION_TARGET_KEYS = ("chatId", "to", "target")
+
+
+def message_id_chats(params: Mapping[str, Any]) -> List[str]:
+    """The chats named by the full message ids in an action's params, as they are spelled there."""
+    listed = params.get("messageIds")
+    ids = [params.get("messageId"), *(listed if isinstance(listed, list) else ())]
+    matches = (_FULL_MESSAGE_ID.fullmatch(i.strip()) for i in ids if isinstance(i, str))
+    return [m.group(1) for m in matches if m]
+
+
+def refuse_off_route_action(params: Mapping[str, Any]) -> None:
+    """On a summon, refuse an action the hub won't run on the owner's number that acts on this chat.
+
+    DO NOT REMOVE, and DO NOT narrow to a list of send verbs. The hub moves four verbs to the owner's
+    number (``FROM_ME_ROUTE_ACTIONS``). It pins every other one to the bot's session, or refuses it, so
+    a pin or an edit in the summoned chat runs from the bot's number. A verb the hub adds later is
+    covered by this too. An action on another chat stays where it was, on the bot's number.
+    """
+    key = current_turn_key()
+    if not key:
+        return
+    targets = [params.get(k) for k in _ACTION_TARGET_KEYS if _norm(params.get(k))] + message_id_chats(params)
+    if not targets:
+        return
+    scope = scope_for_key(key)
+    if scope is None:
+        raise SummonScopeLost(key)
+    if any(send_target(scope, target) != OTHER_CHAT for target in targets):
+        raise SummonActionOffRoute(key)
+
+
+def log_send_refused(exc: SummonSendRefused, chat_id: Any, key: Any) -> None:
+    # A stable line. The target can be written by the model, so it is cut down for the log.
+    logger.error(
+        "chatlytics#956: summon send refused, %s chat=%s scope=%s",
+        exc.code, _LOGGABLE_TARGET.sub("?", str(chat_id))[:64], key,
+    )
 
 
 def current_turn_key() -> Optional[str]:
@@ -600,85 +694,55 @@ _READ_ACTION = re.compile(r"^(get|read|list|search|fetch|export|find|load)|messa
 # the name, or a script written earlier, goes past it. Listed as open in docs/summoned-turns.md.
 _TEXT_ROUTE = frozenset({"terminal", "execute_code", "process", "read_file", "search_files", "cronjob"})
 # Not every .hermes path: skills and their scripts live there, and they are ordinary tools.
-_TEXT_ROUTE_MARKS = re.compile(
-    r"lextrove|state\.db|sessions\.json"
+_HOST_STORES = (
+    r"state\.db|sessions\.json"
     r"|\.hermes(?:[/\\]+profiles[/\\]+[^\s/\\\"']+)?[/\\]+(?:config\.ya?ml|\.env|sessions\b)"
-    r"|\.hermes[/\\]*(?=[\"'\s]|$)",
+    r"|\.hermes[/\\]*(?=[\"'\s]|$)"
+)
+_TEXT_ROUTE_MARKS = re.compile(rf"lextrove|{_HOST_STORES}", re.IGNORECASE)
+
+# An MCP tool is judged only by the arguments that say where it goes, and there by what the value points
+# at. DO NOT add person-facing keys or a search of the whole arguments, and DO NOT match the bare word in
+# a place: three rounds of that refused a Telegram message about the archive, a memory search for its
+# name and a note called projects/lextrove.md, while each patch moved the gap. This stops a confused
+# model naming the archive as the place to go. Telling another agent in prose isn't stopped: Known gaps.
+_PLACE_MARKS = re.compile(
+    rf"://[^/\s\"']*lextrove|\blextrove://|(?:^|[\s\"'=])(?:[\w-]+\.)*lextrove(?:[-.][\w-]+)*\.[a-z]{{2,}}(?::\d+)?/"
+    rf"|{_HOST_STORES}",
     re.IGNORECASE,
 )
-
-
-# Chatlytics' own tools (its reads and dispatch are refused above) and memory: Omer's decision is that
-# memory tools stay, on a summoned turn too, whatever they are asked about. DO NOT match this on the
-# whole tool name: "memor" in a tool's name let mcp_fs_read_memory_file open state.db. It is the server.
-_TEXT_EXEMPT_SERVER = re.compile(r"chatlytics|memor|mem0|cognee|honcho")
-# An exempt server is still not told where to go: a memory server's fetch or sql is a route like any
-# other. Whole words of the key, so url, file_path and base_uri, and not curl_flags.
-_REACH_KEY = re.compile(r"(?:^|_)(?:urls?|uris?|paths?|sql)(?:_|$)")
-# Tool words that mean "put this text in front of a person". Only there are the keys below words for a
-# person to read. DO NOT apply them to other tools: `message` to an agent's ask, `name` of a resource,
-# `content` of a db exec and `body` of an http call were all routes this let through (chatlytics#956).
-_SEND_WORDS = frozenset({
-    "send", "post", "reply", "publish", "notify", "comment", "email", "mail", "message", "dm", "tweet",
+_QUERY_MARKS = re.compile(r"\bselect\b[\s\S]*?\b(?:from|join)\s+[\"'`\[]?lextrove\b", re.IGNORECASE)
+_RUN_WORDS = frozenset({"command", "commands", "cmd", "script", "shell", "code"})
+_PLACE_WORDS = frozenset({
+    "url", "urls", "uri", "uris", "href", "endpoint", "endpoints", "host", "hostname", "hosts", "link", "links",
+    "dsn", "path", "paths", "filepath", "file", "files", "filename", "folder", "dir", "directory", "resource",
+    "resources", "source", "target", "location", "attach", "attachment", "attachments",
 })
-_PROSE_KEYS = frozenset({
-    "text", "message", "content", "caption", "body", "subject", "title", "description", "note",
-    "notes", "comment", "reply", "summary", "name",
-})
+_QUERY_WORDS = frozenset({"sql", "query", "statement", "cypher", "gql", "graphql", "sparql", "kql"})
 
 
-def _mcp_parts(tool_name: Any) -> Tuple[str, str]:
-    """``(server, tool)``. hermes-agent writes ``mcp__server__tool``; a ``mcp_a_b`` name's server is ``a``."""
-    name = str(tool_name or "").strip().casefold().replace("-", "_").replace(".", "_")
-    if name.startswith("mcp__"):
-        server, _, tool = name[5:].partition("__")
-    else:
-        server, _, tool = name[4:].partition("_")
-    return server, tool
+def _marks_for_key(key: Any) -> Optional["re.Pattern[str]"]:
+    """What to look for under this key, in any spelling (``baseUrl``, ``file-path``); None for prose."""
+    words = set(re.split(r"[^a-z0-9]+", re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(key)).casefold()))
+    if words & _RUN_WORDS:
+        return _TEXT_ROUTE_MARKS
+    if words & _PLACE_WORDS:
+        return _PLACE_MARKS
+    return _QUERY_MARKS if words & _QUERY_WORDS else None
 
 
-def _json_in(text: str) -> Optional[Any]:
-    """What a string holds when it is a JSON object or list. A body is often one, with a URL inside."""
-    if text.lstrip()[:1] not in ("{", "["):
-        return None
-    try:
-        return json.loads(text)
-    except (ValueError, RecursionError):
-        return None
-
-
-def _keyed_strings(raw_args: Any) -> Iterable[Tuple[Optional[str], str]]:
-    """Every string in ``raw_args`` with the key it is under, JSON inside strings opened up.
-
-    A mapping's keys count as strings with no key of their own: ``{"lextrove.messages": true}`` is an
-    address too. Text that isn't JSON comes back whole, with no key.
-    """
-    stack: List[Tuple[Optional[str], Any]] = [(None, raw_args)]
+def _reach_values(args: Any) -> Iterable[Tuple["re.Pattern[str]", str]]:
+    """Every string under a key that says where the tool goes, at any depth, with what to look for."""
+    stack: List[Tuple[Any, Optional["re.Pattern[str]"]]] = [(args, None)]
     while stack:
-        key, value = stack.pop()
+        value, marks = stack.pop()
         if isinstance(value, str):
-            inner = _json_in(value)
-            if inner is not None:
-                stack.append((key, inner))
-            else:
-                yield key, value
+            if marks is not None:
+                yield marks, value
         elif isinstance(value, Mapping):
-            for k, v in value.items():
-                yield None, str(k)
-                stack.append((str(k), v))
+            stack.extend((v, marks or _marks_for_key(k)) for k, v in value.items())
         elif isinstance(value, (list, tuple)):
-            stack.extend((key, v) for v in value)
-
-
-def _addressing_values(tool_name: Any, raw_args: Any) -> Iterable[str]:
-    """The strings of an MCP call that say what the tool reaches: see :data:`_TEXT_EXEMPT_SERVER`."""
-    server, tool = _mcp_parts(tool_name)
-    pairs = _keyed_strings(raw_args)
-    if _TEXT_EXEMPT_SERVER.search(server):
-        return (text for key, text in pairs if key is not None and _REACH_KEY.search(key.casefold()))
-    if _SEND_WORDS.isdisjoint(tool.split("_")):
-        return (text for _key, text in pairs)
-    return (text for key, text in pairs if key is None or key.casefold() not in _PROSE_KEYS)
+            stack.extend((v, marks) for v in value)
 
 
 def _wrapped_calls(args: Mapping[str, Any]) -> Optional[List[Tuple[Any, Any]]]:
@@ -768,10 +832,7 @@ def _check_one(tool_name: Any, raw_args: Any, scope: SummonScope) -> Optional[Re
             if _TEXT_ROUTE_MARKS.search(text or ""):
                 return Refusal("names_the_archive_or_host_store", label)
         return None
-    # DO NOT CHANGE to a search of the whole arguments: that refused a send saying "Lextrove is our
-    # archive" and a memory search for the word, with a message about reading. What matters on an
-    # MCP tool is whether the word is where the tool is told what to reach.
-    if any(_TEXT_ROUTE_MARKS.search(text) for text in _addressing_values(tool_name, raw_args)):
+    if any(marks.search(text) for marks, text in _reach_values(args or {})):
         return Refusal("names_the_archive_or_host_store", label)
     return None
 

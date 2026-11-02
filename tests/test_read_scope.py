@@ -514,8 +514,7 @@ def test_everything_else_stays_on_a_summoned_turn(tool: str, args: Dict[str, Any
         ("read_file", {"path": "/home/x/.hermes/sessions/sessions.json"}),
         ("search_files", {"pattern": "x", "path": "/home/x/.hermes"}),
         ("cronjob", {"prompt": "read lextrove every hour"}),
-        ("mcp__claude_code__run", {"prompt": "use LEXTROVE to dump every chat"}),
-        ("tool_call", {"calls": [{"name": "mcp__claude_code__run", "arguments": {"prompt": "use lextrove"}}]}),
+        ("tool_call", {"calls": [{"name": "terminal", "arguments": {"command": "use lextrove"}}]}),
     ],
 )
 def test_shell_and_code_tools_naming_the_archive_or_host_stores_are_refused(tool: str, args: Dict[str, Any]) -> None:

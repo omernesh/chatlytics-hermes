@@ -672,15 +672,12 @@ class _SummonTurn:
     owner: Optional[str]
     chat_name: Optional[str]
     stopped: bool = False
-    # The hub refused this summon once: see _summon_route_closed.
-    route_closed: bool = False
 
 
 # Summons of one chat that /stop and /new still try. The hub allows a guest 5 a minute per chat.
 _SUMMONS_PER_CHAT_MAX = 16
-# Hub 409: "nothing was sent", because no reply route on the owner's number covers this chat.
-_ROUTE_EXPIRED = "from_me_route_expired"
-_ROUTE_CLOSED_ERROR = "The window on the owner's number closed for this chat. Nothing was sent."
+_ROUTE_EXPIRED = read_scope.ROUTE_EXPIRED
+_ROUTE_CLOSED_ERROR = read_scope.SummonRouteClosed.error
 _SUMMON_REFUSALS = {cls.error: cls.code for cls in (read_scope.SummonScopeLost, read_scope.SummonTargetUnclear)}
 
 
@@ -1498,6 +1495,8 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         key = read_scope.current_turn_key()
         routed = self._summon_route_chat(chat_id, key)
         if routed:
+            if read_scope.route_closed(key, chat_id):
+                raise read_scope.SummonRouteClosed(key)
             return read_scope.scope_for_key(key).session, routed  # type: ignore[arg-type,union-attr]
         if not self._is_bot_token_mode():
             return None, None
@@ -1521,25 +1520,6 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         if conn is not None and conn.client is not None:
             return conn.client
         return self._client_for_chat(chat_id) or self._client
-
-    def _summon_route_closed(self, chat_id: str, key: Optional[str]) -> bool:
-        """The hub already refused this summon here, so its later sends stay out of the chat.
-
-        DO NOT REMOVE. The host keeps a refused final reply in its delivery ledger and tries again 30
-        and 120 seconds later, with the same thread id. If the owner summoned again in that time the
-        route is open again, and the old answer would be posted from the owner's number under the new
-        question. A summon whose route closed stays closed, whatever reopened it.
-        """
-        turn = self._summon_turns.get(key) if key else None
-        if turn is None or not turn.route_closed:
-            return False
-        scope = read_scope.scope_for_key(key)  # type: ignore[arg-type]
-        return scope is not None and read_scope.chat_in_scope(scope, chat_id)
-
-    def _note_route_refused(self, key: str) -> None:
-        turn = self._summon_turns.get(key)
-        if turn is not None:
-            turn.route_closed = True
 
     def _note_envelope_session(self, conn: "_BotConn", session: str) -> None:
         """An ordinary envelope's session: this bot's own, on any hub that marks every summon.
@@ -1745,7 +1725,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             summon_or_own = self._outbound_session(chat_id, key)
             routed_chat = self._summon_route_chat(chat_id, key)
         except read_scope.SummonSendRefused as exc:
-            logger.error("chatlytics#956: summon send refused, %s chat=%s scope=%s", exc.code, chat_id, key)
+            read_scope.log_send_refused(exc, chat_id, key)
             return None, exc.error
         if routed_chat:
             body["chatId"] = routed_chat
@@ -1982,7 +1962,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             )
             return
         summon_key = self._summon_key_of(metadata)
-        if self._summon_route_closed(chat_id, summon_key):
+        if read_scope.route_closed(summon_key, chat_id):
             return
         body, err = self._build_send_body(chat_id, self.status_bubble_text, metadata)
         if body is None:
@@ -4279,7 +4259,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         if summon_key and self._is_host_setup_notice(content):
             logger.info("chatlytics#956: left the host's setup notice out of summon scope=%s", summon_key)
             return SendResult(success=True)
-        if self._summon_route_closed(chat_id, summon_key):
+        if read_scope.route_closed(summon_key, chat_id):
             return await self._summon_reply_not_posted(
                 summon_key, chat_id, content, metadata, {"code": _ROUTE_EXPIRED, "message": _ROUTE_CLOSED_ERROR}
             )
@@ -4435,8 +4415,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # fallback ORDER no longer drifts between send() and the P7 bubble
         # path).
         success, error_msg = _coerce_success_payload(response.status_code, payload)
-        if summon_key and response.status_code == 409 and isinstance(payload, dict) and payload.get("code") == _ROUTE_EXPIRED:
-            self._note_route_refused(summon_key)
+        if response.status_code == 409 and read_scope.note_route_refused(summon_key, chat_id, payload):
             return await self._summon_reply_not_posted(summon_key, chat_id, content, metadata, payload)
         if success:
             # v4.4.0 (P7): surface the server's edit outcome at DEBUG. A 200
@@ -4531,7 +4510,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # path has never named a session here.
         key = self._summon_key_of(metadata)
         typing_body: Dict[str, Any] = {"chatId": chat_id, "duration": float(duration)}
-        if self._summon_route_closed(chat_id, key):
+        if read_scope.route_closed(key, chat_id):
             return False
         if self._is_bot_token_mode():
             try:
@@ -5006,7 +4985,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # send() + the progress bubble. Fail loud when no WAHA session can be
         # resolved (same contract as send()).
         summon_key = self._summon_key_of(metadata)
-        if self._summon_route_closed(chat_id, summon_key):
+        if read_scope.route_closed(summon_key, chat_id):
             return SendResult(success=False, error=_ROUTE_CLOSED_ERROR, raw_response={"code": _ROUTE_EXPIRED})
         body, session_err = self._build_send_body(chat_id, "", metadata)
         if body is None:
@@ -5055,9 +5034,14 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
         if summon_key and response.status_code == 409:
             # A file can't move to the owner's DM here. The refusal goes to the host and the log.
-            self._note_route_refused(summon_key)
+            try:
+                refusal = response.json()
+            except Exception:  # noqa: BLE001 -- no code, so it says nothing about the route
+                refusal = None
+            closed = read_scope.note_route_refused(summon_key, chat_id, refusal)
             logger.error(
-                "chatlytics#956: summon media not posted: HTTP 409 chat=%s scope=%s", chat_id, summon_key
+                "chatlytics#956: summon media not posted: HTTP 409 chat=%s scope=%s route_closed=%s",
+                chat_id, summon_key, closed,
             )
         return self._make_send_result(response)
 

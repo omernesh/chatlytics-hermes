@@ -19,7 +19,17 @@ import pytest
 from chatlytics_hermes import read_scope
 from chatlytics_hermes.adapter import _BotConn, _make_tool_handler
 from chatlytics_hermes.read_scope import pre_tool_call
-from chatlytics_hermes.tools import chatlytics_react, chatlytics_send
+from chatlytics_hermes.tools import (
+    chatlytics_delete,
+    chatlytics_dispatch,
+    chatlytics_edit,
+    chatlytics_pin,
+    chatlytics_poll,
+    chatlytics_react,
+    chatlytics_send,
+    chatlytics_unpin,
+    chatlytics_unsend,
+)
 from tests.test_owner_tagging import BOT_TOKEN, _install_recorders, _lp_adapter
 from tests.test_trigger_context import ENVELOPES, OWNER, OWNER_SESSION, PEER
 
@@ -586,6 +596,17 @@ def _summon_pre(tool: str, args: Any) -> Any:
     ("mcp_memory_graph_search", {"query": "state.db"}),
     ("mcp__slack__post", {"channel": "c1", "text": "Lextrove is our archive"}),
     ("mcp__mail__send", {"to": "a@example.test", "subject": "lextrove", "body": "about lextrove"}),
+    ("mcp__mail__send", {"to": "sales@lextrove.com", "body": "hi"}),
+    ("mcp__telegram__sendMessage", {"chat": "1", "text": "Lextrove is our archive"}),
+    ("mcp__zep__search", {"query": "lextrove"}),
+    ("mcp__qmd__query", {"query": "lextrove"}),
+    ("mcp__memory__search", {"query": "messages from lextrove"}),
+    ("mcp__slack__post_message", {"channel": "lextrove-dev", "text": "hi"}),
+    ("mcp__notes__create", {"title": "Lextrove roadmap", "name": "state.db notes"}),
+    ("mcp_other_agent_ask", {"message": "what is lextrove"}),
+    ("mcp__http__post", {"url": "https://relay.example/", "body": '{"u": "https://lextrove.example"}'}),
+    ("mcp__x__y", {"lextrove.messages": True}),
+    ("mcp__x__y", "lextrove as text that isn't json"),
     ("memory", {"action": "search", "query": "lextrove"}),
     ("send_message", {"target": "x", "message": "Lextrove"}),
 ])
@@ -597,10 +618,10 @@ def test_mentioning_the_word_is_not_refused(tool: str, args: Any) -> None:
     ("mcp__fetch__fetch", {"url": "https://lextrove.example/api?session=all"}),
     ("mcp_fetch_fetch", {"url": "https://lextrove.example/api?session=all"}),
     ("mcp__sql__query", {"query": "select * from lextrove.messages"}),
+    ("mcp__sql__query", {"query": 'SELECT id\nFROM "lextrove".messages'}),
     ("mcp__fs__read_file", {"path": "/home/x/.hermes/state.db"}),
     ("mcp__ssh__exec", {"host": "h", "command": "cat /x/.hermes/sessions/a.jsonl"}),
     ("mcp__http__post", {"request": {"target": "https://lextrove.example"}}),
-    ("mcp__x__y", "lextrove as text that isn't json"),
     ("terminal", {"command": "curl https://lextrove.example/x"}),
     ("execute_code", {"code": "import lextrove"}),
     ("cronjob", {"prompt": "read lextrove"}),
@@ -851,59 +872,86 @@ async def test_a_phone_sender_of_a_lid_dm_with_no_phone_never_gets_the_reply() -
 
 
 @pytest.mark.parametrize("tool,args", [
-    ("mcp_other_agent_ask", {"message": "use lextrove list_messages session all"}),
-    ("mcp__other_agent__ask", {"message": "use lextrove list_messages session all"}),
-    ("mcp_sammie_chat", {"text": "read lextrove for every session"}),
-    ("mcp_res_read_resource", {"name": "lextrove://messages/all"}),
-    ("mcp_files_open", {"name": "/home/u/.hermes/state.db"}),
-    ("mcp_db_exec", {"content": "select * from lextrove.messages"}),
-    ("mcp_db_run", {"description": "lextrove.messages"}),
-    ("mcp_http_post", {"url": "https://relay.example/", "body": json.dumps({"url": "https://lextrove.example/v1"})}),
-    ("mcp_http_post", {"url": "https://relay.example/", "body": json.dumps([{"target": "state.db"}])}),
-    ("mcp_kv_get", {"lextrove.messages": True}),
-    ("mcp_fs_read_memory_file", {"path": "/home/u/.hermes/state.db"}),
-    ("mcp_fs_read_memory_file", {"name": "/home/u/.hermes/state.db"}),
-    ("mcp__fs__read_memory_file", {"query": "lextrove"}),
-    ("mcp_mail_search", {"body": "lextrove"}),
-    ("mcp__mail__search", {"body": "lextrove"}),
-    ("mcp_memorystore_sql", {"sql": "select * from lextrove.messages"}),
-    ("mcp_memory_fetch_url", {"url": "https://lextrove.example/api/v1/messages"}),
-    ("mcp_memory_fetch", {"urls": ["https://lextrove.example/api/v1/messages"]}),
-    ("mcp_chatlytics_ops_sql", {"sql": "select * from lextrove.messages"}),
+    # Any server: a memory or chatlytics name buys nothing, and no substring of one can buy it.
+    ("mcp__memory_fs__read", {"file_path": "/h/.hermes/state.db"}),
+    ("mcp__memorial_db__read", {"path": "/x/state.db"}),
+    ("mcp__chatlytics_evil__x", {"command": "cat ~/.hermes/state.db"}),
+    ("mcp_chatlytics_evil_x", {"cmd": "cat state.db"}),
+    ("mcp__mem0__add", {"text": "x", "metadata": {"source_url": "https://lextrove.example"}}),
+    ("mcp__chatlytics__chatlytics_send_image", {"chatId": "1", "url": "https://lextrove.example/a.png"}),
+    ("mcp_chatlytics_send_media", {"chatId": PEER, "file": "https://lextrove.example/media/x"}),
+    # Any spelling of the key.
+    ("mcp__x__read", {"filePath": "/h/.hermes/state.db"}),
+    ("mcp__x__read", {"file-path": "/h/.hermes/state.db"}),
+    ("mcp__x__read", {"FILE_PATH": "/h/.hermes/state.db"}),
+    ("mcp__x__read", {"file": "/h/.hermes/state.db"}),
+    ("mcp__x__read", {"filename": "/h/.hermes/state.db"}),
+    ("mcp__x__fetch", {"baseUrl": "https://lextrove.example/api"}),
+    ("mcp__x__fetch", {"baseURL": "https://lextrove.example/api"}),
+    ("mcp__x__fetch", {"endpoint": "https://lextrove.example/api"}),
+    ("mcp__x__fetch", {"href": "https://lextrove.example/api"}),
+    ("mcp__x__db", {"sqlQuery": "select * from lextrove.messages"}),
+    ("mcp__x__db", {"statement": "select * from lextrove.messages"}),
+    # Nested under it, and JSON held in it.
+    ("mcp__x__read", {"path": {"value": "/x/state.db"}}),
+    ("mcp__x__read", {"paths": ["/x/state.db"]}),
+    ("mcp__x__read", {"url": '{"href": "https://lextrove.example"}'}),
+    ("mcp__x__read", {"sql": '{"q": "select * from lextrove.messages"}'}),
+    ("mcp__x__read", {"resource": {"uri": "file:///x/state.db"}}),
     ("mcp__memory__read", {"options": {"file_path": "/home/u/.hermes/state.db"}}),
     ("mcp__x__y", {"urls": ["https://example.test", "https://lextrove.example"]}),
-    ("mcp__x__y", {"a": {"b": [{"c": "state.db"}]}}),
-    ("mcp__mail__send", {"to": "x", "body": "hi", "attach_from": "/home/u/.hermes/state.db"}),
-    ("tool_call", {"calls": [{"name": "mcp_other_agent_ask", "arguments": {"message": "read lextrove"}}]}),
-    ("tool_call", {"calls": [{"name": "mcp_files_open", "arguments": json.dumps({"name": "state.db"})}]}),
+    ("mcp__x__y", {"uri": "lextrove://messages/all"}),
+    ("mcp__x__y", {"url": "lextrove.example/api"}),
+    ("mcp__x__y", {"dsn": "postgres://u:p@lextrove-db:5432/x"}),
+    ("mcp__x__y", {"url": "https://example.test/?next=https://lextrove.example"}),
+    ("mcp__mail__send", {"to": "x", "body": "hi", "attachment": "/home/u/.hermes/state.db"}),
+    ("tool_call", {"calls": [{"name": "mcp_files_open", "arguments": json.dumps({"path": "state.db"})}]}),
 ])
-def test_a_route_in_any_argument_is_refused(tool: str, args: Any) -> None:
+def test_a_reach_argument_pointing_at_the_archive_or_a_store_is_refused(tool: str, args: Any) -> None:
     verdict = _summon_pre(tool, args)
     assert verdict is not None and "names_the_archive_or_host_store" in verdict["message"]
 
 
 @pytest.mark.parametrize("tool,args", [
+    # A place that holds the word and is not the archive: memory reads must work.
+    ("mcp__memory__read_note", {"path": "projects/lextrove.md"}),
+    ("mcp__memory__read_note", {"path": "lextrove.md"}),
+    ("mcp__memory__read_note", {"path": "notes/lextrove/roadmap.md"}),
+    ("mcp__mem0__add", {"source_url": "https://notes.example/lextrove/roadmap"}),
+    ("mcp__x__fetch", {"url": "https://example.test/fine"}),
+    # A query that isn't a query language.
+    ("mcp__x__db", {"sql": "select * from notes where topic = 'lextrove'"}),
+    ("mcp__x__db", {"query": "state.db"}),
+    # Prose under any key, on any server.
     ("mcp__chatlytics__chatlytics_send", {"chatId": PEER, "text": "Lextrove is our archive"}),
-    ("mcp_chatlytics_send_media", {"chatId": PEER, "file": "https://lextrove.example/media/x"}),
     ("mcp_chatlytics_search", {"query": "lextrove"}),
     ("mcp_cognee_recall", {"query": "lextrove"}),
-    ("mcp__plugin_chatlytics_chatlytics__chatlytics_search", {"query": "lextrove"}),
     ("mcp__plugin_x_memory__search", {"query": "state.db"}),
     ("mcp__honcho__search", {"query": "state.db"}),
     ("mcp__mem0__add", {"content": "lextrove notes", "name": "lextrove"}),
-    ("mcp_memory_write", {"url": "https://example.test/fine", "text": "lextrove"}),
     ("mcp__slack__post_message", {"request": {"text": "Lextrove is our archive", "title": "lextrove"}}),
     ("mcp__mail__send", {"to": "a@example.test", "body": json.dumps({"note": "about lextrove"})}),
-    ("mcp__mail__send", {"to": "a@example.test", "body": "[not json lextrove"}),
     ("mcp__x__y", {"q": "fine"}),
+    ("mcp__x__y", {"curl_flags": "state.db"}),
 ])
-def test_mentioning_the_word_to_a_person_or_a_memory_still_passes(tool: str, args: Any) -> None:
+def test_a_word_is_not_a_place(tool: str, args: Any) -> None:
     assert _summon_pre(tool, args) is None
+
+
+@pytest.mark.parametrize("key,expected", [
+    ("url", "place"), ("baseUrl", "place"), ("base-url", "place"), ("SOURCE_URL", "place"), ("filePath", "place"),
+    ("command", "run"), ("runCmd", "run"), ("sqlQuery", "query"), ("query", "query"), ("query_url", "place"),
+    ("text", None), ("message", None), ("content", None), ("body", None), ("name", None), ("channel", None),
+    ("curlFlags", None), ("profile", None), ("urlish", None),
+])
+def test_a_key_is_read_in_any_spelling_and_by_whole_words(key: str, expected: Optional[str]) -> None:
+    marks = {"place": read_scope._PLACE_MARKS, "run": read_scope._TEXT_ROUTE_MARKS, "query": read_scope._QUERY_MARKS}
+    assert read_scope._marks_for_key(key) is (marks[expected] if expected else None)
 
 
 def test_json_too_deep_to_open_is_just_text() -> None:
     assert _summon_pre("mcp__mail__send", {"body": "[" * 200000}) is None
-    assert _summon_pre("mcp__x__y", {"q": "[" * 200000}) is None
+    assert _summon_pre("mcp__x__y", {"url": "[" * 200000}) is None
 
 
 # --- second review: several bots (F3) --------------------------------------------------------------
@@ -1053,7 +1101,7 @@ async def test_a_409_on_an_ordinary_turn_is_not_sent_anywhere_else(caplog: Any) 
         result = await adapter.send(PEER, "ordinary")
     assert not result.success and hub.left == []
     assert "summon reply not posted" not in caplog.text
-    assert adapter._summon_turns[summon.source.thread_id].route_closed is False
+    assert read_scope.scope_for_key(summon.source.thread_id).route_closed is False
 
 
 # --- second review: a stale envelope (F5) ----------------------------------------------------------
@@ -1183,7 +1231,7 @@ async def test_a_refused_file_closes_the_route_too(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(adapter, "_resolve_media_file_field", file_field)
     summon = await _deliver(adapter, ENVELOPES["from_me_dm"], conn)
     assert not (await adapter.send_image(PEER, "https://example.test/a.png", metadata=_turn(summon))).success
-    assert adapter._summon_turns[summon.source.thread_id].route_closed
+    assert read_scope.scope_for_key(summon.source.thread_id).route_closed
 
 
 async def test_a_closed_route_doesnt_stop_the_summon_writing_elsewhere() -> None:
@@ -1372,3 +1420,396 @@ def test_the_same_message_id_in_another_chat_or_session_is_new() -> None:
     assert read_scope.first_delivery(_delivered("m", "b@c.us")) is True
     assert read_scope.first_delivery({**_delivered("m", "a@c.us"), "session_id": "other"}) is True
     assert read_scope.first_delivery(_delivered("m", "a@c.us")) is False
+
+
+# --- third review ----------------------------------------------------------------------------------
+
+
+class _RefusingHub(_Hub):
+    """Answers 409 with ``code`` for one chat, as proxy-send-handler's reach check does."""
+
+    def __init__(self, chat: str, code: str = "SESSION_CANNOT_REACH_TARGET") -> None:
+        super().__init__()
+        self.refuse_chat, self.refuse_code = chat, code
+
+    async def post(self, path: str, json: Dict[str, Any], timeout: Any = None) -> _Resp:  # noqa: A002
+        if json.get("chatId") == self.refuse_chat or (json.get("params") or {}).get("chatId") == self.refuse_chat:
+            self.bodies.append((path, dict(json)))
+            return _Resp(409, {"success": False, "error": "x", "code": self.refuse_code})
+        return await super().post(path, json, timeout)
+
+
+OTHER_GROUP = "120363999999999999@g.us"
+
+
+def _media_ok(adapter: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def file_field(*_a: Any, **_k: Any) -> Dict[str, Any]:
+        return {"url": "https://example.test/a.png"}
+
+    monkeypatch.setattr(adapter, "_resolve_media_file_field", file_field)
+
+
+async def test_a_file_refused_for_another_group_leaves_the_turns_reply_in_its_chat(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, hub, conn = _adapter(_RefusingHub(OTHER_GROUP))
+    _media_ok(adapter, monkeypatch)
+    summon = await _summon_on_route(adapter, hub, ENVELOPES["from_me_dm"], conn)
+    key = summon.source.thread_id
+    assert not (await _in_turn(key, lambda: adapter.send_image(OTHER_GROUP, "https://example.test/a.png"))).success
+    assert not read_scope.scope_for_key(key).route_closed
+    assert (await adapter.send(PEER, "the answer", metadata=_turn(summon))).success
+    assert hub.left == [(OWNER_SESSION, PEER, "the answer")]
+
+
+async def test_a_file_refused_in_its_chat_for_another_reason_closes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, hub, conn = _adapter(_RefusingHub(PEER))
+    _media_ok(adapter, monkeypatch)
+    summon = await _summon_on_route(adapter, hub, ENVELOPES["from_me_dm"], conn)
+    assert not (await adapter.send_image(PEER, "https://example.test/a.png", metadata=_turn(summon))).success
+    assert not read_scope.scope_for_key(summon.source.thread_id).route_closed
+
+
+async def test_a_file_refused_with_a_body_that_is_not_json_closes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Html(_Hub):
+        async def post(self, path: str, json: Dict[str, Any], timeout: Any = None) -> Any:  # noqa: A002
+            self.bodies.append((path, dict(json)))
+            resp = _Resp(409, {})
+
+            def bad() -> Any:
+                raise ValueError("not json")
+
+            resp.json = bad  # type: ignore[method-assign]
+            return resp
+
+    adapter, hub, conn = _adapter(_Html())
+    _media_ok(adapter, monkeypatch)
+    summon = await _summon_on_route(adapter, hub, ENVELOPES["from_me_dm"], conn)
+    assert not (await adapter.send_image(PEER, "https://example.test/a.png", metadata=_turn(summon))).success
+    assert not read_scope.scope_for_key(summon.source.thread_id).route_closed
+
+
+@pytest.mark.parametrize("via", ["text", "file"])
+async def test_a_route_refusal_for_another_chat_closes_nothing_and_tells_nobody(via: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, hub, conn = _adapter(_RefusingHub(OTHER_GROUP, "from_me_route_expired"))
+    _media_ok(adapter, monkeypatch)
+    summon = await _summon_on_route(adapter, hub, ENVELOPES["from_me_dm"], conn)
+    key = summon.source.thread_id
+    if via == "text":
+        result = await adapter.send(OTHER_GROUP, "x", metadata=_turn(summon))
+    else:
+        result = await adapter.send_image(OTHER_GROUP, "https://example.test/a.png", metadata=_turn(summon))
+    assert not result.success and not read_scope.scope_for_key(key).route_closed
+    assert hub.left == []  # and nothing went to the owner's DM
+
+
+async def test_a_closed_route_refuses_a_tool_of_the_old_summon_after_a_new_summon_reopened_it(caplog: Any) -> None:
+    adapter, hub, conn = _adapter()
+    old = await _summon_on_route(adapter, hub, ENVELOPES["from_me_dm"], conn)
+    hub.routes.pop(PEER)  # a person's message closes the route
+    assert not (await adapter.send(PEER, "interim", metadata={"thread_id": old.source.thread_id})).success
+    new = await _summon_on_route(adapter, hub, dict(ENVELOPES["from_me_dm"], message_id="other-msg"), conn)
+    key = old.source.thread_id
+    bodies = len(hub.bodies)
+
+    send = _bound_tool(adapter, chatlytics_send, "chatlytics_send")
+    react = _bound_tool(adapter, chatlytics_react, "chatlytics_react")
+    caplog.set_level(logging.ERROR)
+    sent = json.loads(await _in_turn(key, lambda: send({"chatId": PEER, "text": "old answer"})))
+    reacted = json.loads(await _in_turn(key, lambda: react({"messageId": f"false_{PEER}_ABC", "emoji": "x"})))
+    assert not sent["success"] and not reacted["success"]
+    assert sent["error"] == read_scope.SummonRouteClosed.error
+    assert len(hub.bodies) == bodies and hub.left == []
+    assert "summon send refused, summon_route_closed" in caplog.text
+
+    assert (await adapter.send(PEER, "new answer", metadata=_turn(new))).success
+    await _in_turn(key, lambda: send({"chatId": "999@c.us", "text": "elsewhere"}))  # another chat is not its route
+    assert hub.left == [(OWNER_SESSION, PEER, "new answer"), (BOT_SESSION, "999@c.us", "elsewhere")]
+
+
+async def test_a_tools_own_409_closes_the_route_for_every_later_send() -> None:
+    adapter, hub, conn = _adapter()
+    old = await _summon_on_route(adapter, hub, ENVELOPES["from_me_dm"], conn)
+    key = old.source.thread_id
+    hub.routes.pop(PEER)
+    send = _bound_tool(adapter, chatlytics_send, "chatlytics_send")
+    out = json.loads(await _in_turn(key, lambda: send({"chatId": PEER, "text": "x"})))
+    assert out["status_code"] == 409 and read_scope.scope_for_key(key).route_closed
+    hub.routes[PEER] = OWNER_SESSION
+    assert not json.loads(await _in_turn(key, lambda: send({"chatId": PEER, "text": "y"})))["success"]
+    assert not (await adapter.send(PEER, "z", metadata={"thread_id": key})).success
+    assert hub.left == []
+
+
+@pytest.mark.parametrize("chat,code", [(OTHER_GROUP, "from_me_route_expired"), (PEER, "SESSION_CANNOT_REACH_TARGET")])
+async def test_a_tools_other_409_closes_nothing(chat: str, code: str) -> None:
+    adapter, hub, conn = _adapter(_RefusingHub(chat, code))
+    summon = await _summon_on_route(adapter, hub, ENVELOPES["from_me_dm"], conn)
+    send = _bound_tool(adapter, chatlytics_send, "chatlytics_send")
+    await _in_turn(summon.source.thread_id, lambda: send({"chatId": chat, "text": "x"}))
+    assert not read_scope.scope_for_key(summon.source.thread_id).route_closed
+
+
+async def test_an_ordinary_tools_409_closes_no_summon() -> None:
+    adapter, hub, conn = _adapter(_RefusingHub(PEER, "from_me_route_expired"))
+    summon = await _summon_on_route(adapter, hub, ENVELOPES["from_me_dm"], conn)
+    send = _bound_tool(adapter, chatlytics_send, "chatlytics_send")
+    await _in_turn("", lambda: send({"chatId": PEER, "text": "x"}))
+    assert not read_scope.scope_for_key(summon.source.thread_id).route_closed
+
+
+@pytest.mark.parametrize("via", ["tool", "adapter"])
+async def test_a_refusal_logs_the_same_line_on_every_path(via: str, caplog: Any) -> None:
+    adapter, hub, conn = _adapter()
+    summon = await _summon_on_route(adapter, hub, LID_DM, conn)
+    key = summon.source.thread_id
+    caplog.set_level(logging.DEBUG)
+    if via == "tool":
+        tool = _bound_tool(adapter, chatlytics_send, "chatlytics_send")
+        await _in_turn(key, lambda: tool({"chatId": "15550002222@c.us", "text": "x"}))
+    else:
+        await _in_turn(key, lambda: adapter.send("15550002222@c.us", "x"))
+    lines = [r for r in caplog.records if "summon send refused" in r.getMessage()]
+    assert [r.levelname for r in lines] == ["ERROR"]
+    assert lines[0].getMessage() == (
+        f"chatlytics#956: summon send refused, summon_target_unclear chat=15550002222@c.us scope={key}"
+    )
+    assert hub.bodies == []
+
+
+async def test_a_lost_summons_tool_logs_its_refusal(caplog: Any) -> None:
+    adapter, hub, _ = _adapter()
+    tool = _bound_tool(adapter, chatlytics_send, "chatlytics_send")
+    caplog.set_level(logging.ERROR)
+    await _in_turn(read_scope.LOST_KEY, lambda: tool({"chatId": PEER, "text": "x"}))
+    assert "summon send refused, summon_scope_lost" in caplog.text
+
+
+async def test_a_refused_target_is_cut_down_for_the_log(caplog: Any) -> None:
+    adapter, hub, conn = _adapter()
+    summon = await _summon_on_route(adapter, hub, LID_DM, conn)
+    tool = _bound_tool(adapter, chatlytics_send, "chatlytics_send")
+    caplog.set_level(logging.ERROR)
+    await _in_turn(summon.source.thread_id, lambda: tool({"chatId": "Dana\nFAKE LINE " + "x" * 200, "text": "x"}))
+    line = next(r.getMessage() for r in caplog.records if "summon send refused" in r.getMessage())
+    assert "\n" not in line and "x" * 65 not in line
+
+
+class _ActionHub(_Hub):
+    """The hub's /api/v1/actions for a bot: api-v1.ts with bot-action-authz and fromMeRouteActionTargetsChat.
+
+    The route is kept under every alias of the chat, as recordFromMeRoute does.
+    """
+
+    SEND_CLASS = {"poll", "send", "sendPoll", "forwardMessage"}
+    ROUTE = {"react", "startTyping", "stopTyping", "sendSeen"}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ran: List[Tuple[str, str, Dict[str, Any]]] = []  # (session it ran on, action, params)
+
+    async def post(self, path: str, json: Dict[str, Any], timeout: Any = None) -> _Resp:  # noqa: A002
+        if path != "/api/v1/actions":
+            return await super().post(path, json, timeout)
+        self.bodies.append((path, dict(json)))
+        action, params = json["action"], json.get("params") or {}
+        if action in self.SEND_CLASS:
+            return _Resp(403, {"success": False, "error": "bot_send_via_dispatch_denied"})
+        session = self.own
+        if action in self.ROUTE:
+            chat = params.get("chatId")
+            verdict = self._verdict(json.get("session"), chat or "") if chat else self.own
+            if verdict is None:
+                return _Resp(409, {"success": False, "code": "from_me_route_expired"})
+            if verdict != self.own:
+                ids = [params.get("messageId"), *(params.get("messageIds") or [])]
+                for i in filter(None, ids):
+                    named = i.split("_")[1] if i.count("_") >= 2 else ""
+                    if named.replace("@s.whatsapp.net", "@c.us") != chat:
+                        return _Resp(403, {"success": False, "code": "from_me_route_target_mismatch"})
+            session = verdict
+        self.ran.append((session, action, dict(params)))
+        return _Resp(200, {"success": True, "session_used": session})
+
+
+LID_WITH_PHONE = {**LID_DM, "chat_phone": "15550001111"}
+PHONE_JID = "15550001111@c.us"
+
+
+async def _lid_summon(adapter: Any, hub: _Hub, conn: _BotConn) -> str:
+    summon = await _summon_on_route(adapter, hub, LID_WITH_PHONE, conn)
+    hub.routes[PHONE_JID] = OWNER_SESSION
+    return summon.source.thread_id
+
+
+@pytest.mark.parametrize("given,mid,sent", [
+    (PHONE_JID, f"false_{PHONE_JID}_ABC", PHONE_JID),
+    ("15550001111", f"false_{PHONE_JID}_ABC", PHONE_JID),
+    (None, f"false_{PHONE_JID}_ABC", PHONE_JID),
+    (PHONE_JID, f"false_{LID_CHAT}_ABC", LID_CHAT),
+    (LID_CHAT, f"false_{LID_CHAT}_ABC", LID_CHAT),
+    ("999@c.us", f"false_{LID_CHAT}_ABC", LID_CHAT),
+])
+async def test_a_reaction_keeps_the_chat_its_message_id_names(given: Optional[str], mid: str, sent: str) -> None:
+    adapter, hub, conn = _adapter(_ActionHub())
+    key = await _lid_summon(adapter, hub, conn)
+    tool = _bound_tool(adapter, chatlytics_react, "chatlytics_react")
+    args = {"messageId": mid, "emoji": "x", **({"chatId": given} if given else {})}
+    assert json.loads(await _in_turn(key, lambda: tool(args)))["success"]
+    assert hub.ran == [(OWNER_SESSION, "react", {"messageId": mid, "emoji": "x", "chatId": sent})]
+
+
+async def test_a_reaction_with_an_id_that_names_no_chat_still_takes_the_envelopes_spelling() -> None:
+    adapter, hub, conn = _adapter(_ActionHub())
+    key = await _lid_summon(adapter, hub, conn)
+    tool = _bound_tool(adapter, chatlytics_react, "chatlytics_react")
+    await _in_turn(key, lambda: tool({"messageId": "ABC", "emoji": "x", "chatId": "15550001111"}))
+    assert hub.bodies[-1][1]["params"]["chatId"] == LID_CHAT and hub.bodies[-1][1]["session"] == OWNER_SESSION
+
+
+async def test_a_reaction_to_another_chats_message_stays_on_the_bot() -> None:
+    adapter, hub, conn = _adapter(_ActionHub())
+    key = await _lid_summon(adapter, hub, conn)
+    tool = _bound_tool(adapter, chatlytics_react, "chatlytics_react")
+    other = "888@lid"
+    await _in_turn(key, lambda: tool({"messageId": f"false_{other}_ABC", "emoji": "x", "chatId": other}))
+    assert hub.ran[-1][0] == BOT_SESSION and "session" in hub.bodies[-1][1]
+
+
+async def test_a_message_id_this_summon_cant_place_is_refused() -> None:
+    adapter, hub, conn = _adapter(_ActionHub())
+    summon = await _summon_on_route(adapter, hub, LID_DM, conn)  # no chat_phone
+    tool = _bound_tool(adapter, chatlytics_react, "chatlytics_react")
+    out = json.loads(await _in_turn(summon.source.thread_id, lambda: tool(
+        {"messageId": f"false_{PHONE_JID}_ABC", "emoji": "x", "chatId": LID_CHAT})))
+    assert not out["success"] and hub.bodies == []
+
+
+async def test_seen_by_message_ids_names_the_owner_through_dispatch() -> None:
+    adapter, hub, conn = _adapter(_ActionHub())
+    key = await _lid_summon(adapter, hub, conn)
+    tool = _bound_tool(adapter, chatlytics_dispatch, "chatlytics_dispatch")
+    ids = [f"false_{PHONE_JID}_A", f"false_{PHONE_JID}_B"]
+    await _in_turn(key, lambda: tool({"action": "sendSeen", "parameters": {"messageIds": ids}}))
+    assert hub.ran == [(OWNER_SESSION, "sendSeen", {"messageIds": ids, "chatId": PHONE_JID})]
+
+
+async def test_a_session_a_model_names_doesnt_move_a_summons_reaction() -> None:
+    adapter, hub, conn = _adapter(_ActionHub())
+    summon = await _summon_on_route(adapter, hub, ENVELOPES["from_me_dm"], conn)
+    tool = _bound_tool(adapter, chatlytics_dispatch, "chatlytics_dispatch")
+    await _in_turn(summon.source.thread_id, lambda: tool(
+        {"action": "react", "target": PEER, "session": BOT_SESSION, "parameters": {"messageId": f"false_{PEER}_A", "emoji": "x"}}))
+    assert hub.ran[-1][0] == OWNER_SESSION
+
+
+async def test_on_an_ordinary_turn_an_action_is_exactly_what_it_was() -> None:
+    adapter, hub, conn = _adapter(_ActionHub())
+    await _lid_summon(adapter, hub, conn)
+    tool = _bound_tool(adapter, chatlytics_dispatch, "chatlytics_dispatch")
+    mid = f"false_{PHONE_JID}_ABC"
+    await _in_turn("", lambda: tool({"action": "react", "target": LID_CHAT, "parameters": {"messageId": mid, "emoji": "x"}}))
+    assert hub.bodies[-1][1] == {
+        "action": "react", "params": {"chatId": LID_CHAT, "messageId": mid, "emoji": "x"}, "session": BOT_SESSION,
+    }
+    await _in_turn("", lambda: tool({"action": "react", "target": LID_CHAT, "session": "theirs", "parameters": {"messageId": mid, "emoji": "x"}}))
+    assert hub.bodies[-1][1]["session"] == "theirs"
+
+
+_OFF_ROUTE_TOOLS = [
+    (chatlytics_poll, "chatlytics_poll", {"chatId": PEER, "question": "q", "options": ["a", "b"]}),
+    (chatlytics_edit, "chatlytics_edit", {"chatId": PEER, "messageId": "ABC", "text": "t"}),
+    (chatlytics_unsend, "chatlytics_unsend", {"chatId": PEER, "messageId": "ABC"}),
+    (chatlytics_delete, "chatlytics_delete", {"chatId": PEER, "messageId": "ABC"}),
+    (chatlytics_pin, "chatlytics_pin", {"chatId": PEER, "messageId": "ABC"}),
+    (chatlytics_unpin, "chatlytics_unpin", {"chatId": PEER, "messageId": "ABC"}),
+    (chatlytics_pin, "chatlytics_pin", {"messageId": f"false_{PEER}_ABC"}),
+    (chatlytics_edit, "chatlytics_edit", {"messageId": f"true_{PEER}_ABC", "text": "t"}),
+    (chatlytics_poll, "chatlytics_poll", {"chatId": PEER_DIGITS, "question": "q", "options": ["a", "b"]}),
+    (chatlytics_dispatch, "chatlytics_dispatch", {"action": "send", "target": PEER, "parameters": {"text": "x"}}),
+    (chatlytics_dispatch, "chatlytics_dispatch", {"action": "sendPoll", "parameters": {"chatId": PEER}}),
+    (chatlytics_dispatch, "chatlytics_dispatch", {"action": "sendImage", "parameters": {"to": PEER}}),
+    (chatlytics_dispatch, "chatlytics_dispatch", {"action": "forwardMessage", "target": f"whatsapp:{PEER}"}),
+    (chatlytics_dispatch, "chatlytics_dispatch", {"action": "pin", "target": PEER, "session": OWNER_SESSION}),
+    (chatlytics_dispatch, "chatlytics_dispatch", {"action": "someNewVerb", "parameters": {"target": PEER}}),
+]
+
+
+@pytest.mark.parametrize("handler,name,args", _OFF_ROUTE_TOOLS)
+async def test_an_action_the_hub_cant_route_is_refused_in_the_summoned_chat(handler: Any, name: str, args: Dict[str, Any], caplog: Any) -> None:
+    adapter, hub, conn = _adapter(_ActionHub())
+    summon = await _summon_on_route(adapter, hub, ENVELOPES["from_me_dm"], conn)
+    tool = _bound_tool(adapter, handler, name)
+    caplog.set_level(logging.ERROR)
+    out = json.loads(await _in_turn(summon.source.thread_id, lambda: tool(args)))
+    assert out == {"success": False, "error": read_scope.SummonActionOffRoute.error}
+    assert hub.bodies == [] and hub.ran == []
+    assert "summon send refused, summon_action_off_route" in caplog.text
+
+
+@pytest.mark.parametrize("handler,name,args", [
+    (chatlytics_pin, "chatlytics_pin", {"chatId": "999@c.us", "messageId": "ABC"}),
+    (chatlytics_edit, "chatlytics_edit", {"messageId": "false_999@c.us_ABC", "text": "t"}),
+    (chatlytics_dispatch, "chatlytics_dispatch", {"action": "muteChat", "target": OTHER_GROUP}),
+    (chatlytics_dispatch, "chatlytics_dispatch", {"action": "search", "parameters": {"query": "Dana"}}),
+])
+async def test_an_action_elsewhere_or_on_no_chat_stays_as_designed(handler: Any, name: str, args: Dict[str, Any]) -> None:
+    adapter, hub, conn = _adapter(_ActionHub())
+    summon = await _summon_on_route(adapter, hub, ENVELOPES["from_me_dm"], conn)
+    tool = _bound_tool(adapter, handler, name)
+    assert json.loads(await _in_turn(summon.source.thread_id, lambda: tool(args)))["success"]
+    assert hub.ran[-1][0] == BOT_SESSION and "session" not in hub.bodies[-1][1]
+
+
+@pytest.mark.parametrize("handler,name,args", [
+    entry for entry in _OFF_ROUTE_TOOLS if entry[1] != "chatlytics_dispatch"
+])
+async def test_on_an_ordinary_turn_those_actions_reach_the_hub_as_before(handler: Any, name: str, args: Dict[str, Any]) -> None:
+    adapter, hub, conn = _adapter(_ActionHub())
+    await _summon_on_route(adapter, hub, ENVELOPES["from_me_dm"], conn)
+    tool = _bound_tool(adapter, handler, name)
+    await _in_turn("", lambda: tool(args))
+    assert len(hub.bodies) == 1 and "session" not in hub.bodies[0][1]
+
+
+async def test_an_action_on_what_may_be_this_person_is_refused() -> None:
+    adapter, hub, conn = _adapter(_ActionHub())
+    summon = await _summon_on_route(adapter, hub, LID_DM, conn)  # no chat_phone
+    tool = _bound_tool(adapter, chatlytics_pin, "chatlytics_pin")
+    out = json.loads(await _in_turn(summon.source.thread_id, lambda: tool({"chatId": PHONE_JID, "messageId": "ABC"})))
+    assert not out["success"] and hub.bodies == []
+
+
+async def test_an_action_of_a_lost_summon_is_refused() -> None:
+    adapter, hub, _ = _adapter(_ActionHub())
+    tool = _bound_tool(adapter, chatlytics_pin, "chatlytics_pin")
+    out = json.loads(await _in_turn(read_scope.LOST_KEY, lambda: tool({"chatId": PEER, "messageId": "ABC"})))
+    assert out == {"success": False, "error": read_scope.SummonScopeLost.error} and hub.bodies == []
+
+
+async def test_a_reactions_own_409_closes_the_route_too() -> None:
+    adapter, hub, conn = _adapter(_ActionHub())
+    summon = await _summon_on_route(adapter, hub, ENVELOPES["from_me_dm"], conn)
+    key = summon.source.thread_id
+    hub.routes.pop(PEER)
+    tool = _bound_tool(adapter, chatlytics_react, "chatlytics_react")
+    out = json.loads(await _in_turn(key, lambda: tool({"messageId": f"false_{PEER}_ABC", "emoji": "x", "chatId": PEER})))
+    assert out["status_code"] == 409 and read_scope.scope_for_key(key).route_closed
+
+
+async def test_a_tools_409_with_a_body_that_is_not_json_is_a_failure_and_closes_nothing() -> None:
+    class _Html(_Hub):
+        async def post(self, path: str, json: Dict[str, Any], timeout: Any = None) -> Any:  # noqa: A002
+            self.bodies.append((path, dict(json)))
+            resp = _Resp(409, {})
+
+            def bad() -> Any:
+                raise ValueError("not json")
+
+            resp.json = bad  # type: ignore[method-assign]
+            return resp
+
+    adapter, hub, conn = _adapter(_Html())
+    summon = await _summon_on_route(adapter, hub, ENVELOPES["from_me_dm"], conn)
+    tool = _bound_tool(adapter, chatlytics_send, "chatlytics_send")
+    out = json.loads(await _in_turn(summon.source.thread_id, lambda: tool({"chatId": PEER, "text": "x"})))
+    assert out["success"] is False and out["status_code"] == 409
+    assert not read_scope.scope_for_key(summon.source.thread_id).route_closed

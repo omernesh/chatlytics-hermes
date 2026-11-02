@@ -7,8 +7,9 @@
   envelope's session and chat, sees through the `tool_call` wrapper, and refuses tools whose
   reach can't be limited, and a `transform_tool_result` hook refuses a result that can't be
   shown to be that chat. Also refused on such a turn: `session_search`, the hub's reads of the
-  bot's own number, and shell, code and MCP tools whose arguments name the archive or the
-  host's stores. A failure inside the check refuses. Other turns are untouched.
+  bot's own number, shell and code tools that name the archive or the host's stores, and MCP
+  tools whose url, path, file, command or query argument points at them. A failure inside the
+  check refuses. Other turns are untouched.
 - **A summoned turn starts clean** (chatlytics#956). Each summon runs in its own Hermes
   session, so it inherits no earlier turn of the chat, and its transcript is not in the history
   of later turns. `session_search` on an ordinary turn and `memory` can still reach what it did:
@@ -21,7 +22,8 @@
   another spelling of its chat leaves from the owner's number, and one that may be its person under an
   id the envelope doesn't give is refused rather than sent from the bot's. A summon on an extra bot
   uses that bot's bearer for its tools and its `/retry`, and a late retry by the host can't post an old
-  answer into a route a later summon reopened.
+  answer into a route a later summon reopened. An action the hub would run from the wrong account in
+  the summoned chat, such as a poll or a pin, is refused with a clear tool result.
 
 ## [5.3.0] - 2026-11-02
 
