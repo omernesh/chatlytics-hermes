@@ -2819,6 +2819,14 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     memory_strip.log_summon_refused(body["chatId"], why)
                 return
         cp = with_trigger_context(cp, env, summon_scope.key if summon_scope else None)
+        # chatlytics#956: any other turn reads only its own chat on this bot's session, except the
+        # owner's own DM with the bot. Reads only: see read_scope.open_chat_turn. Keep in sync with
+        # inbound.py. DO NOT REMOVE.
+        if not is_summon:
+            cp = read_scope.with_chat_limit(cp, read_scope.open_chat_turn(
+                env, event, getattr(self.config, "extra", None) or {}, authenticated=True,
+                own_session=conn.own_session if conn is not None and conn.own_session_confirmed else None,
+            ))
         # hasattr guard = harness-drift tolerance (older MessageEvent
         # dataclasses without the field must not grow a stray attribute).
         if isinstance(cp, str) and cp.strip():

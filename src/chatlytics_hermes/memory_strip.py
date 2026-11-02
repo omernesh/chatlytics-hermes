@@ -58,7 +58,14 @@ from pathlib import Path
 from typing import Any, Callable, List, Mapping, Optional, Tuple
 
 from . import read_scope
-from .trigger_context import FROM_ME, SUMMON_TOKEN, TURN_CONTEXT_MARKER, render_trigger_context
+from .trigger_context import (
+    CHAT_LIMIT_MARKER,
+    CHAT_SCOPE_TOKEN,
+    FROM_ME,
+    SUMMON_TOKEN,
+    TURN_CONTEXT_MARKER,
+    render_trigger_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -486,6 +493,13 @@ def _note_read_scope(request: Mapping[str, Any], evidence: Optional[str], sessio
             joined = "\n\n".join(_system_strings(request) or ())
             at = joined.rfind(SUMMON_TOKEN)
             named = joined[at:].split("\n", 1)[0] if at >= 0 else ""
+        elif evidence is None:
+            # A chat read scope is not a summon: memory stays, and this only binds the ids.
+            joined = "\n\n".join(_system_strings(request) or ())
+            at = joined.rfind(CHAT_SCOPE_TOKEN)
+            if at >= 0 and joined.startswith(CHAT_LIMIT_MARKER, _line_start(joined, at)):
+                read_scope.note_chat_request(joined[at:].split("\n", 1)[0], session_id, task_id)
+                return
         read_scope.note_request(evidence is not None, named, session_id, task_id)
     except Exception:  # noqa: BLE001
         logger.exception("chatlytics#956: could not note the read scope of a provider request")

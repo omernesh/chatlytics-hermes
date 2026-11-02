@@ -442,11 +442,11 @@ async def test_the_hosts_send_message_path_finds_the_summon_by_context() -> None
 # --- finding 2: a key with no scope --------------------------------------------------------------
 
 
-def _hook_in(thread_id: str, args: Any, ids: str = "resumed") -> Any:
+def _hook_in(thread_id: str, args: Any, ids: str = "resumed", platform: str = "chatlytics") -> Any:
     from gateway import session_context as sc
 
     def run() -> Any:
-        sc.set_session_vars(platform="chatlytics", thread_id=thread_id)
+        sc.set_session_vars(platform=platform, thread_id=thread_id)
         return pre_tool_call(tool_name=LM, args=args, session_id=ids, task_id=ids)
 
     return contextvars.copy_context().run(run)
@@ -466,7 +466,12 @@ async def test_an_evicted_scope_reads_nothing() -> None:
 
 @pytest.mark.parametrize("thread_id", ["", "123", "summon-short", "summon-0000000000000000x"])
 def test_any_other_thread_id_is_an_ordinary_turn(thread_id: str) -> None:
-    assert _hook_in(thread_id, {"session": "all"}) is None
+    # Not on this platform: a Chatlytics turn with no chat scope entry reads nothing either, by its
+    # own reason. tests/test_chat_read_scope.py has that.
+    assert _hook_in(thread_id, {"session": "all"}, platform="telegram") is None
+    verdict = _hook_in(thread_id, {"session": "all"})
+    assert verdict is not None and "no_scope_for_this_turn" in verdict["message"]
+    assert read_scope._NO_CHAT_SCOPE.kind == read_scope.KIND_CHAT
 
 
 # --- finding 3: /stop and /new -------------------------------------------------------------------

@@ -3,7 +3,9 @@
 When the owner of a WhatsApp number types a bot's trigger in one of their own chats, the hub
 delivers an envelope with `trigger_source: "from_me"`. The reply goes into that chat from the
 owner's number, so the other people there read it. Such a turn may read only that chat on that
-account, and may not inherit earlier turns of the chat. Other turns are not affected in any way.
+account, and may not inherit earlier turns of the chat. Every other Chatlytics turn, except the owner's
+own DM with the bot, has its reads limited too, and nothing else about it changes: see
+[The chat read scope](#the-chat-read-scope).
 
 ## Read scope
 
@@ -292,6 +294,68 @@ A name the host cut to 64 characters is compared with what the host makes of tha
 
 **An ordinary turn is not covered.** Its `send_message` still follows the owner's live route, because the hub decides that. See row H5.
 
+## The chat read scope
+
+**The rule.** The bot's full read access applies only in the owner's own DM with the bot. Every other Chatlytics turn may read only the chat it is in, on the bot's own session.
+
+Measured live before this: a group member's trigger called `list_messages` with `session: all` through `tool_call` and got data. The owner's trigger in a group where the bot's own account is a member came from the bot's own leg with no `trigger_source`, so it was an ordinary turn, and did the same.
+
+| Turn | Reads |
+|---|---|
+| The owner's own DM with the bot | Everything, as before. No scope. |
+| A summon | The summon's rules above, on the owner's session. Not changed. |
+| Someone else's DM with the bot | This chat, on the bot's session. |
+| A group member's trigger | This chat, on the bot's session. |
+| The owner's trigger in a group with the bot | This chat, on the bot's session. |
+| A turn whose owner or sender can't be told, or an unsigned webhook | Limited (see below). |
+| Telegram, CLI, cron, any other platform | No envelope, no scope. |
+
+### Who the owner is
+
+The same check that produces `[owner reply]` (`owner.py`): the gateway's `allow_admin_from` for a DM, against the sender the hub delivered on an authenticated transport. It is not the hub's pairing, which the plugin doesn't read. `is_owner_dm` also needs the chat itself to be on that list, because an owner-session envelope with no `trigger_source` has the owner as the sender of their chat with someone else. `CHATLYTICS_OWNER_TAGGING=off` turns off the text prefix only.
+
+Every failure limits the turn:
+
+- **No `allow_admin_from`.** A bot with no owner on record is limited on every turn, with its own operator too. The log's `scope opened` line says `owner_known=False`. To give a bot's owner full access, list them.
+- **One form of a person.** `@c.us` and `@lid` are separate ids. If the hub delivers the owner's DM under a form that isn't listed, as sender or as chat, that DM is limited. List both. See row C4.
+- **An unsigned webhook** can't claim anybody, and its session can't be believed either, so it reads nothing from the archive.
+- **Several bots on one gateway.** The list belongs to the platform config, so it covers every bot of that gateway: whoever is on it is the owner in a DM with any of them. The session is per bot: it's the envelope's, on the bearer the envelope arrived on.
+
+### What it limits
+
+The enforcement above, unchanged: [Lextrove tools](#lextrove-tools), [Other routes](#other-routes), `tool_call`, `transform_tool_result`, `delegate_task` and `execute_code`, also where it says `summon`. The session is the envelope's. A session that disagrees with what `GET /api/v1/bot/me` said for that bearer, or none, means Lextrove reads are refused for the turn. So does a Chatlytics turn this process didn't dispatch, such as one resumed after a restart: the next message opens its scope again.
+
+Two things are worth saying because they are new for an ordinary turn:
+
+- `chatlytics_read` and the hub's `read_messages` are refused even for this chat, as on a summon. On a bot with no Lextrove server, such a turn can read only its history.
+- A tool is taken for Lextrove's by its name, on any MCP server. On a limited turn another server's `list_messages` or `get_contact` gets the same refusal.
+
+### What doesn't change
+
+Accounts, routes, session keys, history, memory (the memory strip stays summon-only), the owner-DM fallback, the bubble, the home-channel notice and redelivery. A limited turn keeps its `source.thread_id`, starts no clean session, and keeps `chatlytics_send` and the hub's MCP send tools: `hub_tool_skips_summon_checks` and `summon_action_off_route` are summon-only. The scope has `kind` chat and its own tables, and its key isn't in the summon format, so nothing on the send path can take it for a summon.
+
+The line and its key are the same on every turn of a chat in one process, so the system prompt doesn't change from turn to turn and a session that keeps its history keeps its provider cache.
+
+### What this does not stop
+
+As above: this stops a confused model, not a hostile one. [What this does not stop](#what-this-does-not-stop) applies in full, minus the send items, and:
+
+- **A host that can't run the hooks keeps the turn.** Unlike a summon, the turn isn't dropped, because that would silence the bot for everyone. Reads are as wide as they were before this scope, and the log has one ERROR: `chat read scope cannot be enforced on this host`.
+- **`execute_code` without the middleware.** Its tool calls are found by the ids that the `llm_request` middleware binds. On a host without it, only the context variables are left, which don't reach that thread.
+- **Two bots in one chat on one gateway.** A subagent finds its scope by the chat alone, so during an overlap it can get the other bot's session. It is still that chat.
+
+### The log
+
+```
+chatlytics#956: chat scope opened kind=chat scope=<key> session=<s> chat=<id> chat_type=dm has_phone=False owner_known=True
+chatlytics#956: no chat scope, the owner's own DM kind=chat chat=<id>
+chatlytics#956: chat read allowed kind=chat tool=<name> scope=<key> turn=<id>
+chatlytics#956: chat read refused kind=chat tool=<name> reason=<code> scope=<key> turn=<id>
+chatlytics#956: chat read scope cannot be enforced on this host, reads are NOT limited: <why>
+```
+
+The reasons are the summon's, so `session_not_summon` means "not this turn's session" here too. The model gets the session and chat in the refusal, so it can make the read that works. Both prompt lines tell it to call a limit "this chat" and never to repeat session ids or phone numbers to people.
+
 ## Live test rows
 
 What can't be decided without a real hub and real accounts. Each row says what decides it.
@@ -316,3 +380,7 @@ What can't be decided without a real hub and real accounts. Each row says what d
 | H8 | The gateway's MCP bearer differs from the summoned bot's, if it does on any profile. Have the model call `send_message` to the chat id. | Refused. The hub's log has nothing for that bot's fingerprint. |
 | H9 | On the same gateway, another MCP server with a `send_message` tool that doesn't mention WhatsApp. Have a summon call it. | It runs. This is the false refusal to look for. |
 | B1 | A long summon, `/stop` after the bubble is up. | Records the stuck bubble in **Known gaps**: whether "working..." stays, and for how long. |
+| C1 | A group member who isn't the owner triggers the bot, and asks about another chat so that the model reads `session: all`. | The log has `chat scope opened kind=chat` and `chat read refused kind=chat ... reason=session_not_summon`. The reply says it can read only this chat, with no session id or phone. A read of this chat with the bot's session runs. The reply leaves from the bot's number. |
+| C2 | The owner types the trigger in a group where the bot's own account is a member. Same question. | The same as C1, with the text tagged `[owner reply]`. The reply leaves from the bot's number. |
+| C3 | Someone other than the owner DMs the bot. Same question, then ask about the DM itself. | The wide read is refused, and the read of this DM on the bot's session runs. The turn still has its earlier history. |
+| C4 | The owner DMs the bot from their usual device. Have the model read `session: all`. | The log has `no chat scope, the owner's own DM`, and the read runs. If it has `chat scope opened` instead, the hub delivered a form that isn't listed: compare `sender_jid` and `entity_jid` with `allow_admin_from`. |

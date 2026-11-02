@@ -27,6 +27,7 @@ from typing import Any, Callable, Dict, Optional
 
 from aiohttp import web
 
+from . import read_scope
 from .memory_strip import log_summon_refused, summon_refusal
 from .trigger_context import FROM_ME, with_trigger_context
 from .owner import (
@@ -368,6 +369,12 @@ def make_webhook_handler(adapter: Any) -> Callable[[web.Request], Any]:
             # Only a signed webhook may say the owner summoned this turn.
             if secret:
                 cp = with_trigger_context(cp, payload, summon_scope.key if summon_scope else None)
+            # chatlytics#956 — same as adapter._dispatch_envelope (keep in sync). An unsigned webhook
+            # is never the owner, and reads nothing. DO NOT REMOVE.
+            if summon_scope is None:
+                cp = read_scope.with_chat_limit(cp, read_scope.open_chat_turn(
+                    payload, event, _owner_extra, authenticated=bool(secret)
+                ))
             if isinstance(cp, str) and cp.strip():
                 if hasattr(event, "channel_prompt"):
                     event.channel_prompt = cp.strip()

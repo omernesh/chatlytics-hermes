@@ -82,6 +82,7 @@ def test_the_exact_failed_call_is_refused_and_says_what_to_do(caplog: pytest.Log
 
 def test_a_refusal_log_line_holds_no_arguments(caplog: pytest.LogCaptureFixture) -> None:
     _open()
+    caplog.clear()  # The scope's own line, if an earlier test's real agent left the root logger at INFO.
     with caplog.at_level(logging.INFO, logger="chatlytics_hermes"):
         _pre(SM, {**DM_READ, "query": "SECRET-WORDS", "session": "all"})
         _pre("session_search", {"query": "SECRET-WORDS"})

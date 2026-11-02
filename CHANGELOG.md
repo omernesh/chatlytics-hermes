@@ -31,6 +31,17 @@
   and the model is told to use `chatlytics_send`. A tool of the same name on another MCP server keeps
   working, unless it describes itself as WhatsApp or its server has a `chatlytics_` tool. Ordinary turns
   and the summon's reply are unchanged.
+- **Full read access applies only in the owner's own DM with the bot** (chatlytics#956). Every other
+  Chatlytics turn, which means someone else's DM, a group member's trigger, and the owner's own trigger in a
+  group with the bot, may read only its chat on the bot's own session, under the same checks as a summon. It
+  keeps its session, history, memory, account and send tools. The owner is the existing `allow_admin_from`
+  check, so **a bot with no `allow_admin_from` is limited on every turn**, and an owner reached under an
+  unlisted `@lid` or `@c.us` form is limited in that DM. On a limited turn `chatlytics_read`, the hub's
+  `read_messages` and `session_search` are refused, and another MCP server's tool with a Lextrove tool's name
+  gets the same refusal. Telegram, CLI and cron turns are not affected. See docs/summoned-turns.md.
+- **Summon and limited turns don't repeat ids to people** (chatlytics#956). Their prompt lines say to call a
+  limit "this chat" and never to repeat session ids or phone numbers. A tool's refusal keeps the ids, for the
+  model's next call.
 
 ## [5.3.0] - 2026-11-02
 

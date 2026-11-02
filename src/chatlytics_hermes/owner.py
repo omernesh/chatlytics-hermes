@@ -260,6 +260,21 @@ def _source_is_owner(source: Any, extra: Any) -> bool:
     )
 
 
+def is_owner_dm(source: Any, extra: Any) -> bool:
+    """Is this the owner's own DM with the bot? (chatlytics#956 chat read scope)
+
+    A DM whose sender is the owner, by the same check as the tag, and whose chat is the owner too.
+    DO NOT drop the second half. An owner-session envelope with no ``trigger_source`` (one queued by an
+    older hub, or any gap in the marker) has the owner as the sender of their chat with someone else,
+    so the sender alone would open every account's messages on a turn that answers that other person.
+    Fails closed like the rest of this file: an owner reachable under both ``@lid`` and ``@c.us`` must
+    list both forms, or a DM where the two ids differ counts as somebody else's.
+    """
+    chat_id = getattr(source, "chat_id", None)
+    # A group or channel id has no canonical identity, so the second half is False for it.
+    return _source_is_owner(source, extra) and is_owner(chat_id, getattr(source, "chat_type", None), extra, chat_id)
+
+
 # ASCII fast path for _fold_char: same result as the general path (ASCII is
 # NFKD-stable; ()[]{}<> are the ASCII brackets), without the unicodedata
 # calls. Built once from the general path itself so the two cannot drift.

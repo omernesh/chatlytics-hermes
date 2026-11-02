@@ -252,8 +252,13 @@ See [docs/features.md](docs/features.md) for the full behavior contracts.
 - **A summoned turn reads only its own chat, and starts clean (chatlytics#956)**: see
   [docs/summoned-turns.md](docs/summoned-turns.md). Enforced in code on the tool call and
   on its result, against the values in the envelope. Refused reads are logged as
-  `chatlytics#956: summon read refused tool=... reason=... scope=... turn=...`. Other
-  turns are untouched, and summons are refused on a host that can't run the hooks.
+  `chatlytics#956: summon read refused tool=... reason=... scope=... turn=...`. Summons
+  are refused on a host that can't run the hooks.
+- **Full read access only in the owner's own DM with the bot (chatlytics#956)**: every other
+  Chatlytics turn reads only its chat on the bot's own session, and keeps its session, history,
+  memory and sends. The owner is `allow_admin_from`, so a bot without one is limited on every
+  turn, and an owner reached under both `@c.us` and `@lid` must list both. See
+  [The chat read scope](docs/summoned-turns.md#the-chat-read-scope).
 - **Tools work everywhere (v4.5.2/v4.5.3)** — a module-level live-adapter
   registry fixed "adapter is not connected" on hermes 0.16 longpoll
   gateways, and host-injected kwargs (e.g. `task_id`) are now filtered to
