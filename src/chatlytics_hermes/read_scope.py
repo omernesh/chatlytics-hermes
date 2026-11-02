@@ -22,7 +22,7 @@ no context line releases the binding, so an ordinary turn is never held to a sum
 **Clean start.** The key as ``source.thread_id`` also gives each summon its own Hermes session
 (``build_session_key`` includes it), so it has no earlier turns to inherit, and its own tool loop,
 fallback and compression run unchanged inside that session. See docs/summoned-turns.md for why
-this and not cutting history out of the request.
+this and not cutting history out of the request, and for which account its sends leave from.
 
 Every Lextrove tool is listed in :data:`LEXTROVE_RULES`. A tool on that server not listed there is
 refused. This is enforcement against a confused model, not a sandbox: see :data:`_TEXT_ROUTE` for
@@ -34,13 +34,19 @@ non-summoned turn reach any of this: it must behave exactly as it did before.
 
 from __future__ import annotations
 
+import contextvars
+import hashlib
 import json
 import logging
+import os
 import re
 import secrets
+import tempfile
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Mapping, Optional, Set, Tuple
 
 from .trigger_context import _safe_id, _safe_phone
@@ -90,6 +96,54 @@ _NO_SCOPE = SummonScope(key="none")
 _lock = threading.Lock()
 _scopes: "OrderedDict[str, SummonScope]" = OrderedDict()
 _bound: "OrderedDict[str, SummonScope]" = OrderedDict()
+
+# A summon whose scope this process no longer has: the format of a key, and in no table.
+LOST_KEY = "summon-" + "0" * 16
+# Set around a chatlytics_* tool call by the adapter: the turn the tool runs in, and how to name the
+# session of a send it makes. Default None: a handler called any other way sends what it always sent.
+TOOL_TURN_KEY: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar("chatlytics_tool_turn", default=None)
+OUTBOUND_RESOLVER: "contextvars.ContextVar[Optional[Callable[[str], Optional[str]]]]" = contextvars.ContextVar(
+    "chatlytics_outbound_resolver", default=None
+)
+
+
+class SummonScopeLost(Exception):
+    """A summon's send whose account can't be named: see :func:`scope_for_key`."""
+
+
+def is_scope_key(value: Any) -> bool:
+    return isinstance(value, str) and _SCOPE_KEY.fullmatch(value) is not None
+
+
+def scope_for_key(key: str) -> Optional[SummonScope]:
+    return _scopes.get(key)
+
+
+def chat_in_scope(scope: SummonScope, chat_id: Any) -> bool:
+    return _norm_jid(chat_id) in scope.chat_forms
+
+
+def current_turn_key() -> Optional[str]:
+    """The scope key of the summon this code runs inside, or None on any other turn."""
+    key = TOOL_TURN_KEY.get()
+    if key:
+        return key
+    try:
+        key = _session_thread_id()
+    except Exception:  # noqa: BLE001 -- no gateway session context: not inside a summon
+        return None
+    return key if is_scope_key(key) else None
+
+
+def turn_key_for_tool(task_id: Any) -> Optional[str]:
+    """Like :func:`current_turn_key`, also through the task id a host passes to a tool."""
+    key = current_turn_key()
+    if key or not task_id:
+        return key
+    scope = _bound.get(task_id)
+    if scope is None:
+        return None
+    return LOST_KEY if scope is _NO_SCOPE else scope.key
 
 
 def _norm(value: Any) -> Optional[str]:
@@ -168,10 +222,21 @@ def note_request(summoned: bool, system_text: str, session_id: Any, task_id: Any
             _bound.popitem(last=False)
 
 
-def _thread_scope() -> Optional[SummonScope]:
+def _session_thread_id() -> str:
     from gateway.session_context import get_session_env
 
-    return _scopes.get(get_session_env("HERMES_SESSION_THREAD_ID", ""))
+    return get_session_env("HERMES_SESSION_THREAD_ID", "") or ""
+
+
+def _thread_scope() -> Optional[SummonScope]:
+    # DO NOT CHANGE: a thread id in the key's format IS a summon, whether or not this process still
+    # has its scope (a restart, an eviction, a delegate after a resume). No entry means nothing says
+    # which chat, so it reads nothing. Answering None here made it an ordinary turn, which reads
+    # anything: list_messages with session all passed (chatlytics#956 review).
+    key = _session_thread_id()
+    if not is_scope_key(key):
+        return None
+    return _scopes.get(key) or _NO_SCOPE
 
 
 def _scope_for(session_id: Any, task_id: Any) -> Optional[SummonScope]:
@@ -185,6 +250,96 @@ def _scope_for(session_id: Any, task_id: Any) -> Optional[SummonScope]:
         if i and i in _bound:
             return _bound[i]
     return None
+
+
+# --- a redelivered summon ------------------------------------------------------------------------
+#
+# DO NOT REMOVE. The host's admission ledger drops a redelivered message by (chat identity, message
+# id), and the identity includes source.thread_id, which here is random per dispatch. So a redelivery
+# (longpoll unacked, a restart before the ack) would run a second summon and post a second public
+# reply from the owner's number. A key derived from the message would not do: after a restart
+# SUMMON_TOKEN has rotated, the channel prompt differs, and the ledger raises admission_conflict,
+# which the host turns into a turn-error notice in that chat. So this is decided before the host: on
+# disk, because the restart is the case that matters, hashed, because it needn't hold a chat id.
+
+_SEEN_MAX = 2000
+_SEEN_TTL_S = 7 * 24 * 3600
+_SEEN_FILE = "chatlytics-summons-seen.json"
+_seen: Dict[str, "OrderedDict[str, float]"] = {}
+
+
+def _seen_path() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return Path(get_hermes_home()) / _SEEN_FILE
+
+
+def _seen_table(path: Path) -> "OrderedDict[str, float]":
+    table = _seen.get(str(path))
+    if table is None:
+        table = OrderedDict()
+        try:
+            stored = json.loads(path.read_text(encoding="utf-8"))
+            items = stored.items() if isinstance(stored, dict) else ()
+            table.update(sorted(((k, v) for k, v in items if isinstance(v, (int, float))), key=lambda kv: kv[1]))
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            logger.warning("chatlytics#956: could not read the delivered summons file: %s", exc)
+        _seen[str(path)] = table
+    return table
+
+
+def _delivery_id(env: Mapping[str, Any]) -> Optional[str]:
+    message_id = env.get("message_id")
+    if not isinstance(message_id, str) or not message_id:
+        return None  # Nothing identifies it, so it can't be told from a new message.
+    parts = (str(env.get("session_id")), str(env.get("entity_jid")), message_id)
+    return hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()[:32]
+
+
+def first_delivery(env: Mapping[str, Any]) -> bool:
+    """True, and remembered, the first time this inbound message is seen; False for a redelivery.
+
+    A failure of the file costs the restart case only: a second summon is not worth losing this one.
+    """
+    identity = _delivery_id(env)
+    if identity is None:
+        return True
+    now = time.time()
+    with _lock:
+        try:
+            path = _seen_path()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("chatlytics#956: no home for the delivered summons file: %s", exc)
+            path = Path(_SEEN_FILE)
+        table = _seen_table(path)
+        at = table.get(identity)
+        if at is not None and now - at <= _SEEN_TTL_S:
+            return False
+        table[identity] = now
+        table.move_to_end(identity)
+        while table and (len(table) > _SEEN_MAX or now - next(iter(table.values())) > _SEEN_TTL_S):
+            table.popitem(last=False)
+        _save_seen(path, table)
+    return True
+
+
+def _save_seen(path: Path, table: Mapping[str, float]) -> None:
+    tmp = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f"{_SEEN_FILE}.")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(table, handle)
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.warning("chatlytics#956: could not save the delivered summons file: %s", exc)
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 # --- the rules ----------------------------------------------------------------------------------
@@ -201,6 +356,20 @@ def _base_name(tool_name: Any) -> Tuple[str, bool]:
     if name.startswith("mcp_"):
         return name[4:], True
     return name, False
+
+
+def _chatlytics_verb(base: str, is_mcp: bool) -> str:
+    """``base``, or the chatlytics read or dispatch it ends in.
+
+    Hermes names an MCP tool ``mcp_<server>_<tool>``, so ``_base_name`` can't drop the server there
+    and ``mcp_chatlytics_chatlytics_read`` was not recognised as the read it is. DO NOT remove.
+    """
+    known = _CHATLYTICS_READS | _CHATLYTICS_DISPATCH
+    if is_mcp and base not in known and "chatlytics" in base:
+        for verb in sorted(known, key=len, reverse=True):
+            if base.endswith(f"_{verb}"):
+                return verb
+    return base
 
 
 def _lextrove_tool(tool_name: Any) -> Optional[str]:
@@ -372,6 +541,41 @@ _TEXT_ROUTE_MARKS = re.compile(
 )
 
 
+# Chatlytics' own tools (its reads and dispatch are refused above) and memory: Omer's decision is that
+# memory tools stay, on a summoned turn too, whatever they are asked about.
+_TEXT_EXEMPT = re.compile(r"chatlytics|memor|mem0|cognee|honcho")
+# Words for a person to read. The other arguments of an unknown MCP tool (url, path, sql, query,
+# command) say what it reaches, and those are still searched.
+_PROSE_KEYS = frozenset({
+    "text", "message", "content", "caption", "body", "subject", "title", "description", "note",
+    "notes", "comment", "reply", "summary", "name",
+})
+
+
+def _normalized(tool_name: Any) -> str:
+    return str(tool_name or "").strip().casefold().replace("-", "_").replace(".", "_")
+
+
+def _addressing_values(raw_args: Any) -> Iterable[str]:
+    """Every string in ``raw_args`` that isn't under a prose key. Text that isn't JSON counts whole."""
+    if isinstance(raw_args, str):
+        try:
+            raw_args = json.loads(raw_args)
+        except ValueError:
+            yield raw_args
+            return
+    stack: List[Tuple[Optional[str], Any]] = [(None, raw_args)]
+    while stack:
+        key, value = stack.pop()
+        if isinstance(value, str):
+            if key is None or key.casefold() not in _PROSE_KEYS:
+                yield value
+        elif isinstance(value, Mapping):
+            stack.extend((str(k), v) for k, v in value.items())
+        elif isinstance(value, (list, tuple)):
+            stack.extend((key, v) for v in value)
+
+
 def _wrapped_calls(args: Mapping[str, Any]) -> Optional[List[Tuple[Any, Any]]]:
     """The ``(name, arguments)`` of each entry of a ``tool_call``; None when it can't be read.
 
@@ -445,17 +649,27 @@ def _check_one(tool_name: Any, raw_args: Any, scope: SummonScope) -> Optional[Re
         return Refusal(reason, label) if reason else None
     if not is_mcp and base in _ALWAYS_REFUSED:
         return Refusal(_ALWAYS_REFUSED[base], label)
-    if base in _CHATLYTICS_READS:
+    verb = _chatlytics_verb(base, is_mcp)
+    if verb in _CHATLYTICS_READS:
         return Refusal("chatlytics_reads_another_account", label)
-    if base in _CHATLYTICS_DISPATCH:
+    if verb in _CHATLYTICS_DISPATCH:
         action = (args or {}).get("action")
-        if args is None or not isinstance(action, str) or _READ_ACTION.search(action):
+        if args is None or not isinstance(action, str) or _READ_ACTION.search(action.strip()):
             return Refusal("chatlytics_read_action", label)
         return None
-    if is_mcp or base in _TEXT_ROUTE:
-        text = raw_args if isinstance(raw_args, str) else json.dumps(raw_args, ensure_ascii=False, default=str)
-        if _TEXT_ROUTE_MARKS.search(text or ""):
-            return Refusal("names_the_archive_or_host_store", label)
+    if not is_mcp:
+        if base in _TEXT_ROUTE:
+            text = raw_args if isinstance(raw_args, str) else json.dumps(raw_args, ensure_ascii=False, default=str)
+            if _TEXT_ROUTE_MARKS.search(text or ""):
+                return Refusal("names_the_archive_or_host_store", label)
+        return None
+    # DO NOT CHANGE to a search of the whole arguments: that refused a send saying "Lextrove is our
+    # archive" and a memory search for the word, with a message about reading. What matters on an
+    # MCP tool is whether the word is where the tool is told what to reach.
+    if _TEXT_EXEMPT.search(_normalized(tool_name)):
+        return None
+    if any(_TEXT_ROUTE_MARKS.search(text) for text in _addressing_values(raw_args)):
+        return Refusal("names_the_archive_or_host_store", label)
     return None
 
 

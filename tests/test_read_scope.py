@@ -838,7 +838,7 @@ async def test_a_signed_webhook_summon_gets_a_scope_and_an_unsigned_one_does_not
 
 async def test_a_webhook_summon_the_scope_cannot_open_for_is_not_dispatched(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = {**_wh_payload("!sammie hi", PEER), "senderId": OWNER, **ENVELOPES["from_me_dm"]}
-    monkeypatch.setattr("chatlytics_hermes.inbound.open_for_event", lambda *_a: None)
+    monkeypatch.setattr(read_scope, "open_for_event", lambda *_a: None)
     assert await _webhook(_wh_adapter(secret=True, allow_admin_from=[OWNER]), payload, sign=True) == []
 
 

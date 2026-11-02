@@ -28,7 +28,6 @@ from typing import Any, Callable, Dict, Optional
 from aiohttp import web
 
 from .memory_strip import log_summon_refused, summon_refusal
-from .read_scope import open_for_event
 from .trigger_context import FROM_ME, with_trigger_context
 from .owner import (
     apply_owner_access,
@@ -265,7 +264,14 @@ def make_webhook_handler(adapter: Any) -> Callable[[web.Request], Any]:
                 or payload.get("sessionName")
                 or payload.get("waha_session")
             )
-            if isinstance(inbound_session, str) and inbound_session:
+            # chatlytics#956: same as adapter._dispatch_envelope (keep in sync): a summon names its
+            # own session, so it doesn't change what the chat's other turns send. DO NOT REMOVE.
+            _keeps_session = (
+                bool(secret)
+                and payload.get("trigger_source") == FROM_ME
+                and event.source.chat_id in adapter._chat_session_map
+            )
+            if isinstance(inbound_session, str) and inbound_session and not _keeps_session:
                 register = getattr(adapter, "register_chat_session", None)
                 if callable(register):
                     register(event.source.chat_id, inbound_session)
@@ -309,9 +315,10 @@ def make_webhook_handler(adapter: Any) -> Callable[[web.Request], Any]:
                 return web.json_response({"status": "accepted"}, status=200)
             # chatlytics#956: same as adapter._dispatch_envelope (keep in sync). DO NOT REMOVE.
             if payload.get("trigger_source") == FROM_ME:
-                summon_scope = open_for_event(payload, event)
+                summon_scope, why = await adapter._open_summon(payload, event)
                 if summon_scope is None:
-                    log_summon_refused(event.source.chat_id, "the read scope could not be opened")
+                    if why:
+                        log_summon_refused(event.source.chat_id, why)
                     return web.json_response({"status": "accepted"}, status=200)
         elif payload.get("trigger_source") == FROM_ME:
             # An unsigned sender is unauthenticated, so this can't be believed, and it runs

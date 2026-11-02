@@ -42,6 +42,17 @@ def _memory_strip_ready(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _summon_delivery_ledger(monkeypatch, tmp_path):
+    """chatlytics#956: the delivered-summons file stays per test and out of the real home."""
+    from chatlytics_hermes import read_scope
+
+    monkeypatch.setattr(read_scope, "_seen_path", lambda: tmp_path / read_scope._SEEN_FILE)
+    read_scope._seen.clear()
+    yield
+    read_scope._seen.clear()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_chatlytics_env(monkeypatch):
     """Hermetic env: clear ambient ``CHATLYTICS_*`` before every test.
 

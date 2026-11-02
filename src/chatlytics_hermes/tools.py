@@ -51,6 +51,7 @@ from urllib.parse import quote
 
 import httpx
 
+from . import read_scope
 from .adapter import NO_TOKEN_PROMPT, _coerce_success_payload
 from .client import ChatlyticsClient
 
@@ -154,6 +155,32 @@ _SEARCH_TIMEOUT: httpx.Timeout = httpx.Timeout(
 )
 
 
+# The hub's FROM_ME_ROUTE_ACTIONS: the /api/v1/actions verbs a reply route can move to the owner's
+# number. Every other verb stays on the bot's own, whatever is named.
+_ROUTE_ACTIONS = frozenset({"react", "startTyping", "stopTyping", "sendSeen"})
+
+
+def _name_outbound_session(path: str, body: Dict[str, Any]) -> None:
+    """chatlytics#956: a tool's send names the account the adapter's would. See adapter._outbound_session.
+
+    DO NOT REMOVE. A send naming no session follows the chat's live reply route, so a tool on an
+    ordinary turn would write from the owner's number while the owner's summon runs there, and a tool
+    on a summon from the bot's number once a person's message closed the route.
+    """
+    resolver = read_scope.OUTBOUND_RESOLVER.get()
+    if resolver is None or "session" in body:
+        return
+    if path == "/api/v1/send":
+        chat = body.get("chatId")
+    elif path == "/api/v1/actions" and body.get("action") in _ROUTE_ACTIONS:
+        chat = (body.get("params") or {}).get("chatId")
+    else:
+        return
+    session = resolver(chat) if isinstance(chat, str) and chat else None
+    if session:
+        body["session"] = session
+
+
 async def _post(
     client: ChatlyticsClient,
     path: str,
@@ -175,6 +202,10 @@ async def _post(
     longer read window (e.g. ``chatlytics_search`` cold-cache) pass an
     explicit :class:`httpx.Timeout`. Bug 3 fix.
     """
+    try:
+        _name_outbound_session(path, body)
+    except read_scope.SummonScopeLost:
+        return {"success": False, "error": "This summoned turn lost its read scope. Nothing was sent."}
     try:
         response = await client.post(path, json=body, timeout=timeout)
     except httpx.RequestError as exc:

@@ -10,8 +10,14 @@
   bot's own number, and shell, code and MCP tools whose arguments name the archive or the
   host's stores. A failure inside the check refuses. Other turns are untouched.
 - **A summoned turn starts clean** (chatlytics#956). Each summon runs in its own Hermes
-  session, so it inherits no earlier turn of the chat, and what it read does not reach later
-  turns in that chat. `/stop` and `/new` from the summoned session also reach a running summon.
+  session, so it inherits no earlier turn of the chat, and its transcript is not in the history
+  of later turns. `session_search` on an ordinary turn and `memory` can still reach what it did:
+  see docs/summoned-turns.md. `/stop` and `/new` from the summoned session reach every running
+  summon of that chat, and a summon delivered twice runs once.
+- **Every send names the account it leaves from** (chatlytics#956). A summon's reply, media, typing
+  and tool sends name the summon's session, and every other turn's name the bot's own, so
+  overlapping turns in one chat can't reply from each other's number. When the hub refuses a summon's
+  reply because its window closed, the owner gets it in their DM with the bot.
 
 ## [5.3.0] - 2026-11-02
 
