@@ -97,16 +97,20 @@ async def test_dm_with_a_phone_searches_direct_chats_only(name: str) -> None:
 
 
 @pytest.mark.parametrize("name", ["from_me_dm", "from_me_dm_lid"])
-def test_dm_with_a_phone_stops_on_any_doubtful_match(name: str) -> None:
+def test_dm_with_a_phone_requires_a_positive_match(name: str) -> None:
     env = ENVELOPES[name]
     line = render_trigger_context(env)
     assert line is not None
 
-    assert "Stop and say you cannot read this chat if that returns nothing" in line
-    assert "resolved_entity is ambiguous" in line
-    assert "similarity_score below 1" in line
+    assert "Continue only if the response has a resolved_entity that is not ambiguous" in line
+    assert "has similarity_score exactly 1" in line
     # With the @, a number that merely shares this prefix does not pass.
-    assert f"identifier that does not start with {env['chat_phone']}@" in line
+    assert f"has an identifier starting with {env['chat_phone']}@" in line
+    # A response without these fields must stop the read, not fall through it.
+    assert (
+        "In every other case, including any of those fields missing or no messages, "
+        "stop and say you cannot read this chat." in line
+    )
 
 
 async def test_owners_own_chat_has_no_phone_so_it_reads_by_chat_id() -> None:

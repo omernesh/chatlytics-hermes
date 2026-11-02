@@ -68,7 +68,8 @@ def _read_instruction(env: Mapping[str, Any], chat_id: str, session: str) -> str
     exact string match and one contact's chat is stored under several forms, while
     list_messages with a contact also returns that person's posts in groups. A
     number with no contact row falls through to fuzzy matching and a sole candidate
-    comes back unflagged, so the model must check the match before it reads on. A
+    comes back unflagged, so reading on needs a positive match: a missing field
+    must stop the read, not pass as "nothing wrong". A
     group has one form and keeps its chat id; so does a DM with no phone, which the
     hub also sends for the owner's chat with themselves.
     """
@@ -78,8 +79,10 @@ def _read_instruction(env: Mapping[str, Any], chat_id: str, session: str) -> str
         read = (
             f"Lextrove search_messages with contact_name {phone}, chat_type dm, session {session}, "
             "mode fts and no query. "
-            "Stop and say you cannot read this chat if that returns nothing, or if its resolved_entity "
-            f"is ambiguous, has a similarity_score below 1, or has an identifier that does not start with {phone}@. "
+            "Continue only if the response has a resolved_entity that is not ambiguous, "
+            f"has similarity_score exactly 1, and has an identifier starting with {phone}@. "
+            "In every other case, including any of those fields missing or no messages, "
+            "stop and say you cannot read this chat. "
             "Do not use list_messages or a chat_id filter for this chat: list_messages also returns "
             "this person's posts in groups, and a chat_id filter matches one stored form and misses messages. "
         )
