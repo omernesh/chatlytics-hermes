@@ -14,16 +14,24 @@ supported point that covers all of it is ``llm_request`` middleware, which sees 
 final provider request and runs again for every attempt, including after a fallback
 to another model. So the rewrite happens here, and only when the request itself says
 the turn is summoned: the context line rides ``channel_prompt`` into the system
-prompt, after the frozen part, so its marker is found only past that part.
+prompt, after the frozen part, so its marker is found only past the memory blocks.
+
+Memory entries are attacker-influenced text, so nothing here reads them to find where
+they end. Each block's header carries the length of its content, computed by the host
+(``MemoryStore._render_block``), and the cut is taken from that number. The middleware
+can't compare against the store itself: it isn't given one, and a resumed session sends
+the prompt frozen when the session began, which differs from the store after any write.
 
 Fail closed, because a silent no-op after a hermes-agent upgrade is the main risk:
 
 - middleware errors are swallowed by the host and the request goes out unchanged, so
   nothing here may raise on a summoned request: it falls back to :func:`_lockdown`;
 - :func:`strip_ready` runs the real host renderers through the strip, and a probe
-  through the host's live middleware chain at every summon. If either fails,
-  :func:`summon_refusal` drops the summoned turn before it is dispatched;
-- anything shaped like memory that the exact patterns miss is cut, never passed on.
+  through the host's live middleware chain, once per chain of callbacks. If either
+  fails, :func:`summon_refusal` drops the summoned turn before it is dispatched;
+- a block whose length doesn't check out, or a header line that isn't a whole block
+  header, raises :class:`MemoryShapeError`, which locks the request down;
+- a ``memory`` tool result that can't be parsed is replaced with a fixed error.
 
 DO NOT widen this to other turns without an explicit decision (chatlytics#952).
 """
@@ -47,11 +55,21 @@ LLM_REQUEST = "llm_request"
 # about it. Only the note the host puts right after it makes one, and both of the host's
 # note wordings start like this, so fences replayed from older turns match too.
 _FENCE_OPEN = r"\s*<\s*memory-context\s*>\s*\[System note:\s*The following is recalled memory context"
-_FENCE = re.compile(_FENCE_OPEN + r"[\s\S]*?<\s*/\s*memory-context\s*>", re.IGNORECASE)
+# The closing tag as the host's sanitizer defines it (``_FENCE_TAG_RE``). Text it leaves in
+# a recall is not a close, so ``< /memory-context>`` doesn't end the fence. The cut runs to
+# the LAST close: that sanitizer makes one pass, so a recall can rebuild a real tag from two
+# pieces. What can follow a fence in the string is plugin context, never the owner's text.
+_FENCE = re.compile(_FENCE_OPEN + r"[\s\S]*</\s*memory-context\s*>", re.IGNORECASE)
 _UNTERMINATED_FENCE = re.compile(_FENCE_OPEN, re.IGNORECASE)
 # hermes-agent tools/memory_tool_store.py: MEMORY_BLOCK_HEADERS and _render_block.
-_BLOCK_START = re.compile(
+_BLOCK_TITLE = re.compile(
     r"^(?:═+\n)?(?:MEMORY \(your personal notes\)|USER PROFILE \(who the user is\))",
+    re.MULTILINE,
+)
+# The whole header. Group 1 is ``len(content)``, formatted by ``_usage_pct``.
+_BLOCK_HEADER = re.compile(
+    r"^═{46}\n(?:MEMORY \(your personal notes\)|USER PROFILE \(who the user is\)) "
+    r"\[\d+% — ([\d,]+)/[\d,]+ chars\]\n═{46}\n",
     re.MULTILINE,
 )
 # What follows the memory parts in hermes-agent agent/system_prompt.py, in this order:
@@ -67,13 +85,38 @@ _SIGNED_KEYS = ("signature", "encrypted_content")
 _SIGNED_TYPES = frozenset({"thinking", "redacted_thinking", "reasoning"})
 # Tool schemas. They are not prompt text, and they hold keys like ``type: ["string", "null"]``.
 _TOOL_KEYS = frozenset({"tools", "toolConfig"})
-# hermes-agent tools/memory_tool_store.py: what a failed memory write sends back of the store.
-_STORE_ECHO_KEYS = ("current_entries", "closest_entries", "matches")
+# hermes-agent tools/memory_tool.py, tools/memory_tool_store.py and agent/tool_guardrails.py:
+# the keys of a ``memory`` tool result that hold no stored text. Everything else goes, on
+# success too (``removed_entry``, ``patched_entries``), and so does any key a new host adds.
+_MEMORY_RESULT_KEYS = frozenset({
+    "success", "done", "target", "usage", "entry_count", "message", "note", "error",
+    "staged", "proposal_staged", "pending_id", "guardrail", "drift_backup", "remediation",
+})
+# On a row whose tool can't be identified, these say it may be a ``memory`` result.
+_STORE_KEY_HINTS = ("_entries", "_entry", "matches")
+_MEMORY_RESULT_LOST = json.dumps(
+    {"success": False, "error": "Memory tool result withheld on this turn."}, ensure_ascii=False
+)
+# agent/anthropic_adapter.py renames the tool on OAuth requests (``mcp__context_notes``).
+_MEMORY_TOOL_NAMES = frozenset({"memory", "context_notes"})
+# agent/anthropic_message_convert.py, what the host fills an empty user row with.
+_EMPTY_USER_TEXT = "(empty message)"
 _LOCKDOWN_TEXT = "Reply with one short line saying you cannot answer right now."
 # Dropped outright: strict backends return 400 on an empty system prompt or on tool
 # settings without tools (hermes-agent chat_completion_helpers._codex_summary_attempt).
 _LOCKDOWN_DROPPED = _TOOL_KEYS | {"tool_choice", "parallel_tool_calls", "system"}
 _PROBE_TURN = "chatlytics-952-probe"
+# What a real turn passes (agent/turn_api_request.py), so another plugin in the chain has
+# no missing id to trip on when it sees the probe.
+_PROBE_CONTEXT = {
+    "turn_id": _PROBE_TURN, "task_id": _PROBE_TURN, "api_request_id": _PROBE_TURN,
+    "session_id": _PROBE_TURN, "platform": "chatlytics", "model": "probe-model",
+    "provider": "probe", "base_url": "", "api_mode": "chat_completions", "api_call_count": 1,
+}
+
+
+class MemoryShapeError(Exception):
+    """The prompt holds memory this module can't bound. The request gets locked down."""
 
 
 @dataclass
@@ -100,20 +143,24 @@ def _strip_fences(text: str, report: StripReport) -> str:
     return text
 
 
-def _drop_store_echo(text: str, report: StripReport) -> str:
-    """A failed ``memory`` write returns the store, so history would hand it back."""
-    if not any(key in text for key in _STORE_ECHO_KEYS):
-        return text
+def _scrub_memory_result(text: str, report: StripReport) -> str:
+    """A ``memory`` tool result without stored text. Fail closed if it can't be read.
+
+    The host's tool loop guardrail appends plain text to a repeated failure
+    (``append_toolguard_guidance``), and a long result can be truncated, so a row can hold
+    the store and still not parse.
+    """
     try:
         result = json.loads(text)
     except ValueError:
-        return text
-    if not isinstance(result, dict) or result.get("success") is not False:
-        return text
-    if not any(key in result for key in _STORE_ECHO_KEYS):
+        result = None
+    if not isinstance(result, dict):
+        report.store_echoes += 1
+        return _MEMORY_RESULT_LOST
+    if all(key in _MEMORY_RESULT_KEYS for key in result):
         return text
     report.store_echoes += 1
-    kept = {k: v for k, v in result.items() if k not in _STORE_ECHO_KEYS}
+    kept = {k: v for k, v in result.items() if k in _MEMORY_RESULT_KEYS}
     return json.dumps(kept, ensure_ascii=False)
 
 
@@ -124,13 +171,37 @@ def _last(pattern: "re.Pattern[str]", text: str, start: int, end: int) -> Option
     return found
 
 
-def _block_end(text: str, after: int, report: StripReport) -> int:
-    """Where the tail of the prompt starts, walking back from its last real part.
+def _memory_extent(text: str) -> Optional[Tuple[int, int, int]]:
+    """``(start, end, blocks)`` of the built-in memory blocks, or None when there are none.
 
-    Everything before the real date line can quote any of these, so the date line (the
-    last one) is the only anchor taken on sight. The profile line and plugin sections
-    count only when they sit right before it, the way the host joins them. Otherwise an
-    entry quoting a part this prompt does not have would end the cut there.
+    Taken from the headers' length field, so an entry's content can't move it. The content
+    of each block is skipped, so nothing it quotes is read. A block whose length doesn't
+    land on the blank line the host joins parts with means a transform changed the text
+    (agent/anthropic_adapter.py rewrites words on OAuth requests), and the number can't be
+    trusted. A title line outside any block means memory in a shape this can't bound.
+    """
+    start = end = None
+    blocks = pos = 0
+    while (header := _BLOCK_HEADER.search(text, pos)) is not None:
+        stop = header.end() + int(header.group(1).replace(",", ""))
+        if stop > len(text) or (stop < len(text) and not text.startswith("\n\n", stop)):
+            raise MemoryShapeError("a memory block's length does not match its text")
+        if _BLOCK_TITLE.search(text, pos, header.start()):
+            raise MemoryShapeError("a memory block header without a length")
+        start = header.start() if start is None else start
+        end, pos = stop, stop
+        blocks += 1
+    if _BLOCK_TITLE.search(text, pos):
+        raise MemoryShapeError("a memory block header without a length")
+    return None if start is None or end is None else (start, end, blocks)
+
+
+def _block_end(text: str, after: int, report: StripReport) -> int:
+    """Where the tail of the prompt starts: everything from ``after`` up to here goes.
+
+    ``after`` is past the entries, so what is searched is the provider block and the real
+    tail. The date line (the last one) is the anchor, and the profile line and plugin
+    sections count only when they sit right before it, the way the host joins them.
     """
     marker = text.rfind(TURN_CONTEXT_MARKER, after)
     bound = text.rfind("\n", after, marker) + 1 if marker >= 0 else len(text)
@@ -151,12 +222,16 @@ def _block_end(text: str, after: int, report: StripReport) -> int:
 
 
 def _strip_system(text: str, report: StripReport) -> str:
-    while (match := _BLOCK_START.search(text)) is not None:
-        report.blocks += 1
-        end = _block_end(text, match.end(), report)
-        head, tail = text[: match.start()].rstrip(), text[end:]
-        text = f"{head}\n\n{tail}" if head and tail else head or tail
-    return text
+    extent = _memory_extent(text)
+    if extent is None:
+        return text
+    start, after, blocks = extent
+    report.blocks += blocks
+    # One cut from the first block to the tail. If a length were off by a transform that
+    # still lands on a blank line, what is left of an entry goes with the provider block.
+    end = _block_end(text, after, report)
+    head, tail = text[:start].rstrip(), text[end:]
+    return f"{head}\n\n{tail}" if head and tail else head or tail
 
 
 def _is_tool_output(part: Mapping[str, Any]) -> bool:
@@ -165,11 +240,11 @@ def _is_tool_output(part: Mapping[str, Any]) -> bool:
 
 
 def _map_strings(
-    value: Any, fn: Callable[[str], str], tool_fn: Optional[Callable[[str], str]] = None
+    value: Any, fn: Callable[[str], str], tool_part: Optional[Callable[[Mapping[str, Any]], Any]] = None
 ) -> Any:
     """A copy of ``value`` with ``fn`` applied to every string. Never edits in place.
 
-    With ``tool_fn``, the strings of tool output nested in ``value`` get that instead.
+    With ``tool_part``, a tool result nested in ``value`` is handed to that instead.
     """
     if isinstance(value, str):
         return fn(value)
@@ -177,13 +252,13 @@ def _map_strings(
         kind = value.get("type")
         if (isinstance(kind, str) and kind in _SIGNED_TYPES) or any(k in value for k in _SIGNED_KEYS):
             return value  # A provider-signed block is rejected if edited.
-        if tool_fn is not None and _is_tool_output(value):
-            return _map_strings(value, tool_fn)
-        return {k: _map_strings(v, fn, tool_fn) for k, v in value.items()}
+        if tool_part is not None and _is_tool_output(value):
+            return tool_part(value)
+        return {k: _map_strings(v, fn, tool_part) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         kept: List[Any] = []
         for item in value:
-            mapped = _map_strings(item, fn, tool_fn)
+            mapped = _map_strings(item, fn, tool_part)
             # A part that held only a fence must go: providers reject empty text parts.
             emptied = (
                 isinstance(item, dict)
@@ -204,26 +279,29 @@ def _strings(value: Any) -> List[str]:
     return found
 
 
-def _past_the_frozen_prompt(system: str) -> str:
+def _past_the_memory_blocks(system: str) -> str:
     """The part of a system prompt no memory entry can reach.
 
-    The context line is added after the frozen prompt, and memory sits inside it, above
-    the date line and the runtime section. So the later of the last date line and the last
-    end delimiter comes after anything an entry quotes, and a prompt stored before the
-    runtime section existed still has its date line. Text after the marker can't fake either
-    one: ``clean_chat_name`` makes the name one line and removes its angle brackets.
+    The context line is added after the frozen prompt, so it is after the last block. Text
+    after it (a channel prompt, skills) can say anything: only the blocks' lengths count.
+    A prompt whose lengths don't check out is searched whole: a false positive costs memory,
+    and on a summon the strip locks that request down.
     """
-    date = _last(_DATE_LINE, system, 0, len(system))
-    start = max(system.rfind(_RUNTIME_END), date.start() if date is not None else -1)
-    return system[max(start, 0) :]
+    try:
+        extent = _memory_extent(system)
+    except MemoryShapeError:
+        return system
+    return system if extent is None else system[extent[1] :]
 
 
 def is_summoned_request(request: Mapping[str, Any]) -> bool:
     """Does the system prompt carry the context line, past its frozen part?
 
     Neither a contact pasting the marker into a chat nor a memory entry quoting it can
-    switch memory off. When no system prompt can be located the shape is new to us, so
-    the whole request is searched: a false positive costs memory, not privacy.
+    switch memory off. Text the operator controls can (a provider block or runtime hint
+    quoting the marker), and that is accepted: a false positive costs memory, not privacy.
+    When no system prompt can be located the shape is new to us, so the whole request is
+    searched, for the same reason.
     """
     system: List[str] = []
     located = False
@@ -241,7 +319,110 @@ def is_summoned_request(request: Mapping[str, Any]) -> bool:
         rest = _strings({k: v for k, v in request.items() if k not in _TOOL_KEYS})
         return any(TURN_CONTEXT_MARKER in text for text in rest)
     # Joined: a provider may split the prompt into cache tiers.
-    return TURN_CONTEXT_MARKER in _past_the_frozen_prompt("\n\n".join(system))
+    return TURN_CONTEXT_MARKER in _past_the_memory_blocks("\n\n".join(system))
+
+
+def _tool_names(request: Mapping[str, Any]) -> dict:
+    """Tool call id to tool name, from the assistant turns in all four request shapes."""
+    names: dict = {}
+
+    def note(call_id: Any, name: Any) -> None:
+        if isinstance(call_id, str) and isinstance(name, str):
+            names[call_id] = name
+
+    for key in ("messages", "input"):
+        rows = request.get(key)
+        for row in rows if isinstance(rows, (list, tuple)) else ():
+            if not isinstance(row, dict):
+                continue
+            if row.get("type") == "function_call":
+                note(row.get("call_id") or row.get("id"), row.get("name"))
+            for call in row.get("tool_calls") or ():
+                if isinstance(call, dict) and isinstance(call.get("function"), dict):
+                    note(call.get("id"), call["function"].get("name"))
+                    note(call.get("call_id"), call["function"].get("name"))
+            content = row.get("content")
+            for part in content if isinstance(content, (list, tuple)) else ():
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "tool_use":
+                    note(part.get("id"), part.get("name"))
+                elif isinstance(part.get("toolUse"), dict):
+                    note(part["toolUse"].get("toolUseId"), part["toolUse"].get("name"))
+    return names
+
+
+def _result_scrubber(name: Any, report: StripReport) -> Optional[Callable[[str], str]]:
+    """What to do to a tool result's text. None for any tool that isn't ``memory``.
+
+    A result whose call can't be found is treated as one only if it mentions a store key.
+    """
+    if isinstance(name, str):
+        if name.removeprefix("mcp__").removeprefix("mcp_") in _MEMORY_TOOL_NAMES:
+            return lambda text: _scrub_memory_result(text, report)
+        return None
+
+    def if_store_shaped(text: str) -> str:
+        if any(hint in text for hint in _STORE_KEY_HINTS):
+            return _scrub_memory_result(text, report)
+        return text
+
+    return if_store_shaped
+
+
+def _scrub_structured(value: Any, scrub: Callable[[str], str]) -> Optional[str]:
+    """The scrubbed text of a non-text value, or None when scrubbing left it as it was."""
+    text = json.dumps(value, ensure_ascii=False, default=str)
+    scrubbed = scrub(text)
+    return None if scrubbed == text else scrubbed
+
+
+def _scrub_result_content(content: Any, scrub: Callable[[str], str]) -> Any:
+    """The text of a tool result, as a string or a list of parts."""
+    if isinstance(content, str):
+        return scrub(content)
+    if not isinstance(content, (list, tuple)):
+        scrubbed = _scrub_structured(content, scrub)
+        return content if scrubbed is None else scrubbed
+    kept: List[Any] = []
+    for part in content:
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            kept.append({**part, "text": scrub(part["text"])})
+            continue
+        # Bedrock's structured output, or a part the memory tool doesn't produce.
+        value = part["json"] if isinstance(part, dict) and "json" in part else part
+        scrubbed = _scrub_structured(value, scrub)
+        kept.append(part if scrubbed is None else {"text": scrubbed})
+    return kept
+
+
+def _scrub_tool_row(row: Mapping[str, Any], names: Mapping[str, str], report: StripReport) -> Any:
+    """A tool result in any request shape. The call id stays, so the pairing holds."""
+    if row.get("type") == "function_call_output":
+        call_id, key, holder = row.get("call_id"), "output", row
+    elif row.get("type") == "tool_result":
+        call_id, key, holder = row.get("tool_use_id"), "content", row
+    elif isinstance(row.get("toolResult"), dict):
+        call_id, key, holder = row["toolResult"].get("toolUseId"), "content", row["toolResult"]
+    else:
+        call_id, key, holder = row.get("tool_call_id"), "content", row
+    scrub = _result_scrubber(names.get(call_id) or row.get("name"), report)
+    if scrub is None or key not in holder:
+        return row
+    cleaned = {**holder, key: _scrub_result_content(holder[key], scrub)}
+    return cleaned if holder is row else {**row, "toolResult": cleaned}
+
+
+def _fill_emptied(before: Mapping[str, Any], after: dict) -> dict:
+    """The host fills empty user rows before the middleware runs, so one emptied here stays
+    empty unless it is filled the same way. Providers reject an empty user turn."""
+    was, now = before.get("content"), after.get("content")
+    if isinstance(was, str) and was.strip() and isinstance(now, str) and not now.strip():
+        return {**after, "content": _EMPTY_USER_TEXT}
+    if isinstance(was, (list, tuple)) and was and isinstance(now, list) and not now:
+        shape = next((p for p in was if isinstance(p, dict) and isinstance(p.get("text"), str)), {})
+        return {**after, "content": [{**shape, "text": _EMPTY_USER_TEXT}]}
+    return after
 
 
 def strip_summoned_request(request: Mapping[str, Any]) -> Tuple[dict, StripReport]:
@@ -254,8 +435,10 @@ def strip_summoned_request(request: Mapping[str, Any]) -> Tuple[dict, StripRepor
     def blocks(text: str) -> str:
         return _strip_system(text, report)
 
-    def echoes(text: str) -> str:
-        return _drop_store_echo(text, report)
+    names = _tool_names(request)
+
+    def tool_part(part: Mapping[str, Any]) -> Any:
+        return _scrub_tool_row(part, names, report)
 
     def row(item: Any) -> Any:
         # Fences only ride user rows. Elsewhere a lookalike is someone's text or tool
@@ -265,9 +448,9 @@ def strip_summoned_request(request: Mapping[str, Any]) -> Tuple[dict, StripRepor
         if item.get("role") in _SYSTEM_ROLES:
             return _map_strings(item, blocks)
         if item.get("role") == "user":
-            return _map_strings(item, fences, echoes)
+            return _fill_emptied(item, _map_strings(item, fences, tool_part))
         if item.get("role") == "tool" or item.get("type") == "function_call_output":
-            return _map_strings(item, echoes)
+            return _scrub_tool_row(item, names, report)
         return item
 
     out: dict = {}
@@ -315,7 +498,7 @@ def _log_pass(report: StripReport, turn_id: Any) -> None:
     if report.changed:
         logger.info(
             "chatlytics#952: summoned turn: removed %d memory fence(s) and %d memory prompt "
-            "block(s), and %d memory tool echo(es). turn=%s",
+            "block(s), and rewrote %d memory tool result(s). turn=%s",
             report.fences, report.blocks, report.store_echoes, turn_id,
         )
     else:
@@ -353,6 +536,7 @@ def llm_request_middleware(**kwargs: Any) -> Optional[dict]:
 
 _registered = False
 _shape_ok = False
+_chain_ok: Optional[Tuple[Any, ...]] = None
 
 
 def register_strip(ctx: Any) -> None:
@@ -430,27 +614,50 @@ def _probe_host() -> Optional[str]:
     return None
 
 
+def _chain_callbacks() -> Optional[Tuple[Any, ...]]:
+    """The callbacks in the host's chain, or None if this host doesn't let us see them."""
+    from hermes_cli.plugins import _delivery_manager
+
+    callbacks = getattr(_delivery_manager(), "_middleware", {}).get(LLM_REQUEST)
+    return tuple(callbacks) if isinstance(callbacks, list) else None
+
+
 def _probe_chain() -> Optional[str]:
     """Does a summoned request come out of the host's live middleware chain stripped?
 
-    Run at every summon: a plugin unload removes the callback while this module stays
-    loaded. It goes through the chain, so another plugin's middleware can't stand in.
+    The registration check runs at every summon: a plugin unload removes the callback while
+    this module stays loaded. The request itself goes through once per process per chain of
+    callbacks, because other plugins see it, and it runs in the dispatch path. A chain that
+    can't be read is probed every time. It goes through the chain, so another plugin's
+    middleware can't stand in.
     """
+    global _chain_ok
     from hermes_cli.middleware import apply_llm_request_middleware
     from hermes_cli.plugins import has_middleware
 
     if not has_middleware(LLM_REQUEST):
         return "llm_request middleware is no longer registered with the host"
-    result = apply_llm_request_middleware(_probe_request(), turn_id=_PROBE_TURN)
+    try:
+        chain = _chain_callbacks()
+    except (ImportError, AttributeError):
+        chain = None
+    if chain is not None and chain == _chain_ok:
+        return None
+    request = {"model": "probe-model", **_probe_request()}
+    result = apply_llm_request_middleware(request, **_PROBE_CONTEXT)
     problem = _probe_result_problem(result.payload)
-    return f"the host's middleware chain did not strip: {problem}" if problem else None
+    if problem:
+        return f"the host's middleware chain did not strip: {problem}"
+    _chain_ok = chain
+    return None
 
 
 def strip_ready() -> Optional[str]:
     """None when summoned turns can be stripped, else why not.
 
-    Only a passed shape check is remembered, since the renderers don't change in a
-    running process. A failure may be transient, so the next summon checks again.
+    Only passes are remembered, since the renderers don't change in a running process and
+    a chain of the same callbacks is the same chain. A failure may be transient, so the
+    next summon checks again.
     """
     global _shape_ok
     if not _registered:
