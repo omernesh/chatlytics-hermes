@@ -88,7 +88,7 @@ from .stream import (
     reconnect_delay,
     run_stream_once,
 )
-from .trigger_context import with_trigger_context
+from .trigger_context import FROM_ME, with_trigger_context
 from .owner import (
     apply_owner_access,
     apply_owner_tagging,
@@ -2815,6 +2815,18 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             logger.info(
                 "control retry_last: no memoized last message for chat %s; "
                 "ignoring",
+                chat_id,
+            )
+            return
+        # chatlytics#951: a summoned turn is delivered as the owner. A /retry the
+        # other person sends in their own DM with the bot's number shares this
+        # memo key but arrives on the bot's session. Replaying it would run the
+        # owner's words as the owner on that person's say-so, so only a retry from
+        # the summoned session may replay it. DO NOT REMOVE.
+        if memo.get("trigger_source") == FROM_ME and env.get("session_id") != memo.get("session_id"):
+            logger.warning(
+                "control retry_last: refused to replay a summoned turn for chat %s "
+                "from another session",
                 chat_id,
             )
             return

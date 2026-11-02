@@ -23,6 +23,7 @@ from chatlytics_hermes.trigger_context import (
 from tests.test_native_admission import _metadata_clause, hermes_0225  # noqa: F401 -- fixture
 from tests.test_owner_tagging import (
     _dispatch,
+    _install_recorders,
     _lp_adapter,
     _md,
     _post,
@@ -110,6 +111,41 @@ async def test_context_is_not_sticky_on_the_next_turn_in_the_same_chat() -> None
     second = await _dispatch(adapter, dict(ENVELOPES["third_party_dm"]))
     assert second.source.chat_id == first.source.chat_id
     assert _prompt(second) == ""
+
+
+def _retry(session_id: str) -> Dict[str, Any]:
+    # What the hub enqueues for /retry: the typing session, with the peer as chat and sender.
+    return {
+        "kind": "control",
+        "action": "retry_last",
+        "session_id": session_id,
+        "chat_type": "dm",
+        "entity_jid": PEER,
+        "sender_jid": PEER,
+        "ts": 1,
+    }
+
+
+async def test_peer_retry_cannot_replay_the_owners_summoned_turn() -> None:
+    adapter = _adapter()
+    events, _ = _install_recorders(adapter)
+    await adapter._dispatch_envelope(dict(ENVELOPES["from_me_dm"]))
+    assert len(events) == 1
+
+    await adapter._dispatch_envelope(_retry(ENVELOPES["third_party_dm"]["session_id"]))
+
+    assert len(events) == 1
+
+
+async def test_retry_from_the_summoned_session_still_replays() -> None:
+    adapter = _adapter()
+    events, _ = _install_recorders(adapter)
+    await adapter._dispatch_envelope(dict(ENVELOPES["from_me_dm"]))
+
+    await adapter._dispatch_envelope(_retry(OWNER_SESSION))
+
+    assert len(events) == 2
+    assert "Chatlytics turn context" in _prompt(events[1])
 
 
 async def test_context_joins_a_configured_channel_prompt() -> None:
