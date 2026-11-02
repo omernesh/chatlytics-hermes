@@ -1,3 +1,18 @@
+## [Unreleased]
+
+### Security
+
+- **A turn the owner summoned reads only the summoned chat on the owner's account**
+  (chatlytics#956). A `pre_tool_call` hook refuses a Lextrove read that is not exactly the
+  envelope's session and chat, sees through the `tool_call` wrapper, and refuses tools whose
+  reach can't be limited, and a `transform_tool_result` hook refuses a result that can't be
+  shown to be that chat. Also refused on such a turn: `session_search`, the hub's reads of the
+  bot's own number, and shell, code and MCP tools whose arguments name the archive or the
+  host's stores. A failure inside the check refuses. Other turns are untouched.
+- **A summoned turn starts clean** (chatlytics#956). Each summon runs in its own Hermes
+  session, so it inherits no earlier turn of the chat, and what it read does not reach later
+  turns in that chat. `/stop` and `/new` from the summoned session also reach a running summon.
+
 ## [5.3.0] - 2026-11-02
 
 ### Security

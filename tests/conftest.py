@@ -38,6 +38,7 @@ def _memory_strip_ready(monkeypatch):
     from chatlytics_hermes import memory_strip
 
     monkeypatch.setattr(memory_strip, "strip_ready", lambda: None)
+    monkeypatch.setattr(memory_strip.read_scope, "scope_ready", lambda: None)
 
 
 @pytest.fixture(autouse=True)

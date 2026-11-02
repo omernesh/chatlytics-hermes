@@ -249,6 +249,11 @@ See [docs/features.md](docs/features.md) for the full behavior contracts.
   refused, with an ERROR in the log, on a hermes-agent without `llm_request`
   middleware, after that middleware is unloaded, or with a memory format this plugin
   does not recognise. Verified on hermes-agent 0.22.5. Other turns are untouched.
+- **A summoned turn reads only its own chat, and starts clean (chatlytics#956)**: see
+  [docs/summoned-turns.md](docs/summoned-turns.md). Enforced in code on the tool call and
+  on its result, against the values in the envelope. Refused reads are logged as
+  `chatlytics#956: summon read refused tool=... reason=... scope=... turn=...`. Other
+  turns are untouched, and summons are refused on a host that can't run the hooks.
 - **Tools work everywhere (v4.5.2/v4.5.3)** — a module-level live-adapter
   registry fixed "adapter is not connected" on hermes 0.16 longpoll
   gateways, and host-injected kwargs (e.g. `task_id`) are now filtered to

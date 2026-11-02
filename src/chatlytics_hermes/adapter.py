@@ -65,6 +65,7 @@ import random
 import re
 import time
 import uuid
+import dataclasses
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -88,7 +89,7 @@ from .stream import (
     reconnect_delay,
     run_stream_once,
 )
-from . import memory_strip
+from . import memory_strip, read_scope
 from .trigger_context import FROM_ME, with_trigger_context
 from .owner import (
     apply_owner_access,
@@ -983,6 +984,9 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # possible: the base class serializes per SESSION key, and group
         # chats can carry several session keys).
         self._progress_bubble_owner: Dict[str, str] = {}
+        # chatlytics#956: chat_id -> (scope key, session) of the chat's latest summon, which runs
+        # in its own Hermes session, so /stop and /new also have to reach it.
+        self._last_summon: "OrderedDict[str, Tuple[str, Optional[str]]]" = OrderedDict()
         self._live_typing_turns: Dict[str, set] = {}
 
         # v4.5.0 (chatlytics v5.4 P8): pending owner-DM questions. request_id
@@ -2469,7 +2473,20 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         if refusal:
             memory_strip.log_summon_refused(body["chatId"], refusal)
             return
-        cp = with_trigger_context(cp, env)
+        # chatlytics#956: the turn's read scope, from this envelope, and its own Hermes session
+        # (the scope key is source.thread_id, so it inherits no earlier turn). See read_scope.py.
+        # Keep in sync with inbound.py. DO NOT REMOVE.
+        summon_scope = None
+        if env.get("trigger_source") == FROM_ME:
+            summon_scope = read_scope.open_for_event(env, event)
+            if summon_scope is None:
+                memory_strip.log_summon_refused(body["chatId"], "the read scope could not be opened")
+                return
+            self._last_summon[body["chatId"]] = (summon_scope.key, summon_scope.session)
+            self._last_summon.move_to_end(body["chatId"])
+            while len(self._last_summon) > _LAST_MESSAGE_MEMO_MAX:
+                self._last_summon.popitem(last=False)
+        cp = with_trigger_context(cp, env, summon_scope.key if summon_scope else None)
         # hasattr guard = harness-drift tolerance (older MessageEvent
         # dataclasses without the field must not grow a stray attribute).
         if isinstance(cp, str) and cp.strip():
@@ -2657,6 +2674,8 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         """
         event = self._control_event(env, text="/new")
         source = event.source
+        # chatlytics#956: a summon has no history to reset, but it may still be running.
+        await self._stop_summon_of(env, source)
         session_key = self._control_session_key(source)
         gw = self._gateway_runner()
 
@@ -2748,7 +2767,24 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         log clearly what was NOT cancellable.
         """
         event = self._control_event(env, text="/stop")
-        source = event.source
+        await self._stop_summon_of(env, event.source)
+        await self._stop_source(event.source)
+
+    async def _stop_summon_of(self, env: Dict[str, Any], source: Any) -> None:
+        """Cancel the chat's latest summon, when ``env`` comes from the summoned session.
+
+        A person's /stop in their own DM with the bot's number shares the chat id and arrives on
+        the bot's session: that must not reach the owner's turn (chatlytics#951).
+        """
+        last = self._last_summon.get(env.get("entity_jid"))
+        if last is not None and env.get("session_id") == last[1]:
+            try:
+                await self._stop_source(dataclasses.replace(source, thread_id=last[0]))
+            except Exception:  # noqa: BLE001 -- the chat's ordinary conversation still has to stop
+                logger.exception("control: could not stop the running summon %s", last[0])
+
+    async def _stop_source(self, source: Any) -> None:
+        """Cancel the in-flight turn of one session: see :meth:`_control_stop`."""
         session_key = self._control_session_key(source)
         gw = self._gateway_runner()
 
@@ -5385,6 +5421,8 @@ def _register_impl(ctx: Any) -> None:
 
     # chatlytics#952: owner memory stays out of a turn summoned from the owner's number.
     memory_strip.register_strip(ctx)
+    # chatlytics#956: and its reads stay inside the chat it was summoned in.
+    read_scope.register_scope(ctx)
 
 
 def register(ctx: Any) -> None:

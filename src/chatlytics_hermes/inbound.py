@@ -28,6 +28,7 @@ from typing import Any, Callable, Dict, Optional
 from aiohttp import web
 
 from .memory_strip import log_summon_refused, summon_refusal
+from .read_scope import open_for_event
 from .trigger_context import FROM_ME, with_trigger_context
 from .owner import (
     apply_owner_access,
@@ -296,6 +297,7 @@ def make_webhook_handler(adapter: Any) -> Callable[[web.Request], Any]:
             event, _owner_extra, sender_authenticated=bool(secret)
         )
 
+        summon_scope = None
         # chatlytics#952 — same as adapter._dispatch_envelope (keep in sync). Only
         # a signed webhook can summon. Outside the try below on purpose: this one
         # must stop the turn, while prompt injection must never break dispatch.
@@ -305,6 +307,12 @@ def make_webhook_handler(adapter: Any) -> Callable[[web.Request], Any]:
                 log_summon_refused(event.source.chat_id, refusal)
                 # 200, not 5xx: a retry cannot change this answer.
                 return web.json_response({"status": "accepted"}, status=200)
+            # chatlytics#956: same as adapter._dispatch_envelope (keep in sync). DO NOT REMOVE.
+            if payload.get("trigger_source") == FROM_ME:
+                summon_scope = open_for_event(payload, event)
+                if summon_scope is None:
+                    log_summon_refused(event.source.chat_id, "the read scope could not be opened")
+                    return web.json_response({"status": "accepted"}, status=200)
         elif payload.get("trigger_source") == FROM_ME:
             # An unsigned sender is unauthenticated, so this can't be believed, and it runs
             # as an ordinary turn with full memory. If it is real, the reply reaches a third party.
@@ -352,7 +360,7 @@ def make_webhook_handler(adapter: Any) -> Callable[[web.Request], Any]:
             # chatlytics#956 — same as adapter._dispatch_envelope (keep in sync).
             # Only a signed webhook may say the owner summoned this turn.
             if secret:
-                cp = with_trigger_context(cp, payload)
+                cp = with_trigger_context(cp, payload, summon_scope.key if summon_scope else None)
             if isinstance(cp, str) and cp.strip():
                 if hasattr(event, "channel_prompt"):
                     event.channel_prompt = cp.strip()

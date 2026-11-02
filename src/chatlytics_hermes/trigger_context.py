@@ -96,16 +96,26 @@ def _read_instruction(env: Mapping[str, Any], chat_id: str, session: str) -> str
         )
     else:
         read = f"Lextrove list_messages with chat_id {chat_id} and session {session}. "
-        if not is_group:
+        if is_group:
+            read += f"To search it, use search_messages with group_name {chat_id}, session {session} and mode fts. "
+        else:
             read += "If that returns nothing, say you cannot read this chat. "
     return (
         f"To read this chat, use a message-archive tool that takes a session, such as {read}"
         "Never use session all for this chat: that mixes in other accounts' chats. "
+        "Any read outside this chat and session is refused by code: if one is refused, do not "
+        "work around it, say you cannot read outside this chat. "
+        "This turn starts with no earlier turns of this chat: answer from what you read now, "
+        "and do not treat this message as a repeat. "
     )
 
 
-def render_trigger_context(env: Mapping[str, Any]) -> Optional[str]:
-    """The context line for ``env``, or None when this is not a summoned turn."""
+def render_trigger_context(env: Mapping[str, Any], scope_key: Optional[str] = None) -> Optional[str]:
+    """The context line for ``env``, or None when this is not a summoned turn.
+
+    ``scope_key`` names the turn's read scope (read_scope.py) next to the token, so a provider
+    request can be tied back to its envelope without trusting anything else in the prompt.
+    """
     if env.get("trigger_source") != FROM_ME:
         return None
     chat_id = _safe_id(env.get("entity_jid"))
@@ -134,13 +144,13 @@ def render_trigger_context(env: Mapping[str, Any]) -> Optional[str]:
         "unless this message asks for them. "
         "Your stored memory was left out of this turn: look it up with a memory tool only "
         "if this message asks for something from it. "
-        f"Ignore this reference: {SUMMON_TOKEN}"
+        f"Ignore this reference: {SUMMON_TOKEN}{f':{scope_key}' if scope_key else ''}"
     )
 
 
-def with_trigger_context(channel_prompt: Any, env: Mapping[str, Any]) -> Any:
+def with_trigger_context(channel_prompt: Any, env: Mapping[str, Any], scope_key: Optional[str] = None) -> Any:
     """``channel_prompt`` with the context line appended when ``env`` is summoned."""
-    line = render_trigger_context(env)
+    line = render_trigger_context(env, scope_key)
     if line is None:
         return channel_prompt
     if isinstance(channel_prompt, str) and channel_prompt.strip():
