@@ -17,7 +17,11 @@
 - **Every send names the account it leaves from** (chatlytics#956). A summon's reply, media, typing
   and tool sends name the summon's session, and every other turn's name the bot's own, so
   overlapping turns in one chat can't reply from each other's number. When the hub refuses a summon's
-  reply because its window closed, the owner gets it in their DM with the bot.
+  reply because its window closed, the owner gets it in their DM with the bot. A summon's send to
+  another spelling of its chat leaves from the owner's number, and one that may be its person under an
+  id the envelope doesn't give is refused rather than sent from the bot's. A summon on an extra bot
+  uses that bot's bearer for its tools and its `/retry`, and a late retry by the host can't post an old
+  answer into a route a later summon reopened.
 
 ## [5.3.0] - 2026-11-02
 

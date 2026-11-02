@@ -10,6 +10,7 @@ import asyncio
 import contextvars
 import json
 import logging
+import time
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -85,6 +86,7 @@ def _adapter(hub: Optional[_Hub] = None, own: Optional[str] = BOT_SESSION) -> Tu
     adapter = _lp_adapter()
     conn = _BotConn(BOT_TOKEN, index=0)
     conn.client, conn.own_session = hub, own
+    conn.own_session_confirmed = own is not None  # what GET /api/v1/bot/me leaves at boot
     adapter._conns, adapter._client = [conn], hub
     adapter._no_credential = False
     return adapter, hub, conn
@@ -260,7 +262,7 @@ async def test_a_summon_this_process_has_no_scope_for_sends_nothing(caplog: Any)
         result = await adapter.send(PEER, "x", metadata=_turn(summon))
     assert not result.success and hub.bodies == []
     assert adapter._send_retry_is_final(result)
-    assert "scope lost" in caplog.text
+    assert "summon_scope_lost" in caplog.text
 
 
 # --- ordinary turns stay as they were ------------------------------------------------------------
@@ -508,13 +510,6 @@ async def test_a_peers_stop_reaches_no_summon(monkeypatch: pytest.MonkeyPatch) -
     assert adapter._control_session_key(first.source) not in gateway.stopped
 
 
-async def test_summons_kept_per_chat_are_bounded() -> None:
-    adapter, _, conn = _adapter()
-    for _i in range(40):
-        await _deliver(adapter, ENVELOPES["from_me_dm"], conn)
-    assert len(adapter._summon_turns) == 16
-
-
 # --- finding 4: the host's setup notice ----------------------------------------------------------
 
 
@@ -716,3 +711,664 @@ async def test_a_summon_with_no_message_id_is_not_deduped() -> None:
     adapter, _, conn = _adapter()
     assert await _deliver(adapter, ENVELOPES["from_me_dm"], conn) is not None
     assert await _deliver(adapter, ENVELOPES["from_me_dm"], conn) is not None
+
+
+# --- second review: a send to this chat under another spelling (F1) ------------------------------
+
+
+LID_DM = ENVELOPES["from_me_dm_lid_unmapped"]
+LID_CHAT = LID_DM["entity_jid"]
+PEER_DIGITS = PEER.split("@")[0]
+
+
+async def _summon_on_route(adapter: Any, hub: _Hub, env: Dict[str, Any], conn: _BotConn) -> Any:
+    summon = await _deliver(adapter, env, conn)
+    hub.routes[env["entity_jid"]] = OWNER_SESSION  # the envelope's id: the only one a test can rely on
+    return summon
+
+
+@pytest.mark.parametrize("spelling", [
+    PEER_DIGITS, "+" + PEER_DIGITS, f"{PEER_DIGITS}@s.whatsapp.net", f"{PEER_DIGITS}:26@s.whatsapp.net",
+    f" {PEER.upper()} ", f"chat:{PEER}", f"whatsapp:{PEER}",
+])
+@pytest.mark.parametrize("via", ["adapter", "tool"])
+async def test_another_spelling_of_this_chat_leaves_from_the_owner(spelling: str, via: str) -> None:
+    """The hub reads the route by a JID, so the body has to carry the envelope's own id."""
+    adapter, hub, conn = _adapter()
+    summon = await _summon_on_route(adapter, hub, ENVELOPES["from_me_dm"], conn)
+    key = summon.source.thread_id
+    if via == "adapter":
+        assert (await _in_turn(key, lambda: adapter.send(spelling, "x"))).success
+    else:
+        tool = _bound_tool(adapter, chatlytics_send, "chatlytics_send")
+        assert json.loads(await _in_turn(key, lambda: tool({"chatId": spelling, "text": "x"})))["success"]
+    assert hub.left == [(OWNER_SESSION, PEER, "x")]
+
+
+async def test_a_lid_chat_with_a_phone_takes_the_phone_in_any_spelling() -> None:
+    adapter, hub, conn = _adapter()
+    env = ENVELOPES["from_me_dm_lid"]
+    summon = await _summon_on_route(adapter, hub, env, conn)
+    phone = env["chat_phone"]
+    for spelling in (phone, f"+{phone}", f"{phone}@c.us"):
+        assert (await _in_turn(summon.source.thread_id, lambda: adapter.send(spelling, "x"))).success
+    assert hub.left == [(OWNER_SESSION, env["entity_jid"], "x")] * 3
+
+
+@pytest.mark.parametrize("target", [PEER, PEER_DIGITS, "+" + PEER_DIGITS, f"{PEER_DIGITS}@s.whatsapp.net", "Dana Levi"])
+async def test_a_lid_summon_with_no_phone_refuses_what_may_be_its_person(target: str, caplog: Any) -> None:
+    adapter, hub, conn = _adapter()
+    summon = await _summon_on_route(adapter, hub, LID_DM, conn)
+    key = summon.source.thread_id
+    hub.bodies.clear()
+
+    with caplog.at_level(logging.ERROR, logger="chatlytics_hermes"):
+        result = await _in_turn(key, lambda: adapter.send(target, "the answer"))
+    assert not result.success and adapter._send_retry_is_final(result)
+    assert "summon_target_unclear" in caplog.text
+
+    tool = _bound_tool(adapter, chatlytics_send, "chatlytics_send")
+    out = json.loads(await _in_turn(key, lambda: tool({"chatId": target, "text": "x"})))
+    assert out["success"] is False and "Nothing was sent" in out["error"]
+
+    assert await _in_turn(key, lambda: adapter.send_typing(target)) is None
+    assert hub.bodies == []
+
+
+async def test_a_refused_target_takes_media_with_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, hub, conn = _adapter()
+
+    async def file_field(*_a: Any, **_k: Any) -> Dict[str, Any]:
+        return {"url": "https://example.test/a.png"}
+
+    monkeypatch.setattr(adapter, "_resolve_media_file_field", file_field)
+    summon = await _summon_on_route(adapter, hub, LID_DM, conn)
+    result = await _in_turn(summon.source.thread_id, lambda: adapter.send_image(PEER, "https://example.test/a.png"))
+    assert not result.success and adapter._send_retry_is_final(result) and hub.left == []
+
+
+@pytest.mark.parametrize("env,target", [
+    (LID_DM, "137000000000000@lid"),  # another LID, and this chat's is known
+    (LID_DM, "120363000000000000@g.us"),
+    (LID_DM, "120363000000000000@newsletter"),
+    (ENVELOPES["from_me_dm"], "999@c.us"),  # another phone, and this chat's is known
+    (ENVELOPES["from_me_dm"], "+999"),
+    (ENVELOPES["from_me_dm"], "120363000000000000@g.us"),
+    (ENVELOPES["from_me_group"], PEER),
+    (ENVELOPES["from_me_group"], "137000000000000@lid"),
+    (ENVELOPES["from_me_group"], "Dana Levi"),
+])
+async def test_a_target_known_to_be_another_chat_leaves_from_the_bot(env: Dict[str, Any], target: str) -> None:
+    adapter, hub, conn = _adapter()
+    summon = await _summon_on_route(adapter, hub, env, conn)
+    assert (await _in_turn(summon.source.thread_id, lambda: adapter.send(target, "x"))).success
+    assert hub.left == [(BOT_SESSION, target, "x")]
+
+
+async def test_a_phone_summon_refuses_a_lid_the_envelope_did_not_give() -> None:
+    adapter, hub, conn = _adapter()
+    summon = await _summon_on_route(adapter, hub, ENVELOPES["from_me_dm"], conn)
+    result = await _in_turn(summon.source.thread_id, lambda: adapter.send("137000000000000@lid", "x"))
+    assert not result.success and hub.left == []
+
+
+async def test_a_group_summon_takes_its_id_without_the_suffix() -> None:
+    adapter, hub, conn = _adapter()
+    summon = await _summon_on_route(adapter, hub, ENVELOPES["from_me_group"], conn)
+    bare = GROUP.split("@")[0]
+    assert (await _in_turn(summon.source.thread_id, lambda: adapter.send(bare, "x"))).success
+    assert hub.left == [(OWNER_SESSION, GROUP, "x")]
+
+
+@pytest.mark.parametrize("target", [PEER, PEER_DIGITS, "Dana Levi", "137000000000000@lid"])
+async def test_an_ordinary_turn_refuses_no_target_during_a_summon(target: str) -> None:
+    adapter, hub, conn = _adapter()
+    await _summon_on_route(adapter, hub, LID_DM, conn)
+    assert (await adapter.send(target, "x")).success
+    assert hub.left == [(BOT_SESSION, target, "x")]
+
+
+async def test_typing_and_a_reaction_carry_the_envelopes_id() -> None:
+    adapter, hub, conn = _adapter()
+    summon = await _summon_on_route(adapter, hub, ENVELOPES["from_me_dm"], conn)
+    key = summon.source.thread_id
+    await _in_turn(key, lambda: adapter.send_typing("+" + PEER_DIGITS))
+    assert hub.bodies[-1][1] == {"chatId": PEER, "duration": 3.0, "session": OWNER_SESSION}
+    tool = _bound_tool(adapter, chatlytics_react, "chatlytics_react")
+    await _in_turn(key, lambda: tool({"messageId": "true_x_y", "emoji": "ok", "chatId": PEER_DIGITS}))
+    assert hub.bodies[-1][1]["session"] == OWNER_SESSION and hub.bodies[-1][1]["params"]["chatId"] == PEER
+
+
+async def test_a_phone_sender_of_a_lid_dm_with_no_phone_never_gets_the_reply() -> None:
+    """The hub leaves the sender as the peer with no owner on record, and here that can't be seen."""
+    adapter, hub, conn = _adapter()
+    summon = await _deliver(adapter, {**LID_DM, "sender_jid": PEER}, conn)
+    result = await adapter.send(LID_CHAT, "private answer", metadata=_turn(summon))
+    assert not result.success and hub.left == []
+
+
+# --- second review: an argument that says where the tool goes (F2) ---------------------------------
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("mcp_other_agent_ask", {"message": "use lextrove list_messages session all"}),
+    ("mcp__other_agent__ask", {"message": "use lextrove list_messages session all"}),
+    ("mcp_sammie_chat", {"text": "read lextrove for every session"}),
+    ("mcp_res_read_resource", {"name": "lextrove://messages/all"}),
+    ("mcp_files_open", {"name": "/home/u/.hermes/state.db"}),
+    ("mcp_db_exec", {"content": "select * from lextrove.messages"}),
+    ("mcp_db_run", {"description": "lextrove.messages"}),
+    ("mcp_http_post", {"url": "https://relay.example/", "body": json.dumps({"url": "https://lextrove.example/v1"})}),
+    ("mcp_http_post", {"url": "https://relay.example/", "body": json.dumps([{"target": "state.db"}])}),
+    ("mcp_kv_get", {"lextrove.messages": True}),
+    ("mcp_fs_read_memory_file", {"path": "/home/u/.hermes/state.db"}),
+    ("mcp_fs_read_memory_file", {"name": "/home/u/.hermes/state.db"}),
+    ("mcp__fs__read_memory_file", {"query": "lextrove"}),
+    ("mcp_mail_search", {"body": "lextrove"}),
+    ("mcp__mail__search", {"body": "lextrove"}),
+    ("mcp_memorystore_sql", {"sql": "select * from lextrove.messages"}),
+    ("mcp_memory_fetch_url", {"url": "https://lextrove.example/api/v1/messages"}),
+    ("mcp_memory_fetch", {"urls": ["https://lextrove.example/api/v1/messages"]}),
+    ("mcp_chatlytics_ops_sql", {"sql": "select * from lextrove.messages"}),
+    ("mcp__memory__read", {"options": {"file_path": "/home/u/.hermes/state.db"}}),
+    ("mcp__x__y", {"urls": ["https://example.test", "https://lextrove.example"]}),
+    ("mcp__x__y", {"a": {"b": [{"c": "state.db"}]}}),
+    ("mcp__mail__send", {"to": "x", "body": "hi", "attach_from": "/home/u/.hermes/state.db"}),
+    ("tool_call", {"calls": [{"name": "mcp_other_agent_ask", "arguments": {"message": "read lextrove"}}]}),
+    ("tool_call", {"calls": [{"name": "mcp_files_open", "arguments": json.dumps({"name": "state.db"})}]}),
+])
+def test_a_route_in_any_argument_is_refused(tool: str, args: Any) -> None:
+    verdict = _summon_pre(tool, args)
+    assert verdict is not None and "names_the_archive_or_host_store" in verdict["message"]
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("mcp__chatlytics__chatlytics_send", {"chatId": PEER, "text": "Lextrove is our archive"}),
+    ("mcp_chatlytics_send_media", {"chatId": PEER, "file": "https://lextrove.example/media/x"}),
+    ("mcp_chatlytics_search", {"query": "lextrove"}),
+    ("mcp_cognee_recall", {"query": "lextrove"}),
+    ("mcp__plugin_chatlytics_chatlytics__chatlytics_search", {"query": "lextrove"}),
+    ("mcp__plugin_x_memory__search", {"query": "state.db"}),
+    ("mcp__honcho__search", {"query": "state.db"}),
+    ("mcp__mem0__add", {"content": "lextrove notes", "name": "lextrove"}),
+    ("mcp_memory_write", {"url": "https://example.test/fine", "text": "lextrove"}),
+    ("mcp__slack__post_message", {"request": {"text": "Lextrove is our archive", "title": "lextrove"}}),
+    ("mcp__mail__send", {"to": "a@example.test", "body": json.dumps({"note": "about lextrove"})}),
+    ("mcp__mail__send", {"to": "a@example.test", "body": "[not json lextrove"}),
+    ("mcp__x__y", {"q": "fine"}),
+])
+def test_mentioning_the_word_to_a_person_or_a_memory_still_passes(tool: str, args: Any) -> None:
+    assert _summon_pre(tool, args) is None
+
+
+def test_json_too_deep_to_open_is_just_text() -> None:
+    assert _summon_pre("mcp__mail__send", {"body": "[" * 200000}) is None
+    assert _summon_pre("mcp__x__y", {"q": "[" * 200000}) is None
+
+
+# --- second review: several bots (F3) --------------------------------------------------------------
+
+
+def _two_bots() -> Tuple[Any, _Hub, _BotConn, _Hub, _BotConn]:
+    adapter, hub, conn = _adapter()
+    other_hub = _Hub(own="other-session")
+    other = _BotConn("sk_bot_" + "b" * 43, index=1)
+    other.client, other.own_session = other_hub, "other-session"
+    adapter._conns.append(other)
+    return adapter, hub, conn, other_hub, other
+
+
+async def test_a_tool_on_a_summon_of_an_extra_bot_uses_that_bot() -> None:
+    adapter, hub, conn, other_hub, other = _two_bots()
+    summon = await _deliver(adapter, ENVELOPES["from_me_dm"], other)
+    other_hub.routes[PEER] = OWNER_SESSION
+    key = summon.source.thread_id
+    tool = _bound_tool(adapter, chatlytics_send, "chatlytics_send")
+
+    await _in_turn(key, lambda: tool({"chatId": PEER, "text": "here"}))
+    await _in_turn(key, lambda: tool({"chatId": "999@c.us", "text": "elsewhere"}))
+    assert hub.bodies == []
+    assert other_hub.left == [(OWNER_SESSION, PEER, "here"), ("other-session", "999@c.us", "elsewhere")]
+    assert other_hub.bodies[-1][1]["session"] == "other-session"
+
+
+async def test_a_tool_on_a_summon_of_an_extra_bot_found_by_task_id_uses_that_bot() -> None:
+    adapter, hub, conn, other_hub, other = _two_bots()
+    summon = await _deliver(adapter, ENVELOPES["from_me_dm"], other)
+    other_hub.routes[PEER] = OWNER_SESSION
+    read_scope.note_request(True, f"x:{summon.source.thread_id}", "s1", "task-1")
+    tool = _bound_tool(adapter, chatlytics_send, "chatlytics_send")
+    await tool({"chatId": PEER, "text": "x"}, task_id="task-1")
+    assert hub.bodies == [] and other_hub.left == [(OWNER_SESSION, PEER, "x")]
+
+
+async def test_an_ordinary_tool_stays_on_the_primary_during_an_extra_bots_summon() -> None:
+    adapter, hub, conn, other_hub, other = _two_bots()
+    await _deliver(adapter, ENVELOPES["from_me_dm"], other)
+    tool = _bound_tool(adapter, chatlytics_send, "chatlytics_send")
+    await _in_turn("", lambda: tool({"chatId": PEER, "text": "x"}))
+    assert hub.left == [(BOT_SESSION, PEER, "x")] and other_hub.bodies == []
+
+
+async def test_a_send_to_another_chat_names_the_session_of_the_bearer_it_uses() -> None:
+    adapter, hub, conn, other_hub, other = _two_bots()
+    await _deliver(adapter, {**ENVELOPES["third_party_dm"], "entity_jid": "999@c.us"}, conn)
+    summon = await _deliver(adapter, ENVELOPES["from_me_dm"], other)
+    await _in_turn(summon.source.thread_id, lambda: adapter.send("999@c.us", "x"))
+    assert other_hub.bodies[-1][1]["session"] == "other-session" and hub.left == []
+
+
+async def test_a_retry_of_an_extra_bots_summon_stays_on_that_bot() -> None:
+    adapter, hub, conn, other_hub, other = _two_bots()
+    await _deliver(adapter, ENVELOPES["third_party_dm"], conn)
+    await _deliver(adapter, ENVELOPES["from_me_dm"], other)
+    events, _ = _install_recorders(adapter)
+    await adapter._dispatch_envelope(_control("retry_last", OWNER_SESSION))
+    assert len(events) == 1
+    other_hub.routes[PEER] = OWNER_SESSION
+    await adapter.send(PEER, "again", metadata=_turn(events[0]))
+    assert hub.left == [] and other_hub.left == [(OWNER_SESSION, PEER, "again")]
+
+
+async def test_a_retry_with_no_known_bearer_among_several_bots_is_refused() -> None:
+    adapter, hub, conn, other_hub, other = _two_bots()
+    await _deliver(adapter, ENVELOPES["from_me_dm"], other)
+    adapter._summon_turns.clear()
+    events, _ = _install_recorders(adapter)
+    await adapter._dispatch_envelope(_control("retry_last", OWNER_SESSION))
+    assert events == []
+
+
+async def test_a_retry_with_one_bot_needs_no_earlier_summon() -> None:
+    adapter, _, conn = _adapter()
+    await _deliver(adapter, ENVELOPES["from_me_dm"], conn)
+    adapter._summon_turns.clear()
+    events, _ = _install_recorders(adapter)
+    await adapter._dispatch_envelope(_control("retry_last", OWNER_SESSION))
+    assert len(events) == 1
+
+
+async def test_a_summon_keeps_its_bearer_after_many_later_summons() -> None:
+    adapter, hub, conn, other_hub, other = _two_bots()
+    await _deliver(adapter, ENVELOPES["third_party_dm"], conn)
+    first = await _deliver(adapter, ENVELOPES["from_me_dm"], other)
+    for _i in range(20):
+        await _deliver(adapter, ENVELOPES["from_me_dm"], other)
+    other_hub.routes[PEER] = OWNER_SESSION
+    await adapter.send(PEER, "late", metadata=_turn(first))
+    assert hub.left == [] and other_hub.left == [(OWNER_SESSION, PEER, "late")]
+
+
+async def test_turns_are_bounded_by_the_scopes_and_stop_by_the_chat(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, _, conn = _adapter()
+    gateway = _Gateway()
+    monkeypatch.setattr(adapter, "_gateway_runner", lambda: gateway)
+    summons = [await _deliver(adapter, ENVELOPES["from_me_dm"], conn) for _i in range(20)]
+    await adapter._dispatch_envelope(_control("stop", OWNER_SESSION))
+    assert len(gateway.stopped) == 17  # 16 summons, and the ordinary session key of the chat
+    assert adapter._control_session_key(summons[-1].source) in gateway.stopped
+    assert adapter._control_session_key(summons[0].source) not in gateway.stopped
+
+    monkeypatch.setattr(read_scope, "_SCOPES_MAX", 5)
+    await _deliver(adapter, ENVELOPES["from_me_dm"], conn)
+    assert len(adapter._summon_turns) == 5
+
+
+# --- second review: the group fallback, and a 409 on an ordinary turn (F4) -------------------------
+
+
+async def test_a_group_owner_dm_is_addressed_to_the_participant_as_the_envelope_has_it() -> None:
+    """What the hub then does with this is exact-match: docs/summoned-turns.md, live test row G1."""
+    adapter, hub, conn = _adapter()
+    lid = "137000000000000@lid"
+    summon = await _deliver(adapter, {**ENVELOPES["from_me_group"], "sender_jid": lid}, conn)
+    assert (await adapter.send(GROUP, "the answer", metadata=_turn(summon))).success
+    assert [(s, c) for s, c, _ in hub.left] == [(BOT_SESSION, lid)]
+
+
+async def test_a_403_on_the_group_owner_dm_loses_the_reply_with_an_error(caplog: Any) -> None:
+    adapter, hub, conn = _adapter()
+    real_post = hub.post
+
+    async def bot_unpaired(path: str, json: Dict[str, Any], timeout: Any = None) -> _Resp:  # noqa: A002
+        if json.get("chatId") != GROUP:
+            return _Resp(403, {"error": "bot_unpaired", "error_kind": "bot-unpaired"})
+        return await real_post(path, json, timeout)
+
+    hub.post = bot_unpaired  # type: ignore[method-assign]
+    lid = "137000000000000@lid"
+    summon = await _deliver(adapter, {**ENVELOPES["from_me_group"], "sender_jid": lid}, conn)
+    with caplog.at_level(logging.ERROR, logger="chatlytics_hermes"):
+        result = await adapter.send(GROUP, "the answer", metadata=_turn(summon))
+    assert not result.success and adapter._send_retry_is_final(result)
+    assert hub.left == [] and "could not tell the owner" in caplog.text
+
+
+async def test_a_409_on_an_ordinary_turn_is_not_sent_anywhere_else(caplog: Any) -> None:
+    adapter, hub, conn = _adapter()
+    summon = await _deliver(adapter, ENVELOPES["from_me_dm"], conn)
+    hub.own = "moved"  # the session this turn names is now foreign, and the bound one
+    hub.bound = BOT_SESSION
+    with caplog.at_level(logging.ERROR, logger="chatlytics_hermes"):
+        result = await adapter.send(PEER, "ordinary")
+    assert not result.success and hub.left == []
+    assert "summon reply not posted" not in caplog.text
+    assert adapter._summon_turns[summon.source.thread_id].route_closed is False
+
+
+# --- second review: a stale envelope (F5) ----------------------------------------------------------
+
+
+def _unmarked(env: str = "from_me_dm") -> Dict[str, Any]:
+    return {k: v for k, v in ENVELOPES[env].items() if k != "trigger_source"}
+
+
+async def test_an_unmarked_owner_envelope_does_not_move_ordinary_sends_to_the_owner() -> None:
+    adapter, hub, conn = _adapter()
+    await _deliver(adapter, _unmarked(), conn)
+    await conn.own_session_probe
+    assert conn.own_session == BOT_SESSION
+    assert (await adapter.send("999@c.us", "x")).success
+    assert hub.left == [(BOT_SESSION, "999@c.us", "x")]
+
+
+async def test_a_bot_really_moved_is_named_once_bot_me_confirms_it() -> None:
+    adapter, hub, conn = _adapter()
+    hub.own = "moved-session"
+    await _deliver(adapter, {**ENVELOPES["third_party_dm"], "session_id": "moved-session"}, conn)
+    await conn.own_session_probe
+    assert conn.own_session == "moved-session"
+
+
+async def test_a_failed_confirmation_keeps_what_bot_me_said() -> None:
+    adapter, hub, conn = _adapter()
+
+    async def down(_path: str, **_: Any) -> _Resp:
+        raise RuntimeError("hub down")
+
+    hub.get = down  # type: ignore[method-assign]
+    await _deliver(adapter, _unmarked(), conn)
+    await conn.own_session_probe
+    assert conn.own_session == BOT_SESSION
+
+
+async def test_an_ordinary_turn_does_not_wait_for_the_confirmation_and_asks_once() -> None:
+    adapter, hub, conn = _adapter()
+    gate = asyncio.Event()
+    calls: List[str] = []
+
+    async def slow(path: str, **_: Any) -> _Resp:
+        calls.append(path)
+        await gate.wait()
+        return _Resp(200, {"session_id": BOT_SESSION})
+
+    hub.get = slow  # type: ignore[method-assign]
+    assert await _deliver(adapter, _unmarked(), conn) is not None
+    await _deliver(adapter, _unmarked(), conn)
+    await asyncio.sleep(0)
+    assert calls == ["/api/v1/bot/me"]
+    gate.set()
+    await conn.own_session_probe
+
+
+async def test_a_matching_envelope_asks_nothing() -> None:
+    adapter, hub, conn = _adapter()
+    await _deliver(adapter, ENVELOPES["third_party_dm"], conn)
+    assert conn.own_session_probe is None
+
+
+async def test_the_boot_probe_records_the_primarys_session() -> None:
+    adapter, hub, conn = _adapter(own=None)
+    await adapter._log_boot_identity()
+    assert conn.own_session == BOT_SESSION and conn.own_session_confirmed
+
+
+async def test_the_extra_bot_probe_records_its_session() -> None:
+    adapter, _, _ = _adapter()
+    other = _BotConn("sk_bot_" + "b" * 43, index=1)
+    other.client = _Hub(own="other-session")
+    assert await adapter._verify_bot_identity(other)
+    assert other.own_session == "other-session" and other.own_session_confirmed
+
+
+# --- second review: a late retry into a reopened route (F7) ----------------------------------------
+
+
+async def test_a_refused_summon_stays_out_of_a_route_a_later_summon_reopened(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, hub, conn = _adapter()
+
+    async def file_field(*_a: Any, **_k: Any) -> Dict[str, Any]:
+        return {"url": "https://example.test/a.png"}
+
+    monkeypatch.setattr(adapter, "_resolve_media_file_field", file_field)
+    old = await _deliver(adapter, ENVELOPES["from_me_dm"], conn)
+    assert (await adapter.send(PEER, "old answer", metadata=_turn(old))).success  # 409, then the owner's DM
+    assert hub.refused == [("/api/v1/send", PEER)]
+
+    new = await _deliver(adapter, ENVELOPES["from_me_dm"], conn)
+    hub.routes[PEER] = OWNER_SESSION  # the owner summoned again
+
+    # What the host's ledger does 30 and 120 seconds later: the row's thread id, and nothing else.
+    row = {"thread_id": old.source.thread_id}
+    assert not (await adapter.send(chat_id=PEER, content="old answer", metadata=row)).success
+    assert hub.refused == [("/api/v1/send", PEER)]  # it never got as far as the hub
+    assert (await adapter.send(PEER, "old answer", metadata=_turn(old))).success
+    assert not (await adapter.send_image(PEER, "https://example.test/a.png", metadata=_turn(old))).success
+    await adapter.send_typing(PEER, metadata=_turn(old, final=False))
+    await adapter._send_progress_bubble(PEER, "t", _turn(old, final=False))
+    assert [left for left in hub.left if left[1] == PEER] == []
+    assert not [b for p, b in hub.bodies if p == "/api/v1/typing"]
+    assert [c for _, c, _ in hub.left] == [OWNER, OWNER]
+
+    assert (await adapter.send(PEER, "new answer", metadata=_turn(new))).success
+    assert hub.left[-1] == (OWNER_SESSION, PEER, "new answer")
+
+
+async def test_a_closed_route_holds_for_another_spelling_of_the_chat() -> None:
+    adapter, hub, conn = _adapter()
+    old = await _deliver(adapter, ENVELOPES["from_me_dm"], conn)
+    await adapter.send(PEER, "old answer", metadata={**_turn(old), "notify": False})
+    await _deliver(adapter, ENVELOPES["from_me_dm"], conn)
+    hub.routes[PEER] = OWNER_SESSION
+    assert not (await adapter.send(PEER_DIGITS, "old answer", metadata={"thread_id": old.source.thread_id})).success
+    assert hub.left == []
+
+
+async def test_a_refused_file_closes_the_route_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, hub, conn = _adapter()
+
+    async def file_field(*_a: Any, **_k: Any) -> Dict[str, Any]:
+        return {"url": "https://example.test/a.png"}
+
+    monkeypatch.setattr(adapter, "_resolve_media_file_field", file_field)
+    summon = await _deliver(adapter, ENVELOPES["from_me_dm"], conn)
+    assert not (await adapter.send_image(PEER, "https://example.test/a.png", metadata=_turn(summon))).success
+    assert adapter._summon_turns[summon.source.thread_id].route_closed
+
+
+async def test_a_closed_route_doesnt_stop_the_summon_writing_elsewhere() -> None:
+    adapter, hub, conn = _adapter()
+    summon = await _deliver(adapter, ENVELOPES["from_me_dm"], conn)
+    await adapter.send(PEER, "x", metadata=_turn(summon))
+    assert (await _in_turn(summon.source.thread_id, lambda: adapter.send("999@c.us", "y"))).success
+    assert hub.left[-1] == (BOT_SESSION, "999@c.us", "y")
+
+
+# --- second review: what the mutation run showed no test held --------------------------------------
+
+
+@pytest.mark.parametrize("sender", ["send_image", "send_voice", "send_video", "send_animation", "send_document"])
+async def test_every_media_kind_names_the_turns_account(sender: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, hub, conn = _adapter()
+
+    async def file_field(*_a: Any, **_k: Any) -> Dict[str, Any]:
+        return {"url": "https://example.test/a.bin"}
+
+    monkeypatch.setattr(adapter, "_resolve_media_file_field", file_field)
+    ordinary = await _deliver(adapter, ENVELOPES["third_party_dm"], conn)
+    summon = await _deliver(adapter, ENVELOPES["from_me_dm"], conn)
+    hub.routes[PEER] = OWNER_SESSION
+    send = getattr(adapter, sender)
+    await send(PEER, "https://example.test/a.bin", metadata=_turn(summon))
+    await send(PEER, "https://example.test/a.bin", metadata=_turn(ordinary))
+    assert [s for s, _, _ in hub.left] == [OWNER_SESSION, BOT_SESSION]
+
+
+async def _wait_for(check: Any) -> None:
+    for _i in range(500):
+        if check():
+            return
+        await asyncio.sleep(0.002)
+    raise AssertionError("never happened")
+
+
+async def test_the_typing_loop_keeps_naming_the_turns_account() -> None:
+    adapter, hub, conn = _adapter()
+    adapter.status_bubble_after_s = 0  # no bubble in this one
+    summon = await _deliver(adapter, ENVELOPES["from_me_dm"], conn)
+    hub.routes[PEER] = OWNER_SESSION
+    stop = asyncio.Event()
+    typing = lambda: [b for p, b in hub.bodies if p == "/api/v1/typing"]  # noqa: E731
+    loop = asyncio.ensure_future(
+        adapter._keep_typing(PEER, interval=0.001, metadata=_turn(summon, final=False), stop_event=stop)
+    )
+    await _wait_for(lambda: len(typing()) >= 3)
+    stop.set()
+    await loop
+    assert all(b["session"] == OWNER_SESSION for b in typing())
+
+
+async def test_the_bubble_timer_names_the_turns_account_and_its_delete_names_none() -> None:
+    adapter, hub, conn = _adapter()
+    adapter.status_edit_in_place, adapter.status_bubble_after_s = True, 0.001
+    summon = await _deliver(adapter, ENVELOPES["from_me_dm"], conn)
+    hub.routes[PEER] = OWNER_SESSION
+    stop = asyncio.Event()
+    loop = asyncio.ensure_future(
+        adapter._keep_typing(PEER, interval=0.01, metadata=_turn(summon, final=False), stop_event=stop)
+    )
+    bubble = lambda: [b for p, b in hub.bodies if p == "/api/v1/send" and b.get("progress")]  # noqa: E731
+    await _wait_for(lambda: bubble())
+    stop.set()
+    await loop
+    assert bubble()[0]["session"] == OWNER_SESSION
+    # No route covers this verb, so the hub pins it to the bot's number and ignores a session.
+    actions = [b for p, b in hub.bodies if p == "/api/v1/actions"]
+    assert [b["action"] for b in actions] == ["unsend"] and "session" not in actions[0]
+
+
+async def test_the_webhook_path_opens_a_summon_like_the_long_poll() -> None:
+    from tests.test_owner_tagging import _post, _wh_adapter, _wh_payload
+
+    adapter = _wh_adapter(secret=True, allow_admin_from=[OWNER])
+    adapter.client_for_test = None
+    payload = {**_wh_payload("!sammie hi", PEER), "senderId": OWNER, **ENVELOPES["from_me_dm"], "message_id": "m-1"}
+    first = await _post(adapter, payload, sign=True)
+    assert read_scope.is_scope_key(first[0].source.thread_id)
+    assert adapter._summon_turns[first[0].source.thread_id].session == OWNER_SESSION
+    assert await _post(adapter, payload, sign=True) == []  # the ledger, on this path too
+
+
+async def test_a_webhook_summon_keeps_the_chats_session_for_its_other_turns() -> None:
+    from tests.test_owner_tagging import _post, _wh_adapter, _wh_payload
+
+    adapter = _wh_adapter(secret=True, allow_admin_from=[OWNER])
+    adapter.register_chat_session(PEER, BOT_SESSION)
+    payload = {**_wh_payload("!sammie hi", PEER), "senderId": OWNER, **ENVELOPES["from_me_dm"], "session": OWNER_SESSION}
+    await _post(adapter, payload, sign=True)
+    assert adapter._chat_session_map[PEER] == BOT_SESSION
+
+
+async def test_the_route_verbs_are_the_hubs_and_no_others() -> None:
+    from chatlytics_hermes.tools import _ROUTE_ACTIONS, _name_outbound_session
+
+    assert _ROUTE_ACTIONS == {"react", "startTyping", "stopTyping", "sendSeen"}
+    token = read_scope.OUTBOUND_RESOLVER.set(lambda _chat: ("s", None))
+    try:
+        for action, named in (("react", True), ("unsend", False), ("edit", False), ("getChatMessages", False)):
+            body = {"action": action, "params": {"chatId": PEER}}
+            _name_outbound_session("/api/v1/actions", body)
+            assert ("session" in body) is named, action
+    finally:
+        read_scope.OUTBOUND_RESOLVER.reset(token)
+
+
+def test_a_request_with_the_line_and_no_scope_gives_its_task_the_lost_key() -> None:
+    read_scope.note_request(True, "the line with no key", "s1", "task-lost")
+    assert read_scope.turn_key_for_tool("task-lost") == read_scope.LOST_KEY
+    assert read_scope.turn_key_for_tool("task-other") is None
+
+
+async def test_a_tool_of_a_task_with_no_scope_sends_nothing() -> None:
+    adapter, hub, _ = _adapter()
+    read_scope.note_request(True, "the line with no key", "s1", "task-lost")
+    tool = _bound_tool(adapter, chatlytics_send, "chatlytics_send")
+    out = json.loads(await tool({"chatId": PEER, "text": "x"}, task_id="task-lost"))
+    assert out["success"] is False and hub.bodies == []
+
+
+# --- second review: the delivered summons file (F6) ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "content",
+    [b"[" * 200000, b"\xff\xfe\x00garbage", b"[1,2,3]", b"", b'{"a":"x","b":null}'],
+    ids=["too_deep", "binary", "a_list", "empty", "bad_values"],
+)
+def test_a_bad_file_never_loses_a_summon(content: bytes, tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "seen.json"
+    path.write_bytes(content)
+    monkeypatch.setattr(read_scope, "_seen_path", lambda: path)
+    env = {"session_id": "s", "entity_jid": "c", "message_id": "m"}
+    assert read_scope.first_delivery(env) is True
+    assert read_scope.first_delivery(env) is False
+    read_scope._seen.clear()
+    assert read_scope.first_delivery(env) is False  # and the file is good again
+
+
+def _delivered(message: str, chat: str = "c") -> Dict[str, Any]:
+    return {"session_id": "s", "entity_jid": chat, "message_id": message}
+
+
+def test_a_delivery_older_than_the_ttl_counts_as_new(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = [1000.0]
+    monkeypatch.setattr(read_scope.time, "time", lambda: now[0])
+    assert read_scope.first_delivery(_delivered("m")) is True
+    now[0] += read_scope._SEEN_TTL_S
+    assert read_scope.first_delivery(_delivered("m")) is False
+    now[0] += 1
+    assert read_scope.first_delivery(_delivered("m")) is True
+
+
+def test_the_ttl_clears_old_entries_from_the_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = [1000.0]
+    monkeypatch.setattr(read_scope.time, "time", lambda: now[0])
+    read_scope.first_delivery(_delivered("old"))
+    now[0] += read_scope._SEEN_TTL_S + 1
+    read_scope.first_delivery(_delivered("new"))
+    assert len(json.loads(read_scope._seen_path().read_text("utf-8"))) == 1
+
+
+def test_the_file_is_capped_and_drops_the_oldest(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(read_scope, "_SEEN_MAX", 3)
+    for message in "abcd":
+        assert read_scope.first_delivery(_delivered(message)) is True
+    assert len(json.loads(read_scope._seen_path().read_text("utf-8"))) == 3
+    assert read_scope.first_delivery(_delivered("d")) is False
+    assert read_scope.first_delivery(_delivered("a")) is True
+
+
+def test_a_loaded_file_drops_the_oldest_by_time_not_by_position(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = time.time()
+    newer, older = read_scope._delivery_id(_delivered("newer")), read_scope._delivery_id(_delivered("older"))
+    read_scope._seen_path().write_text(json.dumps({newer: now - 10, older: now - 1000}), "utf-8")
+    monkeypatch.setattr(read_scope, "_SEEN_MAX", 2)
+    assert read_scope.first_delivery(_delivered("third")) is True
+    assert read_scope.first_delivery(_delivered("newer")) is False
+
+
+def test_the_same_message_id_in_another_chat_or_session_is_new() -> None:
+    assert read_scope.first_delivery(_delivered("m", "a@c.us")) is True
+    assert read_scope.first_delivery(_delivered("m", "b@c.us")) is True
+    assert read_scope.first_delivery({**_delivered("m", "a@c.us"), "session_id": "other"}) is True
+    assert read_scope.first_delivery(_delivered("m", "a@c.us")) is False

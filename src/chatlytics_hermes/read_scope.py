@@ -107,8 +107,32 @@ OUTBOUND_RESOLVER: "contextvars.ContextVar[Optional[Callable[[str], Optional[str
 )
 
 
-class SummonScopeLost(Exception):
-    """A summon's send whose account can't be named: see :func:`scope_for_key`."""
+class SummonSendRefused(Exception):
+    """A summon's send that must not go out, because its account can't be named. Nothing was sent."""
+
+    code = "summon_send_refused"
+    error = "This summoned turn could not name the account to send from. Nothing was sent."
+
+
+class SummonScopeLost(SummonSendRefused):
+    """This process has no scope for the summon: see :func:`scope_for_key`."""
+
+    code = "summon_scope_lost"
+    error = (
+        "This summoned turn lost its read scope, so the account to reply from is unknown. Nothing was "
+        "sent. Summon the bot again."
+    )
+
+
+class SummonTargetUnclear(SummonSendRefused):
+    """A target that may be this DM's person under an id the envelope didn't give: see :func:`send_target`."""
+
+    code = "summon_target_unclear"
+    error = (
+        "This target may be the person of the summoned chat under another id, and that can't be told "
+        "from here, so the account to send from is unknown. Nothing was sent. To write in the summoned "
+        "chat, use that chat's id from your context line."
+    )
 
 
 def is_scope_key(value: Any) -> bool:
@@ -119,8 +143,49 @@ def scope_for_key(key: str) -> Optional[SummonScope]:
     return _scopes.get(key)
 
 
+THIS_CHAT = "this_chat"
+OTHER_CHAT = "other_chat"
+UNCLEAR_CHAT = "unclear_chat"
+# What the hub's normalizeWahaMessagingTarget strips off a target before it reads the route.
+_TARGET_PREFIX = re.compile(r"^(?:waha:|whatsapp:)?(?:chat:)?")
+_NOT_A_PERSON = ("@g.us", "@newsletter", "@broadcast")
+
+
+def send_target(scope: SummonScope, target: Any) -> str:
+    """Is ``target`` this summon's chat, another chat, or can't that be told?
+
+    DO NOT CHANGE to a plain look-up in ``chat_forms``, and DO NOT make the last answers OTHER_CHAT.
+    An envelope gives a DM's person under one or two of their ids. OTHER_CHAT makes the send name the
+    bot's session, and a named own session beats the live route, so the same person under an id the
+    envelope didn't give got the owner's reply from the BOT's number: a summon in ``X@lid`` with no
+    ``chat_phone`` sending to the ``@c.us`` that ``chatlytics_search`` returned did exactly this
+    (chatlytics#956 review). The envelope can't say whose that phone is, so it is refused: a refusal
+    costs one tool call, the wrong number can't be taken back.
+    """
+    text = _norm(target)
+    if text is None:
+        return OTHER_CHAT
+    # The prefix first: its colon reads as a device suffix.
+    text = _norm_jid(_TARGET_PREFIX.sub("", text)) or ""
+    if text in scope.chat_forms:
+        return THIS_CHAT
+    if scope.is_group:
+        return THIS_CHAT if f"{text}@g.us" in scope.chat_forms else OTHER_CHAT
+    digits = _phone_of(text)
+    if digits is not None:
+        known = scope.phone or _phone_of(scope.chat_id)
+        if known is None:
+            return UNCLEAR_CHAT
+        return THIS_CHAT if digits == known else OTHER_CHAT
+    if text.endswith("@lid"):
+        # One person has one LID: known only when the envelope gave this chat's.
+        return OTHER_CHAT if scope.chat_id.casefold().endswith("@lid") else UNCLEAR_CHAT
+    # Anything else that isn't a chat of a person. A bare name could resolve to this one.
+    return OTHER_CHAT if text.endswith(_NOT_A_PERSON) else UNCLEAR_CHAT
+
+
 def chat_in_scope(scope: SummonScope, chat_id: Any) -> bool:
-    return _norm_jid(chat_id) in scope.chat_forms
+    return send_target(scope, chat_id) == THIS_CHAT
 
 
 def current_turn_key() -> Optional[str]:
@@ -284,7 +349,9 @@ def _seen_table(path: Path) -> "OrderedDict[str, float]":
             table.update(sorted(((k, v) for k, v in items if isinstance(v, (int, float))), key=lambda kv: kv[1]))
         except FileNotFoundError:
             pass
-        except (OSError, ValueError) as exc:
+        except Exception as exc:  # noqa: BLE001
+            # DO NOT narrow. A deeply nested file raises RecursionError, and that failed every summon
+            # until someone deleted the file. Starting empty costs the restart case only.
             logger.warning("chatlytics#956: could not read the delivered summons file: %s", exc)
         _seen[str(path)] = table
     return table
@@ -542,38 +609,76 @@ _TEXT_ROUTE_MARKS = re.compile(
 
 
 # Chatlytics' own tools (its reads and dispatch are refused above) and memory: Omer's decision is that
-# memory tools stay, on a summoned turn too, whatever they are asked about.
-_TEXT_EXEMPT = re.compile(r"chatlytics|memor|mem0|cognee|honcho")
-# Words for a person to read. The other arguments of an unknown MCP tool (url, path, sql, query,
-# command) say what it reaches, and those are still searched.
+# memory tools stay, on a summoned turn too, whatever they are asked about. DO NOT match this on the
+# whole tool name: "memor" in a tool's name let mcp_fs_read_memory_file open state.db. It is the server.
+_TEXT_EXEMPT_SERVER = re.compile(r"chatlytics|memor|mem0|cognee|honcho")
+# An exempt server is still not told where to go: a memory server's fetch or sql is a route like any
+# other. Whole words of the key, so url, file_path and base_uri, and not curl_flags.
+_REACH_KEY = re.compile(r"(?:^|_)(?:urls?|uris?|paths?|sql)(?:_|$)")
+# Tool words that mean "put this text in front of a person". Only there are the keys below words for a
+# person to read. DO NOT apply them to other tools: `message` to an agent's ask, `name` of a resource,
+# `content` of a db exec and `body` of an http call were all routes this let through (chatlytics#956).
+_SEND_WORDS = frozenset({
+    "send", "post", "reply", "publish", "notify", "comment", "email", "mail", "message", "dm", "tweet",
+})
 _PROSE_KEYS = frozenset({
     "text", "message", "content", "caption", "body", "subject", "title", "description", "note",
     "notes", "comment", "reply", "summary", "name",
 })
 
 
-def _normalized(tool_name: Any) -> str:
-    return str(tool_name or "").strip().casefold().replace("-", "_").replace(".", "_")
+def _mcp_parts(tool_name: Any) -> Tuple[str, str]:
+    """``(server, tool)``. hermes-agent writes ``mcp__server__tool``; a ``mcp_a_b`` name's server is ``a``."""
+    name = str(tool_name or "").strip().casefold().replace("-", "_").replace(".", "_")
+    if name.startswith("mcp__"):
+        server, _, tool = name[5:].partition("__")
+    else:
+        server, _, tool = name[4:].partition("_")
+    return server, tool
 
 
-def _addressing_values(raw_args: Any) -> Iterable[str]:
-    """Every string in ``raw_args`` that isn't under a prose key. Text that isn't JSON counts whole."""
-    if isinstance(raw_args, str):
-        try:
-            raw_args = json.loads(raw_args)
-        except ValueError:
-            yield raw_args
-            return
+def _json_in(text: str) -> Optional[Any]:
+    """What a string holds when it is a JSON object or list. A body is often one, with a URL inside."""
+    if text.lstrip()[:1] not in ("{", "["):
+        return None
+    try:
+        return json.loads(text)
+    except (ValueError, RecursionError):
+        return None
+
+
+def _keyed_strings(raw_args: Any) -> Iterable[Tuple[Optional[str], str]]:
+    """Every string in ``raw_args`` with the key it is under, JSON inside strings opened up.
+
+    A mapping's keys count as strings with no key of their own: ``{"lextrove.messages": true}`` is an
+    address too. Text that isn't JSON comes back whole, with no key.
+    """
     stack: List[Tuple[Optional[str], Any]] = [(None, raw_args)]
     while stack:
         key, value = stack.pop()
         if isinstance(value, str):
-            if key is None or key.casefold() not in _PROSE_KEYS:
-                yield value
+            inner = _json_in(value)
+            if inner is not None:
+                stack.append((key, inner))
+            else:
+                yield key, value
         elif isinstance(value, Mapping):
-            stack.extend((str(k), v) for k, v in value.items())
+            for k, v in value.items():
+                yield None, str(k)
+                stack.append((str(k), v))
         elif isinstance(value, (list, tuple)):
             stack.extend((key, v) for v in value)
+
+
+def _addressing_values(tool_name: Any, raw_args: Any) -> Iterable[str]:
+    """The strings of an MCP call that say what the tool reaches: see :data:`_TEXT_EXEMPT_SERVER`."""
+    server, tool = _mcp_parts(tool_name)
+    pairs = _keyed_strings(raw_args)
+    if _TEXT_EXEMPT_SERVER.search(server):
+        return (text for key, text in pairs if key is not None and _REACH_KEY.search(key.casefold()))
+    if _SEND_WORDS.isdisjoint(tool.split("_")):
+        return (text for _key, text in pairs)
+    return (text for key, text in pairs if key is None or key.casefold() not in _PROSE_KEYS)
 
 
 def _wrapped_calls(args: Mapping[str, Any]) -> Optional[List[Tuple[Any, Any]]]:
@@ -666,9 +771,7 @@ def _check_one(tool_name: Any, raw_args: Any, scope: SummonScope) -> Optional[Re
     # DO NOT CHANGE to a search of the whole arguments: that refused a send saying "Lextrove is our
     # archive" and a memory search for the word, with a message about reading. What matters on an
     # MCP tool is whether the word is where the tool is told what to reach.
-    if _TEXT_EXEMPT.search(_normalized(tool_name)):
-        return None
-    if any(_TEXT_ROUTE_MARKS.search(text) for text in _addressing_values(raw_args)):
+    if any(_TEXT_ROUTE_MARKS.search(text) for text in _addressing_values(tool_name, raw_args)):
         return Refusal("names_the_archive_or_host_store", label)
     return None
 

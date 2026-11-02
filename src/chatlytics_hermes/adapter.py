@@ -657,6 +657,7 @@ def _note_own_session(conn: Optional["_BotConn"], me: Any) -> None:
     session = me.get("session_id") if isinstance(me, dict) else None
     if conn is not None and isinstance(session, str) and session:
         conn.own_session = session
+        conn.own_session_confirmed = True
 
 
 @dataclasses.dataclass
@@ -671,17 +672,22 @@ class _SummonTurn:
     owner: Optional[str]
     chat_name: Optional[str]
     stopped: bool = False
+    # The hub refused this summon once: see _summon_route_closed.
+    route_closed: bool = False
 
 
 # Summons of one chat that /stop and /new still try. The hub allows a guest 5 a minute per chat.
 _SUMMONS_PER_CHAT_MAX = 16
 # Hub 409: "nothing was sent", because no reply route on the owner's number covers this chat.
 _ROUTE_EXPIRED = "from_me_route_expired"
-_SCOPE_LOST = "summon_scope_lost"
-_SCOPE_LOST_ERROR = (
-    "This summoned turn lost its read scope, so the account to reply from is unknown. Nothing was "
-    "sent. Summon the bot again."
-)
+_ROUTE_CLOSED_ERROR = "The window on the owner's number closed for this chat. Nothing was sent."
+_SUMMON_REFUSALS = {cls.error: cls.code for cls in (read_scope.SummonScopeLost, read_scope.SummonTargetUnclear)}
+
+
+def _summon_refusal_raw(error: Optional[str]) -> Optional[Dict[str, str]]:
+    """``raw_response`` of a send refused here, so the host doesn't retry what can't change."""
+    code = _SUMMON_REFUSALS.get(error or "")
+    return {"code": code} if code else None
 
 
 class ChatlyticsConnectError(RuntimeError):
@@ -757,6 +763,8 @@ class _BotConn:
         "transport_since",
         "transport_detail",
         "own_session",
+        "own_session_confirmed",
+        "own_session_probe",
     )
 
     def __init__(self, token: str, index: int) -> None:
@@ -771,6 +779,9 @@ class _BotConn:
         self.index: int = index
         # chatlytics#956: this bot's own WhatsApp session. See _outbound_session.
         self.own_session: Optional[str] = None
+        # True once GET /bot/me said so: see ChatlyticsAdapter._note_envelope_session.
+        self.own_session_confirmed: bool = False
+        self.own_session_probe: Optional["asyncio.Future"] = None
         self.task: Optional["asyncio.Task"] = None
         # v5.0.0 (bot stream): inbound state shared by BOTH transports. The
         # cursor format is identical on long-poll and the stream, so a bot
@@ -1450,36 +1461,113 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         closed route is a 409 and not the wrong number; anything else the bot's own, where the hub
         answers exactly as it does for no session when no route is open.
 
-        Raises :class:`read_scope.SummonScopeLost` for a summon this process has no scope for.
+        Raises :class:`read_scope.SummonSendRefused` when a summon's account can't be named.
         """
-        if key:
-            scope = read_scope.scope_for_key(key)
-            if scope is None:
-                raise read_scope.SummonScopeLost(key)
-            if read_scope.chat_in_scope(scope, chat_id):
-                return scope.session
-        conn = self._conn_for_chat(chat_id)
+        if self._summon_route_chat(chat_id, key):
+            return read_scope.scope_for_key(key).session  # type: ignore[arg-type,union-attr]
+        conn = self._summon_conn(key) or self._conn_for_chat(chat_id)
         return conn.own_session if conn is not None else None
 
-    def tool_send_session(self, chat_id: str) -> Optional[str]:
-        """:meth:`_outbound_session` for a ``chatlytics_*`` tool, which uses the primary bearer."""
-        key = read_scope.current_turn_key()
-        if key:
-            scope = read_scope.scope_for_key(key)
-            if scope is None:
-                raise read_scope.SummonScopeLost(key)
-            if read_scope.chat_in_scope(scope, chat_id):
-                return scope.session
-        if not self._is_bot_token_mode():
+    @staticmethod
+    def _summon_route_chat(chat_id: str, key: Optional[str]) -> Optional[str]:
+        """The envelope's spelling of the chat when ``chat_id`` is the summon's chat, else None.
+
+        DO NOT send the caller's spelling on a route. The hub reads the route by a JID, without
+        adding ``@c.us`` to a bare or ``+`` phone, so a send naming the owner's session with one would
+        get a 409 for a chat whose route is open. The envelope's own id is always on the route.
+
+        Raises :class:`read_scope.SummonScopeLost` with no scope, and
+        :class:`read_scope.SummonTargetUnclear` when the target may be this chat under another id.
+        """
+        if not key:
             return None
-        return self._conns[0].own_session if self._conns else None
+        scope = read_scope.scope_for_key(key)
+        if scope is None:
+            raise read_scope.SummonScopeLost(key)
+        verdict = read_scope.send_target(scope, chat_id)
+        if verdict == read_scope.UNCLEAR_CHAT:
+            raise read_scope.SummonTargetUnclear(key)
+        return scope.chat_id if verdict == read_scope.THIS_CHAT else None
+
+    def _summon_conn(self, key: Optional[str]) -> Optional["_BotConn"]:
+        turn = self._summon_turns.get(key) if key else None
+        return turn.conn if turn is not None else None
+
+    def tool_send_route(self, chat_id: str) -> Tuple[Optional[str], Optional[str]]:
+        """``(session to name, spelling of the chat to send to)`` for a ``chatlytics_*`` tool's send."""
+        key = read_scope.current_turn_key()
+        routed = self._summon_route_chat(chat_id, key)
+        if routed:
+            return read_scope.scope_for_key(key).session, routed  # type: ignore[arg-type,union-attr]
+        if not self._is_bot_token_mode():
+            return None, None
+        # The bearer tool_client_for_turn gave this tool: the summon's bot, or the primary's.
+        conn = self._summon_conn(key) or (self._conns[0] if self._conns else None)
+        return (conn.own_session if conn is not None else None), None
+
+    def tool_client_for_turn(self, key: Optional[str]) -> Optional[ChatlyticsClient]:
+        """The client for a ``chatlytics_*`` tool: the primary, except on a summon.
+
+        DO NOT REMOVE. A summon that arrived on an extra bot has its route on that bot's bearer. With
+        the primary's, the hub re-pinned the send to the PRIMARY's number, whichever session it named
+        (chatlytics#956 review).
+        """
+        conn = self._summon_conn(key)
+        return conn.client if conn is not None and conn.client is not None else self._client
 
     def _client_for_turn(self, chat_id: str, key: Optional[str]) -> Optional[ChatlyticsClient]:
         """A summon's bearer is the one it arrived on, whatever the chat was bound to since."""
-        turn = self._summon_turns.get(key) if key else None
-        if turn is not None and turn.conn is not None and turn.conn.client is not None:
-            return turn.conn.client
+        conn = self._summon_conn(key)
+        if conn is not None and conn.client is not None:
+            return conn.client
         return self._client_for_chat(chat_id) or self._client
+
+    def _summon_route_closed(self, chat_id: str, key: Optional[str]) -> bool:
+        """The hub already refused this summon here, so its later sends stay out of the chat.
+
+        DO NOT REMOVE. The host keeps a refused final reply in its delivery ledger and tries again 30
+        and 120 seconds later, with the same thread id. If the owner summoned again in that time the
+        route is open again, and the old answer would be posted from the owner's number under the new
+        question. A summon whose route closed stays closed, whatever reopened it.
+        """
+        turn = self._summon_turns.get(key) if key else None
+        if turn is None or not turn.route_closed:
+            return False
+        scope = read_scope.scope_for_key(key)  # type: ignore[arg-type]
+        return scope is not None and read_scope.chat_in_scope(scope, chat_id)
+
+    def _note_route_refused(self, key: str) -> None:
+        turn = self._summon_turns.get(key)
+        if turn is not None:
+            turn.route_closed = True
+
+    def _note_envelope_session(self, conn: "_BotConn", session: str) -> None:
+        """An ordinary envelope's session: this bot's own, on any hub that marks every summon.
+
+        The hub dispatches an ordinary envelope only to a bot on that session (bot-router.ts), so this
+        heals a boot probe that failed. DO NOT let it overwrite what GET /bot/me said without asking
+        again: an owner-session envelope with no ``trigger_source`` (queued by a hub before 6.247.0,
+        or any gap in the marker) made every later ordinary send name the owner's session and get a
+        409. A bot really moved to another session is confirmed by the probe, and then named.
+        """
+        if not conn.own_session_confirmed:
+            conn.own_session = session
+            return
+        probe = conn.own_session_probe
+        if session != conn.own_session and (probe is None or probe.done()):
+            # Not awaited: an ordinary turn doesn't wait on this, and its send uses the known value.
+            conn.own_session_probe = asyncio.ensure_future(self._probe_own_session(conn))
+
+    @staticmethod
+    async def _probe_own_session(conn: "_BotConn") -> None:
+        try:
+            resp = await asyncio.wait_for(conn.client.get("/api/v1/bot/me"), timeout=5.0)
+            if resp.status_code == 200:
+                _note_own_session(conn, resp.json())
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- never the reason a turn is lost
+            logger.debug("chatlytics#956: own session probe failed: %s", exc)
 
     @staticmethod
     def _owner_of_summon(env: Dict[str, Any], scope: Any) -> Optional[str]:
@@ -1490,7 +1578,10 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         @lid sender of a DM can't be compared with a phone chat id, so it is not trusted either.
         """
         sender = env.get("sender_jid")
-        if not isinstance(sender, str) or not sender or read_scope.chat_in_scope(scope, sender):
+        if not isinstance(sender, str) or not sender:
+            return None
+        # A @c.us sender of a @lid DM with no phone may be the peer under their other id, too.
+        if read_scope.send_target(scope, sender) != read_scope.OTHER_CHAT:
             return None
         if not scope.is_group and sender.casefold().endswith("@lid"):
             return None
@@ -1501,14 +1592,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         conn = conn or (self._conns[0] if self._conns else None)
         if conn is None or conn.own_session or conn.client is None or not self._is_bot_token_mode():
             return
-        try:
-            resp = await asyncio.wait_for(conn.client.get("/api/v1/bot/me"), timeout=5.0)
-            if resp.status_code == 200:
-                _note_own_session(conn, resp.json())
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 -- never the reason a summon is lost
-            logger.debug("chatlytics#956: own session probe failed: %s", exc)
+        await self._probe_own_session(conn)
         if not conn.own_session:
             logger.warning(
                 "chatlytics#956: bot %s has no known session of its own, so an ordinary reply sent "
@@ -1528,6 +1612,12 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 "chatlytics#956: dropped a redelivered summon in chat %s", env.get("entity_jid")
             )
             return None, None
+        if replay and conn is None:
+            # DO NOT REMOVE. A /retry comes with no connection, and a summon must leave on the bearer
+            # that has its route: with another one the hub moves the reply to that bot's number.
+            conn = self._conn_of_earlier_summon(env)
+            if conn is None and len(self._conns) > 1:
+                return None, "a retried summon on a gateway with several bots has no known bearer"
         scope = read_scope.open_for_event(env, event)
         if scope is None:
             return None, "the read scope could not be opened"
@@ -1536,12 +1626,17 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             key=scope.key, chat_id=scope.chat_id, session=scope.session, conn=conn,
             owner=self._owner_of_summon(env, scope), chat_name=clean_chat_name(env.get("chat_name")),
         )
-        same_chat = [t.key for t in self._summon_turns.values() if t.chat_id == scope.chat_id]
-        for stale in same_chat[:-_SUMMONS_PER_CHAT_MAX]:
-            self._summon_turns.pop(stale, None)
+        # DO NOT shorten below the scopes': a summon with a scope and no entry here has lost its bearer
+        # and its owner, and would leave on the chat's bot.
         while len(self._summon_turns) > read_scope._SCOPES_MAX:
             self._summon_turns.popitem(last=False)
         return scope, None
+
+    def _conn_of_earlier_summon(self, env: Dict[str, Any]) -> Optional["_BotConn"]:
+        for turn in reversed(list(self._summon_turns.values())):
+            if turn.chat_id == env.get("entity_jid") and turn.session == env.get("session_id"):
+                return turn.conn
+        return None
 
     def _is_host_setup_notice(self, content: str) -> bool:
         """The host's one-time "no home channel" prompt, exactly as the host renders it.
@@ -1562,7 +1657,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
     def _send_retry_is_final(self, result: Any) -> bool:
         """Neither a retry nor the host's plain-text fallback changes a closed route or a lost scope."""
         raw = getattr(result, "raw_response", None)
-        if isinstance(raw, dict) and raw.get("code") in (_ROUTE_EXPIRED, _SCOPE_LOST):
+        if isinstance(raw, dict) and raw.get("code") in (_ROUTE_EXPIRED, *_SUMMON_REFUSALS.values()):
             return True
         parent = getattr(super(), "_send_retry_is_final", None)
         return bool(parent(result)) if callable(parent) else False
@@ -1648,17 +1743,19 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         key = self._summon_key_of(metadata)
         try:
             summon_or_own = self._outbound_session(chat_id, key)
-        except read_scope.SummonScopeLost:
-            logger.error("chatlytics#956: summon send refused, scope lost chat=%s scope=%s", chat_id, key)
-            return None, _SCOPE_LOST_ERROR
-        scope = read_scope.scope_for_key(key) if key else None
+            routed_chat = self._summon_route_chat(chat_id, key)
+        except read_scope.SummonSendRefused as exc:
+            logger.error("chatlytics#956: summon send refused, %s chat=%s scope=%s", exc.code, chat_id, key)
+            return None, exc.error
+        if routed_chat:
+            body["chatId"] = routed_chat
         if self._is_bot_token_mode():
             if summon_or_own:
                 body["session"] = summon_or_own
         else:
             # Legacy operator-key path: session must be resolved and sent.
-            if scope is not None and read_scope.chat_in_scope(scope, chat_id):
-                session_name = scope.session
+            if routed_chat:
+                session_name = read_scope.scope_for_key(key).session  # type: ignore[arg-type,union-attr]
             else:
                 session_name = self._resolve_session_for_chat(chat_id)
             if session_name:
@@ -1884,12 +1981,15 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 chat_id,
             )
             return
+        summon_key = self._summon_key_of(metadata)
+        if self._summon_route_closed(chat_id, summon_key):
+            return
         body, err = self._build_send_body(chat_id, self.status_bubble_text, metadata)
         if body is None:
             logger.debug("progress bubble skipped: %s", err)
             return
         body["progress"] = True
-        _client = self._client_for_turn(chat_id, self._summon_key_of(metadata))
+        _client = self._client_for_turn(chat_id, summon_key)
         # v4.7.4: shield the in-flight POST. If the timer is cancelled while
         # the server is posting the bubble, we must still learn its id -
         # otherwise it is an orphan nobody can ever drop/delete. On
@@ -2590,11 +2690,9 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         is_summon = kind in (None, "message") and env.get("trigger_source") == FROM_ME
         if isinstance(chat_key, str) and not (is_summon and chat_key in self._chat_bot):
             self._bind_chat_bot(chat_key, conn)
-        # The hub dispatches an ordinary envelope only to a bot on that session (bot-router.ts), so
-        # this also heals a boot probe that failed, and a bot moved to another session.
         session_of_env = env.get("session_id")
         if conn is not None and kind in (None, "message") and not is_summon and isinstance(session_of_env, str) and session_of_env:
-            conn.own_session = session_of_env
+            self._note_envelope_session(conn, session_of_env)
 
         if kind is not None and kind != "message":
             if kind == "control":
@@ -3032,8 +3130,12 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         bot's number shares the chat id and arrives on the bot's session: that must not reach the
         owner's turn (chatlytics#951).
         """
-        for turn in list(self._summon_turns.values()):
-            if turn.stopped or turn.chat_id != env.get("entity_jid") or turn.session != env.get("session_id"):
+        same_chat = [
+            turn for turn in self._summon_turns.values()
+            if turn.chat_id == env.get("entity_jid") and turn.session == env.get("session_id")
+        ]
+        for turn in same_chat[-_SUMMONS_PER_CHAT_MAX:]:
+            if turn.stopped:
                 continue
             turn.stopped = True
             try:
@@ -4177,6 +4279,10 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         if summon_key and self._is_host_setup_notice(content):
             logger.info("chatlytics#956: left the host's setup notice out of summon scope=%s", summon_key)
             return SendResult(success=True)
+        if self._summon_route_closed(chat_id, summon_key):
+            return await self._summon_reply_not_posted(
+                summon_key, chat_id, content, metadata, {"code": _ROUTE_EXPIRED, "message": _ROUTE_CLOSED_ERROR}
+            )
 
         # P-19 session resolution + chatId/text/accountId base body — shared
         # with the v4.4.0 progress-bubble path via _build_send_body. send()
@@ -4187,7 +4293,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             return SendResult(
                 success=False,
                 error=session_err,
-                raw_response={"code": _SCOPE_LOST} if session_err == _SCOPE_LOST_ERROR else None,
+                raw_response=_summon_refusal_raw(session_err),
             )
         body: Dict[str, Any] = body_opt
         if reply_to:
@@ -4330,6 +4436,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # path).
         success, error_msg = _coerce_success_payload(response.status_code, payload)
         if summon_key and response.status_code == 409 and isinstance(payload, dict) and payload.get("code") == _ROUTE_EXPIRED:
+            self._note_route_refused(summon_key)
             return await self._summon_reply_not_posted(summon_key, chat_id, content, metadata, payload)
         if success:
             # v4.4.0 (P7): surface the server's edit outcome at DEBUG. A 200
@@ -4424,13 +4531,18 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # path has never named a session here.
         key = self._summon_key_of(metadata)
         typing_body: Dict[str, Any] = {"chatId": chat_id, "duration": float(duration)}
+        if self._summon_route_closed(chat_id, key):
+            return False
         if self._is_bot_token_mode():
             try:
                 session = self._outbound_session(chat_id, key)
-            except read_scope.SummonScopeLost:
+                routed_chat = self._summon_route_chat(chat_id, key)
+            except read_scope.SummonSendRefused:
                 return False
             if session:
                 typing_body["session"] = session
+            if routed_chat:
+                typing_body["chatId"] = routed_chat
         try:
             # v4.6.0 (MULTIBOT): presence is chat-scoped — the typing
             # indicator must appear from the same WhatsApp account that is
@@ -4893,12 +5005,15 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # Reuse the P-19 session/chatId/accountId resolution shared with
         # send() + the progress bubble. Fail loud when no WAHA session can be
         # resolved (same contract as send()).
+        summon_key = self._summon_key_of(metadata)
+        if self._summon_route_closed(chat_id, summon_key):
+            return SendResult(success=False, error=_ROUTE_CLOSED_ERROR, raw_response={"code": _ROUTE_EXPIRED})
         body, session_err = self._build_send_body(chat_id, "", metadata)
         if body is None:
             return SendResult(
                 success=False,
                 error=session_err,
-                raw_response={"code": _SCOPE_LOST} if session_err == _SCOPE_LOST_ERROR else None,
+                raw_response=_summon_refusal_raw(session_err),
             )
         # Media has no text body; ``file`` + optional ``caption`` carry it.
         body.pop("text", None)
@@ -4928,7 +5043,6 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         try:
             # v4.6.0 (MULTIBOT): same bearer-is-routing rule as send() — media
             # must egress on the account bound to this chat.
-            summon_key = self._summon_key_of(metadata)
             response = await self._client_for_turn(chat_id, summon_key).post(
                 "/api/v1/send", json=body, timeout=media_timeout
             )
@@ -4941,6 +5055,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
         if summon_key and response.status_code == 409:
             # A file can't move to the owner's DM here. The refusal goes to the host and the log.
+            self._note_route_refused(summon_key)
             logger.error(
                 "chatlytics#956: summon media not posted: HTTP 409 chat=%s scope=%s", chat_id, summon_key
             )
@@ -5604,6 +5719,10 @@ def _make_tool_handler(ctx: Any, name: str, handler: Any) -> Any:
             result: Any = _no_token_failure()
             return json.dumps(result, ensure_ascii=False, default=str)
         client = getattr(adapter_inst, "client", None) if adapter_inst else None
+        # chatlytics#956: a summon's tools use the bearer the summon arrived on.
+        _for_turn = getattr(adapter_inst, "tool_client_for_turn", None) if _turn_key else None
+        if client is not None and callable(_for_turn):
+            client = _for_turn(_turn_key)
         if client is None:
             result = {
                 "success": False,
@@ -5615,7 +5734,7 @@ def _make_tool_handler(ctx: Any, name: str, handler: Any) -> Any:
         else:
             # chatlytics#956: so a send by this tool names the right account. See tools._post.
             _key_token = read_scope.TOOL_TURN_KEY.set(_turn_key)
-            _resolver = getattr(adapter_inst, "tool_send_session", None)
+            _resolver = getattr(adapter_inst, "tool_send_route", None)
             _resolver_token = read_scope.OUTBOUND_RESOLVER.set(_resolver if callable(_resolver) else None)
             try:
                 if needs_adapter:

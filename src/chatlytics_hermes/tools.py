@@ -171,14 +171,17 @@ def _name_outbound_session(path: str, body: Dict[str, Any]) -> None:
     if resolver is None or "session" in body:
         return
     if path == "/api/v1/send":
-        chat = body.get("chatId")
+        holder: Any = body
     elif path == "/api/v1/actions" and body.get("action") in _ROUTE_ACTIONS:
-        chat = (body.get("params") or {}).get("chatId")
+        holder = body.get("params") or {}
     else:
         return
-    session = resolver(chat) if isinstance(chat, str) and chat else None
+    chat = holder.get("chatId")
+    session, routed_chat = resolver(chat) if isinstance(chat, str) and chat else (None, None)
     if session:
         body["session"] = session
+    if routed_chat:
+        holder["chatId"] = routed_chat
 
 
 async def _post(
@@ -204,8 +207,8 @@ async def _post(
     """
     try:
         _name_outbound_session(path, body)
-    except read_scope.SummonScopeLost:
-        return {"success": False, "error": "This summoned turn lost its read scope. Nothing was sent."}
+    except read_scope.SummonSendRefused as exc:
+        return {"success": False, "error": exc.error}
     try:
         response = await client.post(path, json=body, timeout=timeout)
     except httpx.RequestError as exc:
