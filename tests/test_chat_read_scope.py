@@ -10,6 +10,7 @@ import contextvars
 import json
 import logging
 import threading
+import types
 from typing import Any, Callable, Dict, List, Optional
 
 import pytest
@@ -465,6 +466,176 @@ async def test_two_bots_in_one_chat_each_keep_their_scope_when_the_requests_come
     assert _hook(LM, {"chat_id": PEER, "session": BOT}, "s1", "s1") is None
     assert _reason(_hook(LM, {"chat_id": PEER, "session": "bot-two"}, "s1", "s1")) == "session_not_summon"
     assert _hook(LM, {"chat_id": PEER, "session": "bot-two"}, "s2", "s2") is None
+
+
+# --- several profiles on one gateway (the module and its tables are shared, each adapter has its own list) ---
+
+
+def _extra_profile(name: str = "other", **extra: Any) -> Any:
+    adapter = _lp_adapter(**extra)
+    adapter.set_owner_profile(name)  # What the host does for a secondary: _configure_profile_adapter.
+    return adapter
+
+
+def _child(chat: str, profile: str = "") -> Optional[str]:
+    """A subagent of a turn of ``profile``: found by the context variables alone."""
+    return _reason(_in_context(lambda: _hook(LM, EVERY_ACCOUNT, "a-child", "a-child"), platform="chatlytics", chat_id=chat, profile=profile))
+
+
+async def test_another_profiles_turn_in_the_chat_doesnt_limit_the_owners_dm() -> None:
+    # The owner DMs Sammie, then under the same chat id a bot on a profile that doesn't list them.
+    assert (await _dispatch(_bot(), dict(OWNER_DM))).channel_prompt is None
+    assert _child(OWNER) is None
+    assert CHAT_LIMIT_MARKER in (await _dispatch(_extra_profile(), dict(OWNER_DM))).channel_prompt
+    assert _child(OWNER) is None
+    assert _child(OWNER, "other") == "session_not_summon"
+
+
+async def test_the_owners_dm_on_another_profile_doesnt_lift_a_limit() -> None:
+    await _dispatch(_extra_profile(), dict(OWNER_DM))
+    assert _child(OWNER, "other") == "session_not_summon"
+    await _dispatch(_bot(), dict(OWNER_DM))
+    assert _child(OWNER) is None
+    assert _child(OWNER, "other") == "session_not_summon"
+
+
+async def test_two_extra_profiles_keep_their_own_verdicts_on_one_chat() -> None:
+    await _dispatch(_extra_profile("listed", allow_admin_from=[OWNER]), dict(OWNER_DM))
+    await _dispatch(_extra_profile("unlisted"), dict(OWNER_DM))
+    assert _child(OWNER, "listed") is None
+    assert _child(OWNER, "unlisted") == "session_not_summon"
+
+
+async def test_a_host_that_doesnt_bind_the_profile_stays_limited() -> None:
+    # The read side has no profile: this finds the primary's entry, or none. It never finds another's.
+    await _dispatch(_extra_profile(allow_admin_from=[OWNER]), dict(OWNER_DM))
+    assert _child(OWNER, "other") is None
+    assert _child(OWNER) == "no_scope_for_this_turn"
+
+
+async def test_a_signed_webhook_is_keyed_by_its_profile_too() -> None:
+    adapter = _wh_adapter(secret=True, allow_admin_from=[OWNER])
+    adapter.set_owner_profile("other")
+    await _post(adapter, _hook_payload(OWNER, OWNER), sign=True)
+    assert _child(OWNER, "other") is None
+    assert _child(OWNER) == "no_scope_for_this_turn"
+
+
+def _host_runner(adapter: Any, routed: Optional[str], tmp_path: Any) -> Any:
+    """The runner as the real resolve_identity reads it, under gateway.multiplex_profiles."""
+
+    def route(_source: Any, adapter_profile: Optional[str] = None) -> Optional[str]:
+        return routed
+
+    return types.SimpleNamespace(
+        config=types.SimpleNamespace(multiplex_profiles=True),
+        _primary_profile_name="default",
+        _transport_owner=lambda _source: None,
+        _owning_profile=lambda _adapter, _platform: (True, adapter._owner_profile),
+        _profile_name_for_source=route,
+        _resolve_profile_home_for_source=lambda _source: tmp_path,
+    )
+
+
+@pytest.mark.parametrize(
+    "owner_profile,routed,bound",
+    [(None, None, ""), ("other", None, "other"), (None, "routed", "routed"), ("other", "routed", "routed")],
+    ids=["primary", "extra profile", "primary routed elsewhere", "extra profile routed elsewhere"],
+)
+async def test_the_entry_is_where_the_real_host_will_look(owner_profile: Optional[str], routed: Optional[str], bound: str, tmp_path: Any) -> None:
+    # DO NOT replace with a stub of either side. The real _canonicalize stamps the profile after
+    # dispatch would otherwise read it, and the real _set_session_env is what the hook reads.
+    run = pytest.importorskip("gateway.run")
+    adapter = _bot()
+    adapter.set_owner_profile(owner_profile)
+    adapter.gateway_runner = _host_runner(adapter, routed, tmp_path)
+    event = await _dispatch(adapter, dict(OWNER_DM))
+    assert event.channel_prompt is None
+    assert (event.source.profile or "") == bound
+
+    def turn() -> Any:
+        host = types.SimpleNamespace(adapters={})
+        context = types.SimpleNamespace(source=event.source, session_key="k", session_id="s")
+        run.GatewayRunner._set_session_env(host, context)
+        return _hook(LM, EVERY_ACCOUNT, "a-child", "a-child")
+
+    assert contextvars.copy_context().run(turn) is None
+    assert list(read_scope._chat_turns) == [(bound, OWNER)]
+
+
+# --- another message in the chat during a turn -----------------------------------------------------
+
+
+def _read_rows(*ids: str) -> None:
+    rows = [{"id": i, "chat_id": GROUP} for i in ids]
+    assert transform_tool_result(tool_name=LM, result=json.dumps({"data": {"items": rows}}), session_id=SID, task_id=SID, turn_id="t") is None
+
+
+GET = "mcp__lextrove__get_message"
+
+
+async def test_another_message_mid_turn_keeps_the_ids_the_turn_read() -> None:
+    adapter = _bot()
+    _request(await _dispatch(adapter, dict(MEMBER_GROUP)))
+    _read_rows("m1")
+    assert _hook(GET, {"message_id": "m1"}) is None
+    # Another member's trigger. The running turn's next provider request binds the same line again.
+    next_turn = await _dispatch(adapter, _env(GROUP, "972544000008@c.us", "group"))
+    _request(next_turn)
+    assert _hook(GET, {"message_id": "m1"}) is None
+    assert _reason(_hook(GET, {"message_id": "m-not-read"})) == "id_not_from_this_chat"
+
+
+async def test_another_session_in_the_chat_gets_a_scope_of_its_own() -> None:
+    adapter = _bot()
+    _request(await _dispatch(adapter, dict(MEMBER_GROUP)))
+    _read_rows("m1")
+    # Reusing the scope must not keep this session, or the ids that were read on it.
+    _request(await _dispatch(adapter, _env(GROUP, MEMBER, "group", session="another")), "s2", "s2")
+    assert _reason(_hook(GET, {"message_id": "m1"}, "s2", "s2")) == "id_not_from_this_chat"
+    assert _reason(_hook(LM, {"chat_id": GROUP, "session": BOT}, "s2", "s2")) == "session_not_summon"
+    assert _hook(LM, {"chat_id": GROUP, "session": "another"}, "s2", "s2") is None
+
+
+async def test_reusing_the_scope_doesnt_keep_the_owners_verdict() -> None:
+    adapter = _bot()
+    stranger = _env(OWNER, MEMBER)
+    await _dispatch(adapter, dict(stranger))
+    assert _child(OWNER) == "session_not_summon"
+    await _dispatch(adapter, dict(OWNER_DM))
+    assert _child(OWNER) is None
+    await _dispatch(adapter, dict(stranger))
+    assert _child(OWNER) == "session_not_summon"
+
+
+async def test_the_chats_facts_are_this_envelopes_when_the_scope_is_reused() -> None:
+    adapter = _bot()
+    first = await _dispatch(adapter, _env(PEER, PEER, chat_phone="972544000001"))
+    scope = next(iter(read_scope._chat_scopes.values()))
+    assert scope.phone == "972544000001" and "972544000001@c.us" in scope.chat_forms
+    await _dispatch(adapter, _env(PEER, PEER))
+    assert read_scope._chat_scopes[scope.key] is scope
+    assert scope.phone is None and "972544000001@c.us" not in scope.chat_forms
+    assert first.channel_prompt is not None
+
+
+async def test_a_long_lived_chat_scope_keeps_taking_new_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    # It lasts as long as the process. Stopping at the cap would refuse every later get_message there.
+    monkeypatch.setattr(read_scope, "_SEEN_IDS_MAX", 3)
+    _request(await _dispatch(_bot(), dict(MEMBER_GROUP)))
+    _read_rows("m1", "m2")
+    _read_rows("m3", "m4")
+    assert _hook(GET, {"message_id": "m4"}) is None
+    assert _reason(_hook(GET, {"message_id": "m1"})) == "id_not_from_this_chat"
+
+
+def test_a_summons_ids_are_not_forgotten_at_the_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A summon is one turn: what it read stays readable, and past the cap it stops adding.
+    monkeypatch.setattr(read_scope, "_SEEN_IDS_MAX", 2)
+    scope = read_scope.SummonScope(key="summon-" + "1" * 16, session=BOT, chat_id=GROUP, chat_forms=frozenset({GROUP}))
+    assert read_scope._result_problem("list_messages", {"data": {"items": [{"id": "m1", "chat_id": GROUP}]}}, scope) is None
+    assert read_scope._result_problem("list_messages", {"data": {"items": [{"id": "m2", "chat_id": GROUP}, {"id": "m3", "chat_id": GROUP}]}}, scope) is None
+    assert scope.seen_ids == {"m1", "m2"}
 
 
 # --- sends and sessions are not touched ----------------------------------------------------------

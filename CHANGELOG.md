@@ -41,6 +41,10 @@
   other chat, a name or no chat. It stays refused on a summon. The hub's `read_messages` and `session_search`
   are refused, and another MCP server's tool with a Lextrove tool's name gets the same refusal. Telegram, CLI
   and cron turns are not affected. See docs/summoned-turns.md.
+- **The chat read limit holds per profile and across a turn** (chatlytics#956). On a gateway with several
+  profiles, one bot's turn in a chat no longer changes another profile's limit on the same chat id, in either
+  direction. Another message in the chat during a turn no longer makes it forget the ids it has read, so
+  `get_message` of a row it just got still runs.
 - **Summon and limited turns don't repeat ids to people** (chatlytics#956). Their prompt lines say to call a
   limit "this chat" and never to repeat session ids or phone numbers. A tool's refusal keeps the ids, for the
   model's next call.

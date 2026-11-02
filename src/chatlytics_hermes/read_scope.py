@@ -38,8 +38,8 @@ the owner's own DM with the bot, gets these read limits for its chat on the bot'
 nothing else of a summon: it keeps its session key, history, memory, account and sends. So its scope
 has ``kind`` chat, lives in its own tables, its key is not in the summon format, and it never gets
 near ``source.thread_id``. A hook finds it by the ids bound from its own line
-(:func:`note_chat_request`), or by the chat in the gateway's context variables, which is what reaches
-a delegated subagent. Turns with no Chatlytics context (Telegram, CLI, cron) never reach any of this.
+(:func:`note_chat_request`), or by the profile and chat in the gateway's context variables, which is what
+reaches a delegated subagent. Turns with no Chatlytics context (Telegram, CLI, cron) never reach any of this.
 Its one read a summon doesn't have is the plugin's ``chatlytics_read`` of this chat: see
 :func:`_plugin_read_problem`.
 """
@@ -123,9 +123,11 @@ _lock = threading.Lock()
 _scopes: "OrderedDict[str, SummonScope]" = OrderedDict()
 # DO NOT put chat scopes in _scopes: ordinary turns would evict a running summon's entry.
 _chat_scopes: "OrderedDict[str, SummonScope]" = OrderedDict()
-# Chat id -> its latest turn's scope, or _OWNER_DM for "no scope here, on purpose". Not there: limited.
+# (Profile, chat id) -> its latest turn's scope, or _OWNER_DM for "no scope here, on purpose". Not there:
+# limited. DO NOT drop the profile. Every profile of a gateway shares this module, and each has its own
+# owner list, so by chat alone one bot's turn replaced another's verdict on the same chat: see _turn_profile.
 _OWNER_DM = SummonScope(key="owner-dm", kind=KIND_CHAT)
-_chat_turns: "OrderedDict[str, SummonScope]" = OrderedDict()
+_chat_turns: "OrderedDict[Tuple[str, str], SummonScope]" = OrderedDict()
 _bound: "OrderedDict[str, SummonScope]" = OrderedDict()
 
 # A summon whose scope this process no longer has: the format of a key, and in no table.
@@ -391,15 +393,56 @@ def open_for_event(env: Mapping[str, Any], event: Any) -> Optional[SummonScope]:
     return scope
 
 
-def _forget_chat_turn(chat: Optional[str]) -> None:
-    with _lock:
-        _chat_turns.pop(chat or "", None)
+def _turn_profile(adapter: Any, source: Any) -> str:
+    """The profile this turn will run under, as the host will bind it to ``HERMES_SESSION_PROFILE``.
+
+    The host binds ``source.profile or ""`` (``GatewayRunner._set_session_env``), and stamps that field in
+    ``_canonicalize``, which ``handle_message`` runs after this. So run it now: it pins the identity, and
+    running it again returns the pin. ``_owner_profile`` is what a secondary's handler stamps when the
+    adapter can't resolve the identity itself. The primary has neither, and "" on both sides. Never raises.
+    A value that turns out wrong finds no entry on the read side, and no entry is limited.
+    """
+    canonicalize = getattr(adapter, "_canonicalize", None)
+    if callable(canonicalize):
+        try:
+            canonicalize(source)
+        except Exception:  # noqa: BLE001 -- handle_message runs it too, and decides what a failure means
+            logger.debug("chatlytics#956: could not resolve the turn's profile", exc_info=True)
+    for profile in (getattr(source, "profile", None), getattr(adapter, "_owner_profile", None)):
+        if isinstance(profile, str) and profile.strip():
+            return profile.strip()
+    return ""
 
 
-def _remember_chat_turn(chat: str, scope: SummonScope) -> None:
+def _forget_chat_turn(profile: str, chat: Optional[str]) -> None:
     with _lock:
-        _chat_turns[chat] = scope
-        _chat_turns.move_to_end(chat)
+        _chat_turns.pop((profile, chat or ""), None)
+
+
+def _chat_scope(key: str, session: Optional[str], chat_id: str, is_group: bool, phone: Optional[str]) -> SummonScope:
+    """This key's scope. DO NOT make a new one when it has one.
+
+    A running turn's ids are in it, and a message from someone else in the chat mid-turn would forget them,
+    so ``get_message`` of a row the turn had just read was refused (chatlytics#956 review). Nothing stale
+    can stay: the session and chat are in the key, so another session is another scope with no ids, the
+    owner's verdict is in ``_chat_turns`` and not here, and the rest is set from this envelope.
+    """
+    forms = _chat_forms(chat_id, phone)
+    with _lock:
+        scope = _chat_scopes.get(key)
+        if scope is None:
+            return SummonScope(
+                key=key, session=session, chat_id=chat_id, is_group=is_group, phone=phone, chat_forms=forms, kind=KIND_CHAT,
+            )
+        scope.is_group, scope.phone, scope.chat_forms = is_group, phone, forms
+        return scope
+
+
+def _remember_chat_turn(profile: str, chat: str, scope: SummonScope) -> None:
+    turn = (profile, chat)
+    with _lock:
+        _chat_turns[turn] = scope
+        _chat_turns.move_to_end(turn)
         while len(_chat_turns) > _CHAT_TURNS_MAX:
             _chat_turns.popitem(last=False)
         if scope is not _OWNER_DM:
@@ -426,7 +469,8 @@ def _log_if_not_ready() -> None:
 
 
 def open_chat_turn(
-    env: Mapping[str, Any], event: Any, extra: Any, *, authenticated: bool, own_session: Optional[str] = None
+    env: Mapping[str, Any], event: Any, extra: Any, *, authenticated: bool, own_session: Optional[str] = None,
+    adapter: Any = None,
 ) -> Optional[SummonScope]:
     """The read scope of a non-summoned turn; None for the owner's own DM with the bot.
 
@@ -434,18 +478,21 @@ def open_chat_turn(
     can't claim anybody, and its session can't be believed either, so it reads nothing. ``own_session``
     is what ``GET /bot/me`` said for the bearer the envelope arrived on, when it said. A different
     session on the envelope means the bot's own isn't known for this turn, so it reads nothing.
+    ``adapter`` is the one the envelope arrived on: see :func:`_turn_profile`.
 
     The key is the same for every turn of a chat in this process, so the line doesn't change the system
     prompt from turn to turn, which would cost the prompt cache of a session that keeps its history.
     Never raises: a turn with no entry here is limited anyway.
     """
     chat_key: Optional[str] = None
+    profile = ""
     try:
         source = getattr(event, "source", None)
+        profile = _turn_profile(adapter, source)
         chat_raw = getattr(source, "chat_id", None)
         chat_key = _norm_jid(chat_raw)
         if authenticated and is_owner_dm(source, extra):
-            _remember_chat_turn(chat_key or "", _OWNER_DM)
+            _remember_chat_turn(profile, chat_key or "", _OWNER_DM)
             logger.info("chatlytics#956: no chat scope, the owner's own DM kind=chat chat=%s", _safe_id(chat_raw))
             return None
         _log_if_not_ready()
@@ -456,11 +503,8 @@ def open_chat_turn(
         is_group = env.get("chat_type") == "group" or chat_id.casefold().endswith("@g.us")
         phone = None if is_group else _safe_phone(env.get("chat_phone"))
         digest = hashlib.sha256("\0".join((CHAT_SCOPE_TOKEN, chat_id, session or "")).encode("utf-8")).hexdigest()[:16]
-        scope = SummonScope(
-            key=f"chat-{digest}", session=session, chat_id=chat_id, is_group=is_group, phone=phone,
-            chat_forms=_chat_forms(chat_id, phone), kind=KIND_CHAT,
-        )
-        _remember_chat_turn(chat_key or "", scope)
+        scope = _chat_scope(f"chat-{digest}", session, chat_id, is_group, phone)
+        _remember_chat_turn(profile, chat_key or "", scope)
         owner_known = bool(authenticated) and bool(
             owner_ids_for_chat_type(extra, "dm") or owner_ids_for_chat_type(extra, "group")
         )
@@ -471,7 +515,7 @@ def open_chat_turn(
         return scope
     except Exception:  # noqa: BLE001 -- must not stop the turn, and no entry means limited
         logger.exception("chatlytics#956: could not open a chat scope kind=chat")
-        _forget_chat_turn(chat_key)
+        _forget_chat_turn(profile, chat_key)
         return None
 
 
@@ -551,14 +595,17 @@ def _chat_turn_scope() -> Optional[SummonScope]:
 
     DO NOT CHANGE the order of these answers. Only the gateway's own turn sets this platform, so a
     Telegram, CLI or cron turn stays out (cron binds no platform). In a Chatlytics turn no entry is not
-    "no limit": a turn resumed after a restart has no envelope, and answers as limited.
+    "no limit": a turn resumed after a restart has no envelope, and answers as limited. So does a host
+    that doesn't bind the profile, on every bot but the primary: an extra profile's owner DM is limited
+    there, and nobody's limit is lifted.
     """
     from gateway.session_context import get_session_env
 
     if (get_session_env("HERMES_SESSION_PLATFORM", "") or "") != _PLATFORM:
         return None
     chat = _norm_jid(get_session_env("HERMES_SESSION_CHAT_ID", "")) or ""
-    scope = _chat_turns.get(chat, _NO_CHAT_SCOPE)
+    profile = (get_session_env("HERMES_SESSION_PROFILE", "") or "").strip()
+    scope = _chat_turns.get((profile, chat), _NO_CHAT_SCOPE)
     return None if scope is _OWNER_DM else scope
 
 
@@ -822,7 +869,7 @@ def _search_rule(args: Mapping[str, Any], scope: SummonScope) -> Optional[str]:
 
 
 def _from_this_chat(key: str, allowed: Iterable[str] = (), *, session: bool = False) -> Callable:
-    """By id only: allowed for an id an in-scope read of this turn returned."""
+    """By id only: allowed for an id an in-scope read returned, of this turn or, on a chat scope, this chat."""
     keys = frozenset(allowed) | {key} | ({"session"} if session else frozenset())
 
     def rule(args: Mapping[str, Any], scope: SummonScope) -> Optional[str]:
@@ -1240,11 +1287,15 @@ def _result_problem(tool: str, result: Any, scope: SummonScope) -> Optional[str]
         if chat is not None and _norm_jid(chat) not in scope.chat_forms:
             return "result_row_other_chat"
     if tool in _ID_SOURCES:
-        for row in rows:
-            for key in ("id", "message_id", "target_message_id"):
-                value = row.get(key)
-                if isinstance(value, str) and len(scope.seen_ids) < _SEEN_IDS_MAX:
-                    scope.seen_ids.add(value.strip().casefold())
+        ids = [row[key].strip().casefold() for row in rows for key in ("id", "message_id", "target_message_id")
+               if isinstance(row.get(key), str)]
+        # DO NOT REMOVE. A chat scope lives as long as the process, and past the cap no new id would ever
+        # be added, so every later get_message in a busy chat would be refused. A forgotten id costs a re-read.
+        if scope.kind == KIND_CHAT and len(scope.seen_ids) + len(ids) > _SEEN_IDS_MAX:
+            scope.seen_ids.clear()
+        for value in ids:
+            if len(scope.seen_ids) < _SEEN_IDS_MAX:
+                scope.seen_ids.add(value)
     return None
 
 

@@ -373,7 +373,7 @@ def make_webhook_handler(adapter: Any) -> Callable[[web.Request], Any]:
             # is never the owner, and reads nothing. DO NOT REMOVE.
             if summon_scope is None:
                 cp = read_scope.with_chat_limit(cp, read_scope.open_chat_turn(
-                    payload, event, _owner_extra, authenticated=bool(secret)
+                    payload, event, _owner_extra, authenticated=bool(secret), adapter=adapter,
                 ))
             if isinstance(cp, str) and cp.strip():
                 if hasattr(event, "channel_prompt"):

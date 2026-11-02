@@ -2826,6 +2826,7 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
             cp = read_scope.with_chat_limit(cp, read_scope.open_chat_turn(
                 env, event, getattr(self.config, "extra", None) or {}, authenticated=True,
                 own_session=conn.own_session if conn is not None and conn.own_session_confirmed else None,
+                adapter=self,
             ))
         # hasattr guard = harness-drift tolerance (older MessageEvent
         # dataclasses without the field must not grow a stray attribute).
