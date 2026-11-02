@@ -1,3 +1,36 @@
+## [5.3.0] - 2026-11-02
+
+### Security
+
+- **The owner's memory stays out of a turn the owner summoned from their own number**
+  (chatlytics#952). The reply to such a turn reaches the other people in that chat. An
+  `llm_request` middleware now removes the `<memory-context>` fences, including replayed
+  ones, and the MEMORY, USER PROFILE and memory-provider blocks from the system prompt,
+  and the stored text in earlier `memory` tool results, from failed and successful writes.
+  It acts only on requests whose system prompt carries the summoned-turn context line,
+  recognised by a token that is random per process, so no stored text from an earlier
+  process can make a turn look summoned or hide one. A line pinned before a restart, which
+  has the old token, is still treated as summoned and logged as an ERROR. The end of the
+  memory blocks comes from the length in their headers, or on Anthropic OAuth, where the
+  host rewrites words in the prompt, from the latest of the host's own lines that follow
+  memory; that route also loses the profile line. A block whose length doesn't check out on
+  any other route locks that request down to a fixed one-line prompt.
+  Memory tools stay available, so the owner can still ask for something from memory.
+- **An unsigned webhook that says `trigger_source: from_me` now logs a warning.** Without a
+  webhook secret the claim can't be verified, so that turn still gets no context line and no
+  strip. Set the secret or use long polling.
+
+### Changed
+
+- **A summoned turn is refused when memory cannot be kept out of it.** At each summon the
+  plugin checks that hermes-agent's real memory renderers still go through the strip and
+  that its middleware is still registered. A made-up request goes through the live chain
+  once per process per set of callbacks. If the host has no `llm_request` middleware, the
+  callback was unloaded or its memory format changed, the summoned turn is not dispatched
+  and an ERROR is logged. A failed check is retried at the next summon. Other turns are
+  unaffected. Verified on hermes-agent 0.22.5; hermes-agent 2026.5.16 (0.14) has no such
+  middleware, so summons are refused there.
+
 ## [5.2.0] - 2026-11-01
 
 ### Added

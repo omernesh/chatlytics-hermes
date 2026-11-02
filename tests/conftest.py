@@ -32,6 +32,15 @@ _CHATLYTICS_ENV_VARS = (
 
 
 @pytest.fixture(autouse=True)
+def _memory_strip_ready(monkeypatch):
+    """chatlytics#952 refuses summoned turns on a host that can't strip memory, and the
+    test host is too old to. test_memory_strip.py restores the real check where it's tested."""
+    from chatlytics_hermes import memory_strip
+
+    monkeypatch.setattr(memory_strip, "strip_ready", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_chatlytics_env(monkeypatch):
     """Hermetic env: clear ambient ``CHATLYTICS_*`` before every test.
 

@@ -242,6 +242,13 @@ See [docs/features.md](docs/features.md) for the full behavior contracts.
   `trigger_source: "from_me"` adds one line to that turn's `channel_prompt` with
   the chat, the session and who reads the reply. It is not added to the message
   text or `metadata`, and it is not stored in the transcript.
+- **The owner's memory stays out of a summoned turn (v5.3.0)**: the reply reaches
+  the other people in that chat, so the memory fences and the memory blocks of the
+  system prompt are removed from that turn's requests. Memory tools stay available:
+  the model can look something up when the owner's message asks for it. Summons are
+  refused, with an ERROR in the log, on a hermes-agent without `llm_request`
+  middleware, after that middleware is unloaded, or with a memory format this plugin
+  does not recognise. Verified on hermes-agent 0.22.5. Other turns are untouched.
 - **Tools work everywhere (v4.5.2/v4.5.3)** — a module-level live-adapter
   registry fixed "adapter is not connected" on hermes 0.16 longpoll
   gateways, and host-injected kwargs (e.g. `task_id`) are now filtered to

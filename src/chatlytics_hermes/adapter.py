@@ -88,6 +88,7 @@ from .stream import (
     reconnect_delay,
     run_stream_once,
 )
+from . import memory_strip
 from .trigger_context import FROM_ME, with_trigger_context
 from .owner import (
     apply_owner_access,
@@ -2462,6 +2463,12 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # its facts here, on the per-turn prompt channel, and NOT on event.text
         # or event.metadata. See trigger_context.py. The memoized envelope keeps
         # the field, so retry_last re-renders it.
+        # chatlytics#952: if the memory strip cannot run, the turn does not run.
+        # See memory_strip.py. Keep in sync with inbound.py. DO NOT REMOVE.
+        refusal = memory_strip.summon_refusal(env)
+        if refusal:
+            memory_strip.log_summon_refused(body["chatId"], refusal)
+            return
         cp = with_trigger_context(cp, env)
         # hasattr guard = harness-drift tolerance (older MessageEvent
         # dataclasses without the field must not grow a stray attribute).
@@ -5375,6 +5382,9 @@ def _register_impl(ctx: Any) -> None:
                 # of type coroutine has no len()" on the first tool call.
                 is_async=True,
             )
+
+    # chatlytics#952: owner memory stays out of a turn summoned from the owner's number.
+    memory_strip.register_strip(ctx)
 
 
 def register(ctx: Any) -> None:
