@@ -238,6 +238,10 @@ See [docs/features.md](docs/features.md) for the full behavior contracts.
   from the hub-delivered sender id (never the text); typed lookalike markers
   are stripped from everyone. See
   [docs/configuration.md](docs/configuration.md#owner-tagging).
+- **Summoned from the owner's own number (v5.2.0)**: an envelope with
+  `trigger_source: "from_me"` adds one line to that turn's `channel_prompt` with
+  the chat, the session and who reads the reply. It is not added to the message
+  text or `metadata`, and it is not stored in the transcript.
 - **Tools work everywhere (v4.5.2/v4.5.3)** — a module-level live-adapter
   registry fixed "adapter is not connected" on hermes 0.16 longpoll
   gateways, and host-injected kwargs (e.g. `task_id`) are now filtered to
