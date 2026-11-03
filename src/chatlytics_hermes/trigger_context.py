@@ -81,7 +81,8 @@ def _read_instruction(env: Mapping[str, Any], chat_id: str, session: str, read_p
     """How to read this chat (chatlytics#956).
 
     ``read_prefix`` is how the tools holding the session-limited key are named (chatlytics-hermes#31), or
-    None when that key isn't set up, and then this turn can't read the archive: it must not be told to try.
+    None when that server isn't set up, and then this turn can't read the archive: it must not be told to
+    try. A missing key is the hook's to refuse: see ``read_scope.summon_read_prefix``.
 
     Every form of a DM's chat id finds the whole chat (Lextrove #178), and list_messages with a chat id
     stays in that chat, so that is the read. A number matches exactly or finds nothing (Lextrove #180), so

@@ -8,6 +8,7 @@ does with the key is row K1 in docs/summoned-turns.md, and that needs a live hos
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,6 +28,7 @@ from tests.test_trigger_context import ENVELOPES, OWNER_SESSION, PEER, _prompt
 
 # conftest.py replaces it for every test, after this module is imported.
 REAL_CHECK = read_scope.limited_key_problem
+REAL_SERVER_CHECK = read_scope.limited_server_problem
 
 PHONE = ENVELOPES["from_me_dm"]["chat_phone"]
 GROUP = ENVELOPES["from_me_group"]["entity_jid"]
@@ -63,6 +65,7 @@ def real_check(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """The real check, in a throwaway home that has the setup docs/summoned-turns.md asks for."""
     pytest.importorskip("hermes_cli.config")
     monkeypatch.setattr(read_scope, "limited_key_problem", REAL_CHECK)
+    monkeypatch.setattr(read_scope, "limited_server_problem", REAL_SERVER_CHECK)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv(KEY_NAME, PLACEHOLDER)
     (tmp_path / "config.yaml").write_text(STANZA, encoding="utf-8")
@@ -307,6 +310,7 @@ def test_the_prefix_is_the_hosts(real_check: Path) -> None:
 
 def _config_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(read_scope, "limited_key_problem", REAL_CHECK)
+    monkeypatch.setattr(read_scope, "limited_server_problem", REAL_SERVER_CHECK)
     monkeypatch.setenv(KEY_NAME, PLACEHOLDER)
     (tmp_path / "config.yaml").write_text(STANZA, encoding="utf-8")
 
@@ -417,7 +421,37 @@ def test_a_dm_keeps_its_rows_stored_under_another_form(real_check: Path) -> None
 
 def test_a_dm_with_no_phone_keeps_its_rows_under_a_phone(real_check: Path) -> None:
     _summon("from_me_dm_lid_unmapped")
-    assert _after(LIMITED_LM, UNMAPPED, "972544000099@c.us") is None
+    assert _after(LIMITED_LM, UNMAPPED, "972544000099@c.us", "972544000099@s.whatsapp.net", "972544000099:26@c.us") is None
+
+
+def test_the_row_check_cant_catch_a_wrong_person_it_can_not_name(real_check: Path) -> None:
+    # The limit docs/summoned-turns.md states: with no phone on the envelope any digits pass, and with a phone any
+    # @lid does, so a wrong lid_mappings row in Lextrove passes here. Lextrove's chat_id filter is what decides.
+    _summon("from_me_dm_lid_unmapped")
+    assert _after(LIMITED_LM, "972544000777@c.us") is None
+    _summon("from_me_dm")
+    assert _after(LIMITED_LM, "200000000000777@lid") is None
+
+
+def test_a_limited_chat_turns_rows_get_the_same_check(real_check: Path) -> None:
+    scope = read_scope.SummonScope(
+        key="chat-0123456789abcdef", session="fm-bot", chat_id=PEER, phone=PHONE,
+        chat_forms=frozenset({PEER}), kind=read_scope.KIND_CHAT,
+    )
+    read_scope._bound[SID] = scope
+    assert _after(UNLIMITED_LM, "200000000000777@lid") is None
+    assert "result_row_other_chat" in (_after(UNLIMITED_LM, "abc@c.us") or "")
+
+
+# --- a main server under another name -------------------------------------------------------------
+
+
+def test_a_main_server_without_the_word_is_known_only_by_its_tool_names(real_check: Path) -> None:
+    # What the docs say, and no more. A broader rule would refuse legitimate MCP tools.
+    _summon()
+    assert _reason(_pre("mcp__archive__list_messages", IN_SCOPE)) == read_scope._NEEDS_LIMITED
+    assert _pre("mcp__archive__read_resource", {"uri": "x"}) is None
+    assert _reason(_pre("mcp__lextrove__read_resource", {"uri": "x"})) == "unknown_lextrove_tool"
 
 
 @pytest.mark.parametrize(
@@ -426,6 +460,14 @@ def test_a_dm_with_no_phone_keeps_its_rows_under_a_phone(real_check: Path) -> No
         ("from_me_dm", "972544000099@c.us"),  # Another phone.
         ("from_me_dm", GROUP),
         ("from_me_dm", "someone"),
+        # Not a phone, whatever follows the @. A person's id here is digits.
+        ("from_me_dm", "abc@c.us"),
+        ("from_me_dm", "abc@s.whatsapp.net"),
+        ("from_me_dm", "@c.us"),
+        ("from_me_dm", "972544000003abc@c.us"),
+        ("from_me_dm_lid", "abc@c.us"),
+        ("from_me_dm_lid_unmapped", "abc@c.us"),
+        ("from_me_dm_lid_unmapped", "abc@s.whatsapp.net"),
         ("from_me_dm_lid", "200000000000099@lid"),  # A @lid DM has one @lid.
         ("from_me_dm_lid_unmapped", "200000000000099@lid"),
         ("from_me_group", f"{PHONE}@c.us"),  # A group has one form.
@@ -446,25 +488,122 @@ def test_the_line_names_the_tools_when_there_is_a_key(real_check: Path) -> None:
     assert "Only the tools whose names start with mcp__lextrove_limited__ can do this." in line
 
 
-def test_the_line_says_it_cant_read_when_there_is_no_key(real_check: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(KEY_NAME)
+def test_the_line_says_it_cant_read_when_there_is_no_limited_server(real_check: Path) -> None:
+    _rewrite(real_check, "mcp_servers:\n  lextrove:\n    command: x\n")
     line = render_trigger_context(ENVELOPES["from_me_dm"], None, read_scope.summon_read_prefix()) or ""
     assert "can't be read on this turn" in line and "say you cannot read this chat" in line
     assert "list_messages" not in line and "search_messages" not in line
 
 
-async def test_a_real_dispatch_renders_it(real_check: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_line_leaves_a_missing_key_to_the_hook(real_check: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The same with or without a multiplexer: dispatch can't always read the key, so it never does.
+    monkeypatch.delenv(KEY_NAME)
+    assert REAL_CHECK() == "limited_key_missing"
+    assert read_scope.summon_read_prefix() == "mcp__lextrove_limited__"
+
+
+async def test_a_real_dispatch_renders_it(real_check: Path) -> None:
     with_key = _prompt(await _dispatch(_bot(), dict(ENVELOPES["from_me_dm"])))
     assert "mcp__lextrove_limited__" in with_key
-    monkeypatch.delenv(KEY_NAME)
+    _rewrite(real_check, "{}\n")
     without = _prompt(await _dispatch(_bot(), dict(ENVELOPES["from_me_dm"], message_id="another-message")))
     assert "can't be read on this turn" in without and "mcp__lextrove_limited__" not in without
+
+
+# --- a primary bot under a multiplexer ------------------------------------------------------------
+#
+# The host connects a primary with no profile bound (_start_connect_pending), so its poll task has no secret
+# scope and get_secret raises there. The turn it dispatches runs inside the profile's scope. What the prompt
+# says at dispatch and what the hook does in the turn must agree: the prompt said the archive can't be read
+# while the hook allowed the read (chatlytics-hermes#38 review, on the host's own secret scope).
+
+
+@pytest.fixture
+def multiplexed_primary(real_check: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """A multiplexer's primary: the key only in the profile's env file, as under the host's fail-closed read."""
+    scope_module = pytest.importorskip("agent.secret_scope")
+    monkeypatch.delenv(KEY_NAME)
+    (real_check / ".env").write_text(f"{KEY_NAME}={PLACEHOLDER}\n", encoding="utf-8")
+    scope_module.set_multiplex_active(True)
+    try:
+        yield real_check
+    finally:
+        scope_module.set_multiplex_active(False)
+
+
+async def _dispatched_on_a_poll_task() -> str:
+    """As connect's create_task(_inbound_loop): a new task, and nothing bound on it."""
+    scope_module = pytest.importorskip("agent.secret_scope")
+
+    async def poll_task() -> str:
+        assert scope_module.current_secret_scope() is None
+        return _prompt(await _dispatch(_bot(), dict(ENVELOPES["from_me_dm"])))
+
+    return await asyncio.create_task(poll_task())
+
+
+def _in_the_turn(home: Path, tool: str) -> Optional[Dict[str, str]]:
+    """The hook as a turn runs it: inside the scope the host binds from the profile's files."""
+    scope_module = pytest.importorskip("agent.secret_scope")
+    token = scope_module.set_secret_scope(scope_module.build_profile_secret_scope(home), profile_home=str(home))
+    try:
+        scope = next(iter(read_scope._scopes.values()))
+        read_scope.note_request(True, f"{SUMMON_TOKEN}:{scope.key}", SID, SID)
+        return _pre(tool, IN_SCOPE)
+    finally:
+        scope_module.reset_secret_scope(token)
+
+
+async def test_a_primarys_summon_is_told_what_the_hook_will_allow(multiplexed_primary: Path) -> None:
+    prompt = await _dispatched_on_a_poll_task()
+    assert "can't be read on this turn" not in prompt
+    assert "Only the tools whose names start with mcp__lextrove_limited__ can do this." in prompt
+    assert _in_the_turn(multiplexed_primary, LIMITED_LM) is None
+
+
+async def test_a_primary_with_no_key_is_refused_by_the_hook_and_told_why(multiplexed_primary: Path) -> None:
+    (multiplexed_primary / ".env").write_text("", encoding="utf-8")
+    await _dispatched_on_a_poll_task()
+    verdict = _in_the_turn(multiplexed_primary, LIMITED_LM)
+    assert _reason(verdict) == "limited_key_missing"
+    assert "can't be read on this turn" in (verdict or {})["message"]
+    assert "list_messages" not in (verdict or {})["message"]
+    assert _reason(_in_the_turn(multiplexed_primary, UNLIMITED_LM)) == read_scope._NEEDS_LIMITED
+
+
+async def test_a_primarys_renamed_server_is_named_in_the_prompt(multiplexed_primary: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The name is in the launch profile's env file, which the host loads into the process at startup.
+    monkeypatch.setenv("CHATLYTICS_LEXTROVE_LIMITED_SERVER", "archive-owner")
+    (multiplexed_primary / ".env").write_text(
+        f"{KEY_NAME}={PLACEHOLDER}\nCHATLYTICS_LEXTROVE_LIMITED_SERVER=archive-owner\n", encoding="utf-8",
+    )
+    _rewrite(multiplexed_primary, f"mcp_servers:\n  archive-owner:\n    command: x\n    env:\n      K: ${{{KEY_NAME}}}\n")
+    prompt = await _dispatched_on_a_poll_task()
+    assert "Only the tools whose names start with mcp__archive_owner__ can do this." in prompt
+    assert _in_the_turn(multiplexed_primary, "mcp__archive_owner__list_messages") is None
+
+
+async def test_a_primary_with_no_limited_server_is_told_at_dispatch(multiplexed_primary: Path) -> None:
+    # Reading config.yaml needs no secret, so this much the prompt can still say.
+    _rewrite(multiplexed_primary, "mcp_servers:\n  lextrove:\n    command: x\n")
+    assert "can't be read on this turn" in await _dispatched_on_a_poll_task()
 
 
 def test_the_refusal_says_the_same(real_check: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(KEY_NAME)
     _summon()
-    assert "can't be read on this turn" in (_pre(LIMITED_LM, IN_SCOPE) or {})["message"]
+    for tool in (LIMITED_LM, UNLIMITED_LM):
+        message = (_pre(tool, IN_SCOPE) or {})["message"]
+        assert "can't be read on this turn" in message and "list_messages" not in message
+
+
+def test_a_key_refusal_is_an_error_in_the_log(real_check: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    monkeypatch.delenv(KEY_NAME)
+    _summon()
+    with caplog.at_level("WARNING", logger=read_scope.logger.name):
+        _pre(LIMITED_LM, IN_SCOPE)
+    assert any(r.levelname == "ERROR" and "read nothing from the archive: limited_key_missing" in r.getMessage() for r in caplog.records)
+    assert PLACEHOLDER not in caplog.text
 
 
 def test_a_local_number_is_refused(real_check: Path) -> None:

@@ -43,6 +43,7 @@ def _memory_strip_ready(monkeypatch):
     monkeypatch.setattr(memory_strip.read_scope, "scope_ready", lambda: None)
     # chatlytics-hermes#31: a summon reads only with its limited key. test_limited_key.py tests the real check.
     monkeypatch.setattr(memory_strip.read_scope, "limited_key_problem", lambda: None)
+    monkeypatch.setattr(memory_strip.read_scope, "limited_server_problem", lambda: None)
 
 
 @pytest.fixture(autouse=True)
