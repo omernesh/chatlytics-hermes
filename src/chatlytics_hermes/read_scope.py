@@ -20,7 +20,8 @@ one is enough: the gateway's ``HERMES_SESSION_THREAD_ID`` context variable, whic
 key because that key is the turn's ``source.thread_id`` and which the host copies into hook workers
 and delegated subagents; and the session and task ids that :func:`note_request` binds from the
 system prompt on every provider request, which cover ``execute_code``'s RPC thread. A request with
-no context line releases the binding, so an ordinary turn is never held to a summon's scope.
+no context line releases the binding, so an ordinary turn is never held to a summon's scope. A
+conversation its chat moved past has neither: see :func:`_detached_scope`.
 
 **Clean start.** The key as ``source.thread_id`` also gives each summon its own Hermes session
 (``build_session_key`` includes it), so it has no earlier turns to inherit, and its own tool loop,
@@ -40,6 +41,7 @@ has ``kind`` chat, lives in its own tables, its key is not in the summon format,
 near ``source.thread_id``. A hook finds it by the ids bound from its own line
 (:func:`note_chat_request`), or by the profile and chat in the gateway's context variables, which is what
 reaches a delegated subagent. Turns with no Chatlytics context (Telegram, CLI, cron) never reach any of this.
+A conversation its chat moved past is found by its detached key: see :func:`_detached_scope`.
 Its one read a summon doesn't have is the plugin's ``chatlytics_read`` of this chat: see
 :func:`_plugin_read_problem`.
 """
@@ -71,6 +73,8 @@ TRANSFORM_TOOL_RESULT = "transform_tool_result"
 
 _SCOPE_KEY = re.compile(r"summon-[0-9a-f]{16}")
 _CHAT_KEY = re.compile(r"chat-[0-9a-f]{16}")
+# gateway/session_detached.py's key. Parsed here, so a host that renames its helpers fails closed below.
+_DETACHED_KEY = re.compile(r"agent:[^:]+:detached:([^:]+)")
 _SCOPES_MAX = 512
 _CHAT_TURNS_MAX = 4096
 _PLATFORM = "chatlytics"
@@ -581,20 +585,28 @@ def note_chat_request(named: str, session_id: Any, task_id: Any) -> None:
 
 
 def note_request(summoned: bool, system_text: str, session_id: Any, task_id: Any) -> None:
-    """Called for every provider request. A summoned one binds its ids; any other releases them."""
+    """Called for every provider request. A summoned one binds its ids; any other releases them.
+
+    DO NOT release on a detached conversation. A turn from the apps has no context line, and its
+    ``execute_code`` thread has only these ids to be found by.
+    """
     ids = [i for i in (session_id, task_id) if isinstance(i, str) and i]
-    if not summoned:
-        if _bound:
-            with _lock:
-                for i in ids:
-                    _bound.pop(i, None)
-        return
-    found = _SCOPE_KEY.findall(system_text)
-    with _lock:
+    if summoned:
         # The last one: the line follows the frozen prompt, where a stored entry could hold another.
-        scope = _scopes.get(found[-1]) if found else None
+        found = _SCOPE_KEY.findall(system_text)
+        scope = (_scopes.get(found[-1]) if found else None) or _NO_SCOPE
+    else:
+        detached = _detached_scope()
+        if detached is None:
+            if _bound:
+                with _lock:
+                    for i in ids:
+                        _bound.pop(i, None)
+            return
+        scope = detached
+    with _lock:
         for i in ids:
-            _bound[i] = scope or _NO_SCOPE
+            _bound[i] = scope
             _bound.move_to_end(i)
         while len(_bound) > _BOUND_MAX:
             _bound.popitem(last=False)
@@ -617,6 +629,11 @@ def _thread_scope() -> Optional[SummonScope]:
     return _scopes.get(key) or _NO_SCOPE
 
 
+def _chat_turn_verdict(profile: str, chat: str) -> Optional[SummonScope]:
+    scope = _chat_turns.get((profile, chat), _NO_CHAT_SCOPE)
+    return None if scope is _OWNER_DM else scope
+
+
 def _chat_turn_scope() -> Optional[SummonScope]:
     """The chat read scope by the gateway's context variables, which is what a delegated subagent has.
 
@@ -629,11 +646,61 @@ def _chat_turn_scope() -> Optional[SummonScope]:
     from gateway.session_context import get_session_env
 
     if (get_session_env("HERMES_SESSION_PLATFORM", "") or "") != _PLATFORM:
-        return None
+        return _detached_scope()
     chat = _norm_jid(get_session_env("HERMES_SESSION_CHAT_ID", "")) or ""
     profile = (get_session_env("HERMES_SESSION_PROFILE", "") or "").strip()
-    scope = _chat_turns.get((profile, chat), _NO_CHAT_SCOPE)
-    return None if scope is _OWNER_DM else scope
+    return _chat_turn_verdict(profile, chat)
+
+
+def _detached_scope() -> Optional[SummonScope]:
+    """The scope of a conversation its chat moved past, by its key, for the turn and its subagents.
+
+    hermes-agent 0.22.6 keeps such a conversation running from the apps (gateway/session_detached.py) and
+    binds it as a Desktop session: platform ``local``, its session id as the chat, no thread. Its turns also
+    carry no context line, so neither way in above finds it (chatlytics#974). The route key is what is left:
+    the host binds it on the turn, and a subagent's copied context keeps it. The conversation's own source
+    still says where it came from, and that is the only thing asked here.
+
+    Only the bound key counts, never ``os.environ``. DO NOT make a failure here answer None: this runs only
+    for a detached key, so it costs another platform's turn a refused archive read in the same failure, and
+    the other way a Chatlytics turn reads every account. Never raises.
+    """
+    try:
+        from gateway.session_context import bound_session_key
+
+        key = bound_session_key()
+    except ImportError:
+        return None  # A host with no such key.
+    match = _DETACHED_KEY.fullmatch(key) if isinstance(key, str) else None
+    if match is None:
+        return None
+    try:
+        return _detached_verdict(key, match.group(1))
+    except Exception:  # noqa: BLE001 -- nothing says this isn't a Chatlytics conversation
+        logger.exception("chatlytics#974: could not tell where a detached conversation came from")
+        return _NO_CHAT_SCOPE
+
+
+def _detached_verdict(key: str, session_id: str) -> Optional[SummonScope]:
+    from gateway.run import _gateway_runner_ref
+    from gateway.session_detached import detached_live_source
+
+    runner = _gateway_runner_ref()
+    source = detached_live_source(runner, key)
+    if source is None:
+        # The chat took it back while a turn or a background child still runs on this key. Only the row
+        # is left, and it says the platform and nothing we can read a verdict from.
+        row = runner.session_store._db_for_key(key).get_session(session_id)
+        label = row.get("source") if row else None
+        return None if isinstance(label, str) and label and label != _PLATFORM else _NO_CHAT_SCOPE
+    platform = source.platform
+    if getattr(platform, "value", platform) != _PLATFORM:
+        return None
+    thread = source.thread_id
+    # As _thread_scope: the format of the key says it is a summon, whether or not its scope is still here.
+    if is_scope_key(thread):
+        return _scopes.get(thread) or _NO_SCOPE
+    return _chat_turn_verdict((source.profile or "").strip(), _norm_jid(source.chat_id) or "")
 
 
 def _scope_for(session_id: Any, task_id: Any) -> Optional[SummonScope]:

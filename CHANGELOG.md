@@ -2,6 +2,12 @@
 
 ### Security
 
+- **A conversation its chat moved past stays under its read limit** (chatlytics#974). hermes-agent 0.22.6
+  keeps an old conversation running from the apps after `/new`. Its turns and their subagents had no way
+  to find the scope of the chat they came from, so a read with `session: all` ran. They now find it by the
+  conversation's own key and source. If that can't be read, the archive is refused. The owner's own DM
+  with the bot, Telegram, cron and other platforms stay unlimited. A send from such a turn is not changed
+  (chatlytics#975).
 - **A turn the owner summoned reads only the summoned chat on the owner's account**
   (chatlytics#956). A `pre_tool_call` hook refuses a Lextrove read that is not exactly the
   envelope's session and chat, sees through the `tool_call` wrapper, and refuses tools whose

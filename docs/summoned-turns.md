@@ -53,7 +53,7 @@ read. To allow more, measure what the tool returns for that call first.
 | `terminal`, `execute_code`, `process`, `read_file`, `search_files`, `cronjob` | Refused when the arguments name the archive or the host's own stores. This is text matching. |
 | MCP tools, any server | Judged only by the arguments that say where the tool goes, in any spelling of the key (`baseUrl`, `file-path`), at any depth. A place (`url`, `uri`, `path`, `file`, `endpoint`, `resource`, ...) is refused when it points at the archive's host or a host store (`state.db`, `sessions.json`, `.hermes/.env`), a command (`command`, `cmd`, `script`, `code`) when it names either, and a query (`sql`, `statement`, `query`, ...) when it selects from the archive. JSON held in such an argument is searched as text. No other key is searched. So a mail to an address at lextrove, a memory search for the word and `read_note` of `projects/lextrove.md` pass, and a fetch of the archive's URL doesn't. |
 | `execute_code` calling a tool | Goes through the same hook, found by task id. |
-| `delegate_task` | Allowed. A subagent's calls go through the same hook, found by the copied context variable. |
+| `delegate_task` | Allowed. A subagent's calls go through the same hook, found by the copied context variable, or on a conversation its chat moved past, by its key. See [A conversation its chat moved past](#a-conversation-its-chat-moved-past). |
 | Skills | Instructions only. A skill that says `session="all"` gets the refusal when the model follows it. |
 | `memory` | Allowed. See the memory strip in the README. |
 
@@ -362,6 +362,25 @@ A few things are worth saying because they are new for an ordinary turn:
 - On a summon `chatlytics_read` stays refused, in its own chat too, because it reads the bot's number and the summon's chat is on the owner's. The hub's `read_messages`, and a `chatlytics_read` served over MCP, stay refused on every limited turn, because an MCP server's bearer may be another bot's.
 - A tool is taken for Lextrove's by its name, on any MCP server. On a limited turn another server's `list_messages` or `get_contact` gets the same refusal.
 
+### A conversation its chat moved past
+
+From hermes-agent 0.22.6, when a chat moves on (`/new`, `/resume`, a reset), the old conversation can keep running from the apps as a detached conversation (`gateway/session_detached.py`). The host sends its replies to app viewers only. It also binds its turns as a Desktop session's: platform `local`, the session id as the chat, no thread. And a turn from an app has no context line in its prompt. So neither usual way finds the scope, and the turn and its subagents read everything until this was fixed (chatlytics#974).
+
+So a tool call whose bound route key is a detached one (`agent:<profile>:detached:<session id>`) asks the host for that conversation's source, which keeps the chat, thread and profile it came from. A subagent has the key through its copied context, in the background too. `execute_code`'s thread has the ids its request binds.
+
+| The conversation came from | Reads |
+|---|---|
+| A summon | The summon's rules, by the thread id in its source. |
+| A summon whose scope this process no longer has | Nothing from the archive. |
+| A limited chat | The chat read scope, the chat's current one. |
+| The owner's own DM with the bot | Everything. No scope. |
+| Telegram or any other platform | Everything. No scope. |
+| A Chatlytics chat this process has no entry for, as after a restart | Nothing from the archive. That holds for the owner's own DM too, until the next message in that DM. |
+| Not known: the host's lookup failed, or no gateway runner | Nothing from the archive, whatever platform it came from. |
+| The chat took it back while a turn or a background subagent still runs on the old key | Judged by the session's row. Another platform: everything. Chatlytics or no row: nothing from the archive, for the owner's DM too. |
+
+A host without this key (0.22.5) behaves as before. Nothing here has run from a real app: see row D1.
+
 ### What doesn't change
 
 Accounts, routes, session keys, history, memory (the memory strip stays summon-only), the owner-DM fallback, the bubble, the home-channel notice and redelivery. A limited turn keeps its `source.thread_id`, starts no clean session, and keeps `chatlytics_send` and the hub's MCP send tools: `hub_tool_skips_summon_checks` and `summon_action_off_route` are summon-only. The scope has `kind` chat and its own tables, and its key isn't in the summon format, so nothing on the send path can take it for a summon.
@@ -376,6 +395,9 @@ As above: this stops a confused model, not a hostile one. [What this does not st
 - **`execute_code` without the middleware.** Its tool calls are found by the ids that the `llm_request` middleware binds. On a host without it, only the context variables are left, which don't reach that thread.
 - **Two bots in one chat in one profile.** A subagent finds its scope by its profile and the chat, so during an overlap it can get the session of the other bot of that profile. It is still that chat. Bots in different profiles don't meet this: the host binds the profile a turn runs under to `HERMES_SESSION_PROFILE`. A host that doesn't bind it finds no entry for any profile but the primary, so there a subagent of an extra profile reads nothing, also in that profile's owner DM.
 - **A `hermes` command started by a tool during a Chatlytics turn.** A CLI child of a terminal tool inherits `HERMES_SESSION_PLATFORM=chatlytics` and has empty tables of its own, so it has no entry for the chat and its Lextrove reads are refused with `no_scope_for_this_turn`. This holds in the owner's own DM too, where the turn itself reads everything. It fails in the limiting direction: to read from such a child, use the turn's own tools instead.
+- **A send from a conversation its chat moved past.** The host keeps that turn's replies from the chat, but `chatlytics_send` and the plugin's other tools post to the hub themselves, so they still reach it. An ordinary conversation's send leaves from the bot's number, and a summon's follows the summon's account rules when it is found by its task id. What it can send is limited by what it can read (chatlytics#975).
+- **Memory on a summon's turn from the apps.** It has no context line, so the memory strip doesn't apply, and its prompt has the agent's memory. Reads are still limited.
+- **A `hermes` command started by a shell tool on a detached turn.** It has no bound key and its platform is `local`, so it isn't limited. Only the key in the turn's own context counts, because a key in the environment would also limit a Telegram conversation's command.
 - **`chatlytics_read` on an extra bot.** An ordinary turn's tools use the primary's bearer, and the hub pins a read to the bearer's session. So on a gateway with several bots, an extra bot's turn reads this chat id as the primary's number sees it. On the legacy operator key the tool names no session, so the hub reads on its default account. See row C5.
 
 ### The log
@@ -418,4 +440,5 @@ What can't be decided without a real hub and real accounts. Each row says what d
 | C2 | The owner types the trigger in a group where the bot's own account is a member. Same question. | The same as C1, with the text tagged `[owner reply]`. The reply leaves from the bot's number. |
 | C3 | Someone other than the owner DMs the bot. Same question, then ask about the DM itself. | The wide read is refused, and the read of this DM on the bot's session runs. The turn still has its earlier history. |
 | C4 | The owner DMs the bot from their usual device. Have the model read `session: all`. | The log has `no chat scope, the owner's own DM`, and the read runs. If it has `chat scope opened` instead, the hub delivered a form that isn't listed: compare `sender_jid` and `entity_jid` with `allow_admin_from`. |
+| D1 | A group member triggers the bot. Send `/new` in the chat. Open the old conversation in an app and ask it to read `session: all`, then to delegate that read to a subagent, then to read this chat with its session. Repeat in the owner's own DM with the bot, and on a Telegram conversation. | In the group both wide reads are refused, with `chat read refused kind=chat ... reason=session_not_summon`, and the read of this chat runs. In the owner's DM and on Telegram all of them run, with no refusal in the log. |
 | C5 | On a bot with no Lextrove server, a group member triggers the bot and asks what was said here. Have the model call `chatlytics_read` with the group's JID, then with another chat's id, then with a contact's name. On a gateway with several bots, repeat on an extra bot. | The first returns this group's messages and only them, and the log has `chat read allowed kind=chat tool=chatlytics_read`. The other two return no messages, and the log has `chat read refused kind=chat tool=chatlytics_read reason=chat_not_summon`. On the extra bot, record whose view of the chat came back. |
