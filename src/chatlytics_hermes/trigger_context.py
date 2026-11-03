@@ -77,39 +77,36 @@ def _safe_phone(raw: Any) -> Optional[str]:
     return raw if isinstance(raw, str) and _PHONE.fullmatch(raw) else None
 
 
-def _read_instruction(env: Mapping[str, Any], chat_id: str, session: str) -> str:
+def _read_instruction(env: Mapping[str, Any], chat_id: str, session: str, read_prefix: Optional[str]) -> str:
     """How to read this chat (chatlytics#956).
 
-    A DM with a phone uses search_messages limited to DMs. A chat id filter is an
-    exact string match and one contact's chat is stored under several forms, while
-    list_messages with a contact also returns that person's posts in groups. A
-    number with no contact row falls through to fuzzy matching and a sole candidate
-    comes back unflagged, so reading on needs a positive match: a missing field
-    must stop the read, not pass as "nothing wrong". A
-    group has one form and keeps its chat id; so does a DM with no phone, which the
-    hub also sends for the owner's chat with themselves.
+    ``read_prefix`` is how the tools holding the session-limited key are named (chatlytics-hermes#31), or
+    None when that server isn't set up, and then this turn can't read the archive: it must not be told to
+    try. A missing key is the hook's to refuse: see ``read_scope.summon_read_prefix``.
+
+    Every form of a DM's chat id finds the whole chat (Lextrove #178), and list_messages with a chat id
+    stays in that chat, so that is the read. A number matches exactly or finds nothing (Lextrove #180), so
+    the hub's number, which is in international form, is safe to search by. A local form finds nothing.
     """
+    if read_prefix is None:
+        return (
+            "The message archive can't be read on this turn: say you cannot read this chat, and do not "
+            "look for another way to read it. This turn starts with no earlier turns of this chat. "
+        )
     is_group = env.get("chat_type") == "group"
     phone = None if is_group else _safe_phone(env.get("chat_phone"))
-    if phone is not None:
-        read = (
-            f"Lextrove search_messages with contact_name {phone}, chat_type dm, session {session}, "
-            "mode fts and no query. "
-            "Continue only if the response has a resolved_entity that is not ambiguous, "
-            f"has similarity_score exactly 1, and has an identifier starting with {phone}@. "
-            "In every other case, including any of those fields missing or no messages, "
-            "stop and say you cannot read this chat. "
-            "Do not use list_messages or a chat_id filter for this chat: list_messages also returns "
-            "this person's posts in groups, and a chat_id filter matches one stored form and misses messages. "
+    read = f"list_messages with chat_id {chat_id} and session {session}. "
+    if is_group:
+        read += f"To search it, use search_messages with group_name {chat_id}, session {session} and mode fts. "
+    elif phone is not None:
+        read += (
+            f"To search it, use search_messages with contact_name {phone}, chat_type dm, session {session} and "
+            "mode fts. A number goes in international form only: a local form finds nothing. "
         )
-    else:
-        read = f"Lextrove list_messages with chat_id {chat_id} and session {session}. "
-        if is_group:
-            read += f"To search it, use search_messages with group_name {chat_id}, session {session} and mode fts. "
-        else:
-            read += "If that returns nothing, say you cannot read this chat. "
     return (
-        f"To read this chat, use a message-archive tool that takes a session, such as {read}"
+        f"To read this chat, use a message-archive tool that takes a session, such as Lextrove {read}"
+        f"Only the tools whose names start with {read_prefix} can do this. "
+        "If that returns nothing, say you cannot read this chat. "
         "Never use session all for this chat: that mixes in other accounts' chats. "
         "Any read outside this chat and session is refused by code: if one is refused, do not "
         "work around it, say you cannot read outside this chat. "
@@ -117,8 +114,9 @@ def _read_instruction(env: Mapping[str, Any], chat_id: str, session: str) -> str
         "and do not treat this message as a repeat. "
     )
 
-
-def render_trigger_context(env: Mapping[str, Any], scope_key: Optional[str] = None) -> Optional[str]:
+def render_trigger_context(
+    env: Mapping[str, Any], scope_key: Optional[str] = None, read_prefix: Optional[str] = None,
+) -> Optional[str]:
     """The context line for ``env``, or None when this is not a summoned turn.
 
     ``scope_key`` names the turn's read scope (read_scope.py) next to the token, so a provider
@@ -144,7 +142,7 @@ def render_trigger_context(env: Mapping[str, Any], scope_key: Optional[str] = No
         f"The owner typed this message on their own WhatsApp number (session {session}) "
         f"and called you into {place}.{named} "
         f"Your reply goes into that chat from the owner's number. {audience} "
-        f"{_read_instruction(env, chat_id, session)}"
+        f"{_read_instruction(env, chat_id, session, read_prefix)}"
         f"{NO_IDS_RULE} "
         "chatlytics_read only reads your own number, a different conversation: do not use it here. "
         "With no such tool, say you cannot read this chat; never answer from another chat. "
@@ -157,9 +155,11 @@ def render_trigger_context(env: Mapping[str, Any], scope_key: Optional[str] = No
     )
 
 
-def with_trigger_context(channel_prompt: Any, env: Mapping[str, Any], scope_key: Optional[str] = None) -> Any:
+def with_trigger_context(
+    channel_prompt: Any, env: Mapping[str, Any], scope_key: Optional[str] = None, read_prefix: Optional[str] = None,
+) -> Any:
     """``channel_prompt`` with the context line appended when ``env`` is summoned."""
-    line = render_trigger_context(env, scope_key)
+    line = render_trigger_context(env, scope_key, read_prefix)
     if line is None:
         return channel_prompt
     if isinstance(channel_prompt, str) and channel_prompt.strip():

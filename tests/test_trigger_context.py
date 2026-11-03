@@ -42,6 +42,8 @@ OWNER = ENVELOPES["from_me_dm"]["sender_jid"]
 PEER = ENVELOPES["from_me_dm"]["entity_jid"]
 OWNER_SESSION = ENVELOPES["from_me_dm"]["session_id"]
 
+READ_PREFIX = "mcp__lextrove_limited__"
+
 
 def _adapter() -> Any:
     return _lp_adapter(allow_admin_from=[OWNER], group_allow_admin_from=[OWNER])
@@ -95,32 +97,29 @@ async def test_dm_with_a_phone_searches_direct_chats_only(name: str) -> None:
     prompt = _prompt(await _dispatch(_adapter(), dict(env)))
     phone = env["chat_phone"]
 
+    # chat_id finds a DM in every stored form and stays in that chat (Lextrove #178).
+    assert f"Lextrove list_messages with chat_id {env['entity_jid']} and session {env['session_id']}." in prompt
     assert (
-        f"Lextrove search_messages with contact_name {phone}, chat_type dm, "
-        f"session {env['session_id']}, mode fts and no query." in prompt
+        f"To search it, use search_messages with contact_name {phone}, chat_type dm, "
+        f"session {env['session_id']} and mode fts." in prompt
     )
-    assert "list_messages with" not in prompt
-    assert "Do not use list_messages or a chat_id filter for this chat" in prompt
-    assert "posts in groups" in prompt
+    assert "A number goes in international form only: a local form finds nothing." in prompt
+    assert "Do not use list_messages or a chat_id filter" not in prompt
     # The line still names the chat, for the reply.
     assert f"chat id {env['entity_jid']}" in prompt
 
 
 @pytest.mark.parametrize("name", ["from_me_dm", "from_me_dm_lid"])
-def test_dm_with_a_phone_requires_a_positive_match(name: str) -> None:
+def test_the_model_is_no_longer_asked_to_judge_a_number_match(name: str) -> None:
     env = ENVELOPES[name]
-    line = render_trigger_context(env)
+    line = render_trigger_context(env, None, READ_PREFIX)
     assert line is not None
 
-    assert "Continue only if the response has a resolved_entity that is not ambiguous" in line
-    assert "has similarity_score exactly 1" in line
-    # With the @, a number that merely shares this prefix does not pass.
-    assert f"has an identifier starting with {env['chat_phone']}@" in line
-    # A response without these fields must stop the read, not fall through it.
-    assert (
-        "In every other case, including any of those fields missing or no messages, "
-        "stop and say you cannot read this chat." in line
-    )
+    # A number matches exactly or finds nothing (Lextrove #180). The check itself is in read_scope.py.
+    assert "Continue only if" not in line
+    assert "similarity_score" not in line
+    assert "resolved_entity" not in line
+    assert "If that returns nothing, say you cannot read this chat." in line
 
 
 async def test_owners_own_chat_has_no_phone_so_it_reads_by_chat_id() -> None:
@@ -176,7 +175,7 @@ async def test_dm_without_a_phone_reads_by_chat_id_and_admits_an_empty_result() 
 )
 def test_a_chat_phone_that_is_not_digits_is_dropped(bad: Any) -> None:
     env = dict(ENVELOPES["from_me_dm_lid"], chat_phone=bad)
-    line = render_trigger_context(env)
+    line = render_trigger_context(env, None, READ_PREFIX)
     assert line is not None
     assert "contact_name" not in line
     assert f"list_messages with chat_id {env['entity_jid']}" in line
@@ -185,7 +184,7 @@ def test_a_chat_phone_that_is_not_digits_is_dropped(bad: Any) -> None:
 
 def test_a_chat_phone_of_exactly_15_digits_is_kept() -> None:
     env = dict(ENVELOPES["from_me_dm_lid"], chat_phone="123456789012345")
-    line = render_trigger_context(env)
+    line = render_trigger_context(env, None, READ_PREFIX)
     assert line is not None
     assert "contact_name 123456789012345," in line
 

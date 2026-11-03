@@ -2858,7 +2858,10 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 if why:
                     memory_strip.log_summon_refused(body["chatId"], why)
                 return
-        cp = with_trigger_context(cp, env, summon_scope.key if summon_scope else None)
+        cp = with_trigger_context(
+            cp, env, summon_scope.key if summon_scope else None,
+            read_scope.summon_read_prefix() if summon_scope else None,
+        )
         # chatlytics#956: any other turn reads only its own chat on this bot's session, except the
         # owner's own DM with the bot. Reads only: see read_scope.open_chat_turn. Keep in sync with
         # inbound.py. DO NOT REMOVE.

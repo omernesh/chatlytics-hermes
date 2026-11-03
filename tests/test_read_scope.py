@@ -54,8 +54,10 @@ def _reason(verdict: Optional[Dict[str, str]]) -> Optional[str]:
     return verdict["message"].split("(", 1)[1].split(")", 1)[0]
 
 
-LM = "mcp__lextrove__list_messages"
-SM = "mcp__lextrove__search_messages"
+# A summon reads through the server holding the limited key: see tests/test_limited_key.py.
+LM = "mcp__lextrove_limited__list_messages"
+SM = "mcp__lextrove_limited__search_messages"
+UNLIMITED_LM = "mcp__lextrove__list_messages"
 DM_READ = {"contact_name": PHONE, "chat_type": "dm", "session": OWNER_SESSION, "mode": "fts"}
 GROUP_LIST = {"chat_id": GROUP, "session": OWNER_SESSION}
 
@@ -74,7 +76,7 @@ def test_the_exact_failed_call_is_refused_and_says_what_to_do(caplog: pytest.Log
         verdict = _pre("tool_call", FAILED_CALL)
     assert _reason(verdict) == "session_not_summon"
     assert "cannot read outside this chat" in verdict["message"]
-    assert f"contact_name {PHONE}, chat_type dm, session {OWNER_SESSION}, mode fts" in verdict["message"]
+    assert f"list_messages with chat_id {PEER} and session {OWNER_SESSION}" in verdict["message"]
     line = next(r.getMessage() for r in caplog.records if "summon read refused" in r.getMessage())
     assert f"tool={LM} reason=session_not_summon" in line
     assert "all" not in line.split("reason=")[0]
@@ -263,13 +265,13 @@ def test_a_tool_that_cannot_be_scoped_is_refused_with_the_best_arguments(name: s
     chat = ENVELOPES[env]["entity_jid"]
     args = {"chat_id": chat, "session": OWNER_SESSION, "contact_name": PHONE, "chat_type": "dm", "endpoint": "chat-report",
             "contact_id": chat, "entity_id": chat, "entity_type": "contact", "query": PHONE, "newsletter_id": chat}
-    assert _pre(f"mcp__lextrove__{name}", args) is not None
-    assert _pre(f"mcp__lextrove__{name}", {"chat_id": chat, "session": OWNER_SESSION}) is not None
+    assert _pre(f"mcp__lextrove_limited__{name}", args) is not None
+    assert _pre(f"mcp__lextrove_limited__{name}", {"chat_id": chat, "session": OWNER_SESSION}) is not None
 
 
 @pytest.mark.parametrize("name", ["list_media", "list_links", "list_polls", "list_locations", "list_reactions"])
 def test_the_chat_filter_tools_follow_the_same_rule(name: str) -> None:
-    tool = f"mcp__lextrove__{name}"
+    tool = f"mcp__lextrove_limited__{name}"
     _open("from_me_group")
     assert _pre(tool, GROUP_LIST) is None
     assert _pre(tool, {**GROUP_LIST, "session": "all"}) is not None
@@ -280,15 +282,15 @@ def test_the_chat_filter_tools_follow_the_same_rule(name: str) -> None:
 
 def test_a_reaction_by_message_id_alone_is_refused() -> None:
     _open("from_me_group")
-    assert _reason(_pre("mcp__lextrove__list_reactions", {"message_id": "m1", "session": OWNER_SESSION})) == "arg_not_allowed"
+    assert _reason(_pre("mcp__lextrove_limited__list_reactions", {"message_id": "m1", "session": OWNER_SESSION})) == "arg_not_allowed"
 
 
 @pytest.mark.parametrize(
     "tool, args",
     [
-        ("mcp__lextrove__list_group_events", {"chat_id": GROUP, "session": OWNER_SESSION}),
-        ("mcp__lextrove__list_contacts", {"chat_id": GROUP, "session": OWNER_SESSION}),
-        ("mcp__lextrove__get_group", {"group_id": GROUP, "session": OWNER_SESSION}),
+        ("mcp__lextrove_limited__list_group_events", {"chat_id": GROUP, "session": OWNER_SESSION}),
+        ("mcp__lextrove_limited__list_contacts", {"chat_id": GROUP, "session": OWNER_SESSION}),
+        ("mcp__lextrove_limited__get_group", {"group_id": GROUP, "session": OWNER_SESSION}),
     ],
 )
 def test_the_group_facts_are_for_that_group_only(tool: str, args: Dict[str, Any]) -> None:
@@ -304,14 +306,14 @@ def test_the_group_facts_are_for_that_group_only(tool: str, args: Dict[str, Any]
 
 def test_list_contacts_cannot_search_or_browse() -> None:
     _open("from_me_group")
-    assert _pre("mcp__lextrove__list_contacts", {"search": "Dana", "session": OWNER_SESSION, "chat_id": GROUP}) is not None
-    assert _pre("mcp__lextrove__list_contacts", {"search": "Dana", "session": OWNER_SESSION}) is not None
+    assert _pre("mcp__lextrove_limited__list_contacts", {"search": "Dana", "session": OWNER_SESSION, "chat_id": GROUP}) is not None
+    assert _pre("mcp__lextrove_limited__list_contacts", {"search": "Dana", "session": OWNER_SESSION}) is not None
 
 
 @pytest.mark.parametrize(
     "name",
-    ["mcp__lextrove__read_resource", "mcp__lextrove__get_prompt", "mcp__lextrove__list_resources",
-     "mcp__lextrove__a_new_tool", "mcp_lextrove_a_new_tool", "lextrove_a_new_tool", "MCP__LexTrove__New"],
+    ["mcp__lextrove_limited__read_resource", "mcp__lextrove_limited__get_prompt", "mcp__lextrove_limited__list_resources",
+     "mcp__lextrove_limited__a_new_tool", "mcp_lextrove_a_new_tool", "lextrove_a_new_tool", "MCP__LexTrove__New"],
 )
 def test_an_unknown_tool_on_that_server_is_refused(name: str) -> None:
     _open()
@@ -320,13 +322,22 @@ def test_an_unknown_tool_on_that_server_is_refused(name: str) -> None:
 
 @pytest.mark.parametrize(
     "name",
-    [LM, "mcp_lextrove_list_messages", "MCP__LEXTROVE__LIST_MESSAGES", " mcp__lextrove__list_messages ",
-     "mcp__lextrove-eu__list_messages", "mcp__renamed_archive__list_messages", "list_messages"],
+    [LM, "MCP__LEXTROVE_LIMITED__LIST_MESSAGES", " mcp__lextrove_limited__list_messages ", "mcp__lextrove-limited__list_messages"],
 )
-def test_every_spelling_of_the_tool_name_is_caught(name: str) -> None:
+def test_every_spelling_of_the_limited_servers_tool_is_held_to_the_rules(name: str) -> None:
     _open("from_me_group")
     assert _reason(_pre(name, {**GROUP_LIST, "session": "all"})) == "session_not_summon"
     assert _pre(name, GROUP_LIST) is None
+
+
+@pytest.mark.parametrize(
+    "name",
+    [UNLIMITED_LM, "mcp_lextrove_list_messages", "MCP__LEXTROVE__LIST_MESSAGES",
+     "mcp__lextrove-eu__list_messages", "mcp__renamed_archive__list_messages", "list_messages"],
+)
+def test_every_spelling_on_any_other_server_is_refused_even_in_scope(name: str) -> None:
+    _open("from_me_group")
+    assert _reason(_pre(name, GROUP_LIST)) == read_scope._NEEDS_LIMITED
 
 
 # --- reads by id -------------------------------------------------------------------------------
@@ -356,12 +367,12 @@ def _search(rows: Any, entity: Any) -> str:
 @pytest.mark.parametrize(
     "tool, args",
     [
-        ("mcp__lextrove__get_message", {"message_id": "m1"}),
-        ("mcp__lextrove__get_media_url", {"message_id": "m1"}),
-        ("mcp__lextrove__get_media_url", {"message_ids": ["m1"]}),
-        ("mcp__lextrove__get_media_url", {"message_id": "m1", "durable": False}),
-        ("mcp__lextrove__get_poll", {"poll_id": "m1"}),
-        ("mcp__lextrove__list_poll_votes", {"poll_id": "m1", "session": OWNER_SESSION}),
+        ("mcp__lextrove_limited__get_message", {"message_id": "m1"}),
+        ("mcp__lextrove_limited__get_media_url", {"message_id": "m1"}),
+        ("mcp__lextrove_limited__get_media_url", {"message_ids": ["m1"]}),
+        ("mcp__lextrove_limited__get_media_url", {"message_id": "m1", "durable": False}),
+        ("mcp__lextrove_limited__get_poll", {"poll_id": "m1"}),
+        ("mcp__lextrove_limited__list_poll_votes", {"poll_id": "m1", "session": OWNER_SESSION}),
     ],
 )
 def test_a_read_by_id_needs_an_id_this_chat_returned(tool: str, args: Dict[str, Any]) -> None:
@@ -376,23 +387,23 @@ def test_a_read_by_id_needs_an_id_this_chat_returned(tool: str, args: Dict[str, 
 def test_one_foreign_id_in_a_bulk_read_refuses_it_all() -> None:
     _open("from_me_group")
     _post(LM, _mcp({"items": [_row(GROUP)]}))
-    assert _reason(_pre("mcp__lextrove__get_media_url", {"message_ids": ["m1", "m9"]})) == "id_not_from_this_chat"
-    assert _reason(_pre("mcp__lextrove__get_media_url", {"message_ids": []})) == "id_not_from_this_chat"
-    assert _reason(_pre("mcp__lextrove__get_media_url", {})) == "id_not_from_this_chat"
+    assert _reason(_pre("mcp__lextrove_limited__get_media_url", {"message_ids": ["m1", "m9"]})) == "id_not_from_this_chat"
+    assert _reason(_pre("mcp__lextrove_limited__get_media_url", {"message_ids": []})) == "id_not_from_this_chat"
+    assert _reason(_pre("mcp__lextrove_limited__get_media_url", {})) == "id_not_from_this_chat"
 
 
 def test_an_id_seen_by_one_summon_is_not_good_for_the_next() -> None:
     _open("from_me_group")
     _post(LM, _mcp({"items": [_row(GROUP)]}))
     _open("from_me_group")
-    assert _reason(_pre("mcp__lextrove__get_message", {"message_id": "m1"})) == "id_not_from_this_chat"
+    assert _reason(_pre("mcp__lextrove_limited__get_message", {"message_id": "m1"})) == "id_not_from_this_chat"
 
 
 def test_poll_votes_also_need_the_session() -> None:
     _open("from_me_group")
-    _post("mcp__lextrove__list_polls", _mcp([{"id": "p1", "chat_id": GROUP}]))
-    assert _reason(_pre("mcp__lextrove__list_poll_votes", {"poll_id": "p1"})) == "session_missing"
-    assert _reason(_pre("mcp__lextrove__list_poll_votes", {"poll_id": "p1", "session": "all"})) == "session_not_summon"
+    _post("mcp__lextrove_limited__list_polls", _mcp([{"id": "p1", "chat_id": GROUP}]))
+    assert _reason(_pre("mcp__lextrove_limited__list_poll_votes", {"poll_id": "p1"})) == "session_missing"
+    assert _reason(_pre("mcp__lextrove_limited__list_poll_votes", {"poll_id": "p1", "session": "all"})) == "session_not_summon"
 
 
 # --- the wrapper -------------------------------------------------------------------------------
@@ -604,8 +615,8 @@ def test_a_group_search_needs_the_groups_own_entity() -> None:
 def test_a_list_by_chat_id_also_refuses_a_row_of_another_chat() -> None:
     _open("from_me_group")
     assert "result_row_other_chat" in _post(LM, _mcp({"items": [_row("120363000000000999@g.us")]}))
-    assert "result_row_other_chat" in _post("mcp__lextrove__list_media", _mcp([_row("120363000000000999@g.us")]))
-    assert "result_row_other_chat" in _post("mcp__lextrove__get_message", _mcp(_row("120363000000000999@g.us")))
+    assert "result_row_other_chat" in _post("mcp__lextrove_limited__list_media", _mcp([_row("120363000000000999@g.us")]))
+    assert "result_row_other_chat" in _post("mcp__lextrove_limited__get_message", _mcp(_row("120363000000000999@g.us")))
 
 
 def test_a_list_too_long_to_parse_stays_because_its_arguments_prove_it() -> None:
@@ -615,7 +626,7 @@ def test_a_list_too_long_to_parse_stays_because_its_arguments_prove_it() -> None
 
 def test_a_row_id_is_only_kept_from_a_source_that_is_a_chat_read() -> None:
     scope = _open("from_me_group")
-    assert _post("mcp__lextrove__get_group", _mcp({"id": "g1", "chat_id": GROUP})) is None
+    assert _post("mcp__lextrove_limited__get_group", _mcp({"id": "g1", "chat_id": GROUP})) is None
     assert "g1" not in scope.seen_ids
 
 
@@ -676,15 +687,15 @@ def test_an_unknown_scope_key_can_read_nothing() -> None:
 
 
 NOT_SUMMONED = [
-    (LM, {"chat_id": "anything@c.us", "session": "all"}),
-    (SM, {"query": "x", "session": "all"}),
+    (UNLIMITED_LM, {"chat_id": "anything@c.us", "session": "all"}),
+    ("mcp__lextrove__search_messages", {"query": "x", "session": "all"}),
     ("mcp__lextrove__export_messages", {}),
     ("mcp__lextrove__resolve_entity", {"query": "Dana"}),
     ("mcp__lextrove__a_new_tool", {}),
     ("session_search", {"query": "x"}),
     ("chatlytics_read", {"chatId": PEER}),
     ("terminal", {"command": "sqlite3 ~/.hermes/state.db"}),
-    ("tool_call", FAILED_CALL),
+    ("tool_call", {"calls": [{"name": UNLIMITED_LM, "arguments": {"session": "all"}}]}),
     ("tool_call", {"calls": "not json"}),
 ]
 
@@ -699,9 +710,9 @@ def test_no_other_turn_is_touched(tool: str, args: Dict[str, Any]) -> None:
 
 def test_a_request_with_no_line_releases_the_session() -> None:
     _open()
-    assert _pre(LM, {"session": "all"}) is not None
+    assert _pre(UNLIMITED_LM, {"session": "all"}) is not None
     read_scope.note_request(False, "", SID, SID)
-    assert _pre(LM, {"session": "all"}) is None
+    assert _pre(UNLIMITED_LM, {"session": "all"}) is None
 
 
 def test_a_request_with_no_line_does_not_release_another_session() -> None:
@@ -719,11 +730,11 @@ def test_the_middleware_binds_and_releases_on_the_request() -> None:
 
     memory_strip.llm_request_middleware(request=summoned, session_id="s1", task_id="t1", turn_id="x")
     assert read_scope._bound["s1"] is scope and read_scope._bound["t1"] is scope
-    assert pre_tool_call(tool_name=LM, args={"session": "all"}, session_id="s1") is not None
-    assert pre_tool_call(tool_name=LM, args={"session": "all"}, task_id="t1") is not None
+    assert pre_tool_call(tool_name=UNLIMITED_LM, args={"session": "all"}, session_id="s1") is not None
+    assert pre_tool_call(tool_name=UNLIMITED_LM, args={"session": "all"}, task_id="t1") is not None
 
     memory_strip.llm_request_middleware(request=ordinary, session_id="s1", task_id="t1", turn_id="y")
-    assert pre_tool_call(tool_name=LM, args={"session": "all"}, session_id="s1", task_id="t1") is None
+    assert pre_tool_call(tool_name=UNLIMITED_LM, args={"session": "all"}, session_id="s1", task_id="t1") is None
 
 
 def test_a_failing_note_does_not_lock_down_an_ordinary_turn(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -863,11 +874,11 @@ def test_the_scope_key_rides_only_when_given() -> None:
 
 def test_the_line_says_the_read_is_enforced_and_starts_clean() -> None:
     for name in ("from_me_dm", "from_me_group", "from_me_dm_lid_unmapped"):
-        line = render_trigger_context(ENVELOPES[name]) or ""
+        line = render_trigger_context(ENVELOPES[name], None, "mcp__lextrove_limited__") or ""
         assert "refused by code" in line
         assert "no earlier turns of this chat" in line
         assert "do not treat this message as a repeat" in line
-    assert f"search_messages with group_name {GROUP}" in (render_trigger_context(ENVELOPES["from_me_group"]) or "")
+    assert f"search_messages with group_name {GROUP}" in (render_trigger_context(ENVELOPES["from_me_group"], None, "mcp__lextrove_limited__") or "")
 
 
 # --- /stop and /new reach a summon -------------------------------------------------------------

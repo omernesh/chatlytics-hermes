@@ -184,8 +184,10 @@ def test_no_entry_for_the_chat_is_limited_and_reads_nothing(gateway: Any) -> Non
 def test_a_subagent_of_a_summoned_conversation_keeps_the_summons_scope(gateway: Any) -> None:
     turn = _summon_turn(gateway)
     child = turn.context.copy()
-    assert _reason(child.run(_hook, LM, EVERY_ACCOUNT)) == "session_not_summon"
-    assert child.run(_hook, LM, {"chat_id": GROUP, "session": OWNER_SESSION}) is None
+    limited = "mcp__lextrove_limited__list_messages"
+    assert _reason(child.run(_hook, limited, EVERY_ACCOUNT)) == "session_not_summon"
+    assert child.run(_hook, limited, {"chat_id": GROUP, "session": OWNER_SESSION}) is None
+    assert _reason(child.run(_hook, LM, {"chat_id": GROUP, "session": OWNER_SESSION})) == read_scope._NEEDS_LIMITED
     assert _reason(child.run(_hook, "mcp__hub__send_message", {})) == read_scope._HUB_WRITE_REFUSED
 
 
