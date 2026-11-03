@@ -37,21 +37,23 @@ Hermes holds one credential per MCP server, set when it connects, and a plugin c
 
 **This is a backstop, not the main control.** The hook holds a summon to its chat and its session, and the rules below are what limit it. What the key adds is that a call which gets past them still can't read another account. It stops nothing else: a live test showed an ordinary turn reading the unlimited key out of the profile's env file through `execute_code` and calling the API with it, and a model that does that on a summon has no limit at all. The hook refuses text that names that file, that key or the archive (see [What this does not stop](#what-this-does-not-stop)), and that is text matching.
 
-**Setup.** On the host, in the profile's `config.yaml`, copy the main server's entry and change its key:
+**Setup.** On the host, install the Lextrove MCP binary and add a stdio entry for it to the profile's `config.yaml`. A main server that is a hosted HTTP endpoint can't be copied for this: it accepts only its one configured bearer, so the limited key gets a 401. The limited server has to be the local binary, started with the limited key:
 
 ```yaml
 mcp_servers:
   lextrove_limited:
-    command: <the same command as the main Lextrove server>
+    command: <path to the Lextrove MCP binary>
+    cwd: <an empty directory, with no .env>
     env:
       LEXTROVE_API_KEY: ${LEXTROVE_LIMITED_API_KEY}
+      LEXTROVE_API_URL: <the Lextrove API URL>
     tools:
       include: [list_messages, search_messages, list_media, list_links, list_polls, list_locations, list_reactions, list_group_events, list_contacts, get_group, get_message, get_media_url, get_poll, list_poll_votes]
 ```
 
-And in the profile's `.env`, `LEXTROVE_LIMITED_API_KEY=<the key>`. `include` is what a summon may call: without it the limited server's 34 tools join every turn's list, for any model that lists them. The two names are the defaults, and `CHATLYTICS_LEXTROVE_LIMITED_SERVER` and `CHATLYTICS_LEXTROVE_LIMITED_KEY_NAME` change them. They name things. Neither holds a key. Set `CHATLYTICS_LEXTROVE_LIMITED_SERVER` and `CHATLYTICS_LEXTROVE_LIMITED_KEY_NAME` in the profile's `.env`, not only in the process env: at dispatch a primary bot reads `os.environ`, and in the turn the host's `get_secret` reads only the profile's env file, so a name set only in process env makes the prompt and the hook disagree (it fails closed).
+And in the profile's `.env`, `LEXTROVE_LIMITED_API_KEY=<the key>`. `LEXTROVE_API_URL` is required: the binary's default is localhost. `cwd` is required too: with none the process inherits the gateway's working directory, and the binary loads any `.env` where it runs. `include` is what a summon may call: without it the limited server's 34 tools join every turn's list, for any model that lists them. The two names are the defaults, and `CHATLYTICS_LEXTROVE_LIMITED_SERVER` and `CHATLYTICS_LEXTROVE_LIMITED_KEY_NAME` change them. They name things. Neither holds a key. Set `CHATLYTICS_LEXTROVE_LIMITED_SERVER` and `CHATLYTICS_LEXTROVE_LIMITED_KEY_NAME` in the profile's `.env`, not only in the process env: at dispatch a primary bot reads `os.environ`, and in the turn the host's `get_secret` reads only the profile's env file, so a name set only in process env makes the prompt and the hook disagree (it fails closed).
 
-It has to be its own process. The Lextrove MCP binary sends the one key it was started with on every call, and the bearer a client presents to it is only a gate, so a second connection to one running HTTP server with another bearer is not limited at all. A stdio entry like the one above, or a second HTTP server started with the limited key, both are.
+It has to be its own process. The Lextrove MCP binary sends the one key it was started with on every call, and the bearer a client presents to it is only a gate, so a second connection to one running HTTP server with another bearer is not limited at all, where that server accepts the bearer at all. A stdio entry like the one above, or a second HTTP server started with the limited key, both are.
 
 **Why the plugin checks the key itself.** A stdio server's unset `${VAR}` in `env` is dropped by the host, and the process starts anyway (`_build_safe_env`). The Lextrove binary then reads a `.env` from where it runs, which can hold the unlimited key under the name it wants. So the host connecting says nothing, and on every summon read `limited_key_problem` looks at the server's entry in the raw config and at the key for this profile. The value is only tested for being there, and never kept or logged.
 
