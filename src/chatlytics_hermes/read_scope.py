@@ -44,6 +44,12 @@ reaches a delegated subagent. Turns with no Chatlytics context (Telegram, CLI, c
 A conversation its chat moved past is found by its detached key: see :func:`_detached_scope`.
 Its one read a summon doesn't have is the plugin's ``chatlytics_read`` of this chat: see
 :func:`_plugin_read_problem`.
+
+**Two keys** (chatlytics-hermes#31). A summon reads through its own MCP server, which holds a key limited
+to the owner's session on Lextrove's side. Hermes holds one key per MCP server and picks no key per call,
+so the choice is made here by refusing the other server: see :func:`_check_one` and
+:func:`limited_key_problem`. It is a backstop behind the rules below, not a wall: a model that gets the
+other key out of the host's environment or env file is not stopped by it.
 """
 
 from __future__ import annotations
@@ -388,7 +394,7 @@ def _phone_of(value: Any) -> Optional[str]:
 
 
 def _chat_forms(chat_id: str, phone: Optional[str]) -> FrozenSet[str]:
-    """Every stored spelling of this chat. Lextrove's ``chat_id`` is an exact string match."""
+    """The spellings of this chat the envelope can vouch for. A DM can have more: see :func:`_row_in_this_chat`."""
     forms = {_norm_jid(chat_id) or ""}
     digits = phone or _phone_of(chat_id)
     if digits and not chat_id.casefold().endswith("@g.us"):
@@ -888,6 +894,122 @@ def _hub_write_tool(tool_name: Any) -> bool:
     return _is_hub_server(name)
 
 
+# --- the limited key -----------------------------------------------------------------------------
+#
+# The names only. The key is on the host, in the profile's env file, and nothing here keeps or logs it.
+_LIMITED_SERVER_ENV = "CHATLYTICS_LEXTROVE_LIMITED_SERVER"
+_LIMITED_KEY_NAME_ENV = "CHATLYTICS_LEXTROVE_LIMITED_KEY_NAME"
+_LIMITED_SERVER_DEFAULT = "lextrove_limited"
+_LIMITED_KEY_NAME_DEFAULT = "LEXTROVE_LIMITED_API_KEY"
+# These go into a system prompt and a regular expression.
+_CONFIG_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_LIMITED_OFF_SUMMON = "limited_key_is_for_summons"
+_NEEDS_LIMITED = "lextrove_needs_limited_key"
+
+
+def _host_secret(name: str) -> Optional[str]:
+    """A value by its name, as the host renders it for this profile. Under a multiplexer with no profile bound it raises."""
+    try:
+        from agent.secret_scope import get_secret
+    except ImportError:
+        return os.environ.get(name)
+    return get_secret(name)
+
+
+def _configured_name(env_name: str, default: str) -> Optional[str]:
+    """The name set in ``env_name``, the default when none is. None for a name that can't be one.
+
+    DO NOT fall back to the default on a bad name: someone meant another server or key.
+    """
+    try:
+        value = (_host_secret(env_name) or "").strip()
+    except Exception:  # noqa: BLE001 -- no profile bound. Only a name, and the key's own read still fails closed.
+        value = ""
+    if not value:
+        return default
+    return value if _CONFIG_NAME.fullmatch(value) else None
+
+
+def _names_key(entry: Mapping[str, Any], key_name: str) -> bool:
+    """Does this server's own ``env`` or ``headers`` take its credential from ``key_name``?"""
+    reference = re.compile(rf"\$\{{(?:env:)?{re.escape(key_name)}\}}")
+    for part in ("env", "headers"):
+        values = entry.get(part)
+        if isinstance(values, Mapping) and any(isinstance(v, str) and reference.search(v) for v in values.values()):
+            return True
+    return False
+
+
+def limited_key_problem() -> Optional[str]:
+    """None when a summon can read through the limited server, otherwise the code to refuse it with.
+
+    DO NOT leave this to the host's connect. For a stdio server the host treats an unset ``${VAR}`` in
+    ``env`` as absent (``_build_safe_env``) and starts the process anyway, and the Lextrove MCP binary then
+    loads a ``.env`` from where it runs, which can hold the unlimited key under the name it wants. That
+    would be the fallback this exists to prevent. Never raises: any doubt refuses, and costs one read.
+    """
+    try:
+        server = _configured_name(_LIMITED_SERVER_ENV, _LIMITED_SERVER_DEFAULT)
+        key_name = _configured_name(_LIMITED_KEY_NAME_ENV, _LIMITED_KEY_NAME_DEFAULT)
+        if server is None or key_name is None:
+            return "limited_key_config_invalid"
+        from hermes_cli.config import read_raw_config  # Raw: load_config has already rendered the references.
+
+        servers = read_raw_config().get("mcp_servers")
+        entry = servers.get(server) if isinstance(servers, Mapping) else None
+        if not isinstance(entry, Mapping):
+            return "limited_server_not_configured"
+        if not _names_key(entry, key_name):
+            return "limited_server_not_on_limited_key"
+        return None if (_host_secret(key_name) or "").strip() else "limited_key_missing"
+    except Exception:  # noqa: BLE001 -- see the docstring
+        logger.exception("chatlytics-hermes#31: could not check the limited Lextrove key")
+        return "limited_key_check_failed"
+
+
+def _mcp_component(name: str) -> str:
+    return re.sub(r"[^a-z0-9_]", "_", name.casefold())
+
+
+def summon_read_prefix() -> Optional[str]:
+    """How the tools a summon may read with are named; None when it can't read. For the context line."""
+    problem = limited_key_problem()
+    server = _configured_name(_LIMITED_SERVER_ENV, _LIMITED_SERVER_DEFAULT)
+    if problem or server is None:
+        logger.error("chatlytics-hermes#31: this summon can read nothing from the archive: %s", problem)
+        return None
+    return f"mcp__{re.sub(r'[^A-Za-z0-9_]', '_', server)}__"
+
+
+def _on_limited_server(tool_name: Any) -> bool:
+    """Is this tool the limited server's? The host's registry says when it knows the name.
+
+    The registry first because the host cuts a long name to a hash, which no prefix survives. A name it
+    doesn't know can't run, so reading the prefix then decides only which refusal the model gets.
+    """
+    server = _configured_name(_LIMITED_SERVER_ENV, _LIMITED_SERVER_DEFAULT)
+    if server is None:
+        return False
+    name = str(tool_name or "").strip()
+    try:
+        from tools.registry import registry
+
+        toolset = registry.get_toolset_for_tool(name)
+    except Exception:  # noqa: BLE001 -- no registry: the name is what is left
+        toolset = None
+    if toolset:
+        return toolset == f"mcp-{server}"
+    return _mcp_component(name).startswith(f"mcp__{_mcp_component(server)}__")
+
+
+def _limited_tool_off_summon(tool_name: Any, args: Any) -> bool:
+    """A turn with no scope at all: is this call, or an entry of a ``tool_call``, the limited server's?"""
+    base, is_mcp = _base_name(tool_name)
+    if base == _WRAPPER and not is_mcp:
+        return any(_on_limited_server(name) for name, _ in _wrapped_calls(args if isinstance(args, dict) else {}) or ())
+    return _on_limited_server(tool_name)
+
+
 def _lextrove_tool(tool_name: Any) -> Optional[str]:
     """The Lextrove tool this name means: a table name, or "unknown" for one not in the table.
 
@@ -1070,6 +1192,7 @@ _HOST_STORES = (
     r"state\.db|sessions\.json"
     r"|\.hermes(?:[/\\]+profiles[/\\]+[^\s/\\\"']+)?[/\\]+(?:config\.ya?ml|\.env|sessions\b)"
     r"|\.hermes[/\\]*(?=[\"'\s]|$)"
+    r"|\$\{?HERMES_HOME\}?[/\\]+\.env"
 )
 _TEXT_ROUTE_MARKS = re.compile(rf"lextrove|{_HOST_STORES}", re.IGNORECASE)
 
@@ -1209,11 +1332,23 @@ def _check_one(tool_name: Any, raw_args: Any, scope: SummonScope) -> Optional[Re
         return None
     args = _as_args(raw_args)
     lextrove = _lextrove_tool(tool_name)
+    limited = _on_limited_server(tool_name)
+    # DO NOT let another turn use this server: its key is one owner's session, not this turn's.
+    if limited and scope.kind != KIND_SUMMON:
+        return Refusal(_LIMITED_OFF_SUMMON, label)
+    if limited and lextrove is None:
+        lextrove = "unknown"
     if lextrove is not None:
         if lextrove == "unknown":
             return Refusal("unknown_lextrove_tool", label)
         if scope.session is None:
             return Refusal("no_scope_for_this_turn", label)
+        # chatlytics-hermes#31. DO NOT let a summon fall back to another server when the limited one isn't
+        # there: a tool of any other server, renamed or unknown, may hold the unlimited key.
+        if scope.kind == KIND_SUMMON:
+            problem = limited_key_problem() if limited else _NEEDS_LIMITED
+            if problem:
+                return Refusal(problem, label)
         if args is None:
             return Refusal("args_unreadable", label)
         reason = LEXTROVE_RULES[lextrove](args, scope)
@@ -1249,16 +1384,31 @@ def _how_to_read(scope: SummonScope) -> str:
         return "This turn has no readable chat."
     # A bot with no Lextrove has only this one, and must be told: the line below names tools it doesn't have.
     plugin = f"To read this chat use chatlytics_read with chatId {scope.chat_id}. " if scope.kind == KIND_CHAT else ""
+    tools = ""
+    if scope.kind == KIND_SUMMON:
+        prefix = summon_read_prefix()
+        if prefix is None:
+            return "The message archive can't be read on this turn."
+        tools = f" Only the tools whose names start with {prefix} can do this."
+    read = f"{plugin}To read this chat use list_messages with chat_id {scope.chat_id} and session {scope.session}"
     if scope.is_group:
-        return (f"{plugin}To read this chat use list_messages with chat_id {scope.chat_id} and session {scope.session}, "
-                f"or search_messages with group_name {scope.chat_id}, session {scope.session} and mode fts.")
+        return f"{read}, or search_messages with group_name {scope.chat_id}, session {scope.session} and mode fts.{tools}"
     if scope.phone:
-        return (f"{plugin}To read this chat use search_messages with contact_name {scope.phone}, chat_type dm, "
-                f"session {scope.session}, mode fts and no query.")
-    return f"{plugin}To read this chat use list_messages with chat_id {scope.chat_id} and session {scope.session}."
+        return (f"{read}. To search it use search_messages with contact_name {scope.phone}, chat_type dm, session "
+                f"{scope.session} and mode fts. A number goes in international form only: a local form finds nothing.{tools}")
+    return f"{read}.{tools}"
+
+
+def _limited_off_summon_text() -> str:
+    return (
+        f"Refused ({_LIMITED_OFF_SUMMON}): this server's key is only for summoned turns, and this isn't one. "
+        "Nothing was read. Use the same tool on the main Lextrove server."
+    )
 
 
 def _refusal_text(reason: str, scope: SummonScope) -> str:
+    if reason == _LIMITED_OFF_SUMMON:
+        return _limited_off_summon_text()
     if reason == _HUB_WRITE_REFUSED:
         return (
             f"Refused ({reason}): on this turn this tool could send or act from the wrong account. Nothing was "
@@ -1304,7 +1454,17 @@ def pre_tool_call(
         logger.exception("chatlytics#956: summon read refused tool=? reason=scope_lookup_failed")
         return {"action": "block", "message": _refusal_text("scope_lookup_failed", _NO_SCOPE)}
     if scope is None:
-        return None
+        try:
+            if not _limited_tool_off_summon(tool_name, args):
+                return None
+        except Exception:  # noqa: BLE001 -- this key reads less than the turn may, so a failure here is harmless
+            logger.exception("chatlytics-hermes#31: could not tell which server a tool is on")
+            return None
+        logger.warning(
+            "chatlytics#956: read refused tool=%s reason=%s turn=%s",
+            _LOGGABLE_NAME.sub("?", str(tool_name or ""))[:64], _LIMITED_OFF_SUMMON, turn_id,
+        )
+        return {"action": "block", "message": _limited_off_summon_text()}
     try:
         refusal = _check_one(tool_name, args, scope)
     except Exception:  # noqa: BLE001 -- see the docstring
@@ -1363,6 +1523,26 @@ def _entity_problem(payload: Any, scope: SummonScope) -> Optional[str]:
     return None if identifier.startswith(f"{scope.phone}@") else "result_other_entity"
 
 
+_PERSON_FORMS = ("@lid", "@c.us", "@s.whatsapp.net")
+
+
+def _row_in_this_chat(scope: SummonScope, chat: Any) -> bool:
+    """Can this row be of this chat? It must be when it says so, and when nothing here says otherwise in a DM.
+
+    DO NOT make this a plain look-up in ``chat_forms`` again. Lextrove's ``chat_id`` matches a chat in every
+    stored form since its #178, measured on prod, and a row keeps the form it was stored under. An envelope
+    gives one or two of those, so a DM read under its ``@c.us`` got rows under its ``@lid`` and the whole
+    result was refused. So in a DM a person's id passes unless :func:`send_target` can say it is someone else.
+    What is in the result is the chat filter's answer, and a group has one form, so it stays exact.
+    """
+    norm = _norm_jid(chat)
+    if norm in scope.chat_forms:
+        return True
+    if scope.is_group or not isinstance(norm, str) or not norm.endswith(_PERSON_FORMS):
+        return False
+    return send_target(scope, norm) != OTHER_CHAT
+
+
 def _result_problem(tool: str, result: Any, scope: SummonScope) -> Optional[str]:
     payload = _payload(result)
     must_prove = tool == "search_messages"
@@ -1380,7 +1560,7 @@ def _result_problem(tool: str, result: Any, scope: SummonScope) -> Optional[str]
         chat = row.get("chat_id")
         if chat is None and must_prove:
             return "result_row_without_chat"
-        if chat is not None and _norm_jid(chat) not in scope.chat_forms:
+        if chat is not None and not _row_in_this_chat(scope, chat):
             return "result_row_other_chat"
     if tool in _ID_SOURCES:
         ids = [row[key].strip().casefold() for row in rows for key in ("id", "message_id", "target_message_id")

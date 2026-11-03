@@ -33,6 +33,7 @@ MEMBER = "972544000007@c.us"
 OTHER_CHAT = "972544000099@c.us"
 SID = "20260101_000000_chat"
 LM = "mcp__lextrove__list_messages"
+SUMMON_LM = "mcp__lextrove_limited__list_messages"
 EVERY_ACCOUNT = {"limit": 1, "session": "all"}
 
 
@@ -708,7 +709,7 @@ async def test_a_summon_gets_no_chat_scope_and_keeps_its_own_rules(name: str, ca
         event = await _dispatch(_bot(), dict(env))
         _request(event)
         hub_send = _hook("mcp__chatlytics__send_message", {"chatId": env["entity_jid"], "text": "x"})
-        wide = _hook(LM, EVERY_ACCOUNT)
+        wide = _hook(SUMMON_LM, EVERY_ACCOUNT)
 
     assert read_scope.is_scope_key(event.source.thread_id)
     assert CHAT_LIMIT_MARKER not in event.channel_prompt and TURN_CONTEXT_MARKER in event.channel_prompt
@@ -726,7 +727,7 @@ async def test_a_summon_in_a_limited_chat_stays_on_the_owners_session_and_the_ch
     summon = await _dispatch(adapter, dict(ENVELOPES["from_me_dm"]))
 
     def in_summon() -> Any:
-        return _hook(LM, {"chat_id": PEER, "session": OWNER_SESSION}, "x", "x")
+        return _hook(SUMMON_LM, {"chat_id": PEER, "session": OWNER_SESSION}, "x", "x")
 
     assert _in_context(in_summon, platform="chatlytics", chat_id=PEER, thread_id=summon.source.thread_id) is None
     in_chat = _in_context(lambda: _hook(LM, {"chat_id": PEER, "session": OWNER_SESSION}, "x", "x"), platform="chatlytics", chat_id=PEER)

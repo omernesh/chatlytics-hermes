@@ -21,6 +21,50 @@ dispatched, never from model arguments.
 A session must be exactly the summon's: `all`, a missing session, a list and any other session are
 refused. Case and surrounding spaces in a value are ignored, and so are the JID forms of one phone.
 
+### Two keys
+
+A summon reads through its own MCP server, which holds a Lextrove key limited to the owner's session. Every other turn keeps the main server and its unlimited key. Full Lextrove is only for the owner's own DM with the bot: the other turns are held to one chat by [the chat read scope](#the-chat-read-scope).
+
+Hermes holds one credential per MCP server, set when it connects, and a plugin can't choose one per call. So the choice is `pre_tool_call` refusing the other server:
+
+| Turn | The main server | The limited server |
+|---|---|---|
+| A summon | Refused: `lextrove_needs_limited_key`. So is any other tool with a Lextrove tool's name, on any server. | The rules below. |
+| A summon, the limited key not set up | Refused, as above. Never a fallback. | Refused, with the code below. |
+| Any other turn: a limited chat, the owner's DM, Telegram, the CLI, cron | As before. | Refused: `limited_key_is_for_summons`. The model is told to use the main server. |
+
+**This is a backstop, not the main control.** The hook holds a summon to its chat and its session, and the rules below are what limit it. What the key adds is that a call which gets past them still can't read another account. It stops nothing else: a live test showed an ordinary turn reading the unlimited key out of the profile's env file through `execute_code` and calling the API with it, and a model that does that on a summon has no limit at all. The hook refuses text that names that file, that key or the archive (see [What this does not stop](#what-this-does-not-stop)), and that is text matching.
+
+**Setup.** On the host, in the profile's `config.yaml`, copy the main server's entry and change its key:
+
+```yaml
+mcp_servers:
+  lextrove_limited:
+    command: <the same command as the main Lextrove server>
+    env:
+      LEXTROVE_API_KEY: ${LEXTROVE_LIMITED_API_KEY}
+    tools:
+      include: [list_messages, search_messages, list_media, list_links, list_polls, list_locations, list_reactions, list_group_events, list_contacts, get_group, get_message, get_media_url, get_poll, list_poll_votes]
+```
+
+And in the profile's `.env`, `LEXTROVE_LIMITED_API_KEY=<the key>`. `include` is what a summon may call: without it the limited server's 34 tools join every turn's list, for any model that lists them. The two names are the defaults, and `CHATLYTICS_LEXTROVE_LIMITED_SERVER` and `CHATLYTICS_LEXTROVE_LIMITED_KEY_NAME` change them. They name things. Neither holds a key.
+
+It has to be its own process. The Lextrove MCP binary sends the one key it was started with on every call, and the bearer a client presents to it is only a gate, so a second connection to one running HTTP server with another bearer is not limited at all. A stdio entry like the one above, or a second HTTP server started with the limited key, both are.
+
+**Why the plugin checks the key itself.** A stdio server's unset `${VAR}` in `env` is dropped by the host, and the process starts anyway (`_build_safe_env`). The Lextrove binary then reads a `.env` from where it runs, which can hold the unlimited key under the name it wants. So the host connecting says nothing, and on every summon read `limited_key_problem` looks at the server's entry in the raw config and at the key for this profile. The value is only tested for being there, and never kept or logged.
+
+| Code | Means |
+|---|---|
+| `limited_server_not_configured` | No such entry under `mcp_servers`. |
+| `limited_server_not_on_limited_key` | The entry's `env` or `headers` doesn't take anything from the key's name. A copy of the main entry that kept its key gets this. |
+| `limited_key_missing` | The name is empty or not set for this profile. |
+| `limited_key_config_invalid` | A name in one of the two variables can't be a name. There is no fallback to the default. |
+| `limited_key_check_failed` | The check itself failed, such as a multiplexer with no profile bound. |
+
+With any of these the context line tells the model the archive can't be read on this turn, and names no tool. The turn still runs and can still reply, and the log has an ERROR: `this summon can read nothing from the archive`.
+
+What this can't see: the plugin can't tell a limited key from an unlimited one by its value, so a wrong key under the right name passes every check above. That is row K1. And the key is for one session: a summon on any other session gets Lextrove's 403 on the limited server, which also fails closed.
+
 ### Lextrove tools
 
 | Tool | On a summoned turn |
@@ -40,6 +84,15 @@ refused. Case and surrounding spaces in a value are ignored, and so are the JID 
 
 An argument not listed for a tool is refused too: a filter this table doesn't know could widen the
 read. To allow more, measure what the tool returns for that call first.
+
+The model is told to read a chat with `list_messages` and to search a DM by its number. Since Lextrove's
+#178 every form of a DM's `chat_id` finds the whole chat, and `chat_id` stays in that chat, where
+`contact_name` also returns that person's group posts. Since its #180 a number matches exactly or finds
+nothing. A number goes in international form only: a local form finds nothing, and the rule above refuses it.
+
+A row keeps the form it was stored under, so a DM's rows can be under an id the envelope didn't give. In a
+DM a person's id passes the result check unless it is known to be someone else (another phone, or another
+`@lid` in a `@lid` DM). A group has one form, and its rows must match it.
 
 ### Other routes
 
@@ -63,6 +116,9 @@ This limits a confused model. It is not a sandbox against a hostile one. Not blo
 
 - Shell or code that hides the name: an encoded string, a variable (`$HERMES_HOME/sessions`), a script
   already on disk.
+- Getting the unlimited key without naming it: `env`, `dict(os.environ)`, `cd` into the profile and
+  `cat .env`, an encoded path. `~/.hermes/.env`, a profile's `.env`, `$HERMES_HOME/.env` and the word
+  lextrove, which the default key names have, are refused. A key found this way goes around both the hook and [the limited key](#two-keys).
 - Another MCP server with its own route to the same data, under a name and arguments that don't name
   the archive.
 - A cron job scheduled during the turn with a prompt that doesn't name the archive. It runs later as
@@ -91,6 +147,8 @@ chatlytics#956: summon send refused, summon_action_off_route chat=<id> scope=<ke
 chatlytics#956: summon media not posted: HTTP 409 chat=<id> scope=<key> route_closed=<bool>
 chatlytics#956: dropped a redelivered summon in chat <id>
 chatlytics#956: left the host's setup notice out of summon scope=<key>
+chatlytics#956: read refused tool=<name> reason=limited_key_is_for_summons turn=<id>
+chatlytics-hermes#31: this summon can read nothing from the archive: <code>
 ```
 
 Arguments and results are never logged. The exception is a refused send's target, cut to 64 characters
@@ -360,7 +418,7 @@ A few things are worth saying because they are new for an ordinary turn:
 
 - The plugin's `chatlytics_read` runs when its `chatId` is this chat, in any form the envelope knows, written as an id: the JID in any case, `@s.whatsapp.net`, or in a DM whose phone is known, that phone bare or with `+`. Any other `chatId`, a missing one, a name, a phone with spaces, any other argument, and a turn whose session isn't known or believed are refused. This is how a bot with no Lextrove server reads its own chat. The prompt line says so. No result check applies: the hub's rows have no chat field. From the hub's source, `readMessages` passes `chatId` to the transport as written, with no name resolution, so the check on the id is what holds the read to this chat. A bare phone passes this check but isn't a JID, so what it returns is the transport's answer. None of this has been run against a live hub yet: see row C5.
 - On a summon `chatlytics_read` stays refused, in its own chat too, because it reads the bot's number and the summon's chat is on the owner's. The hub's `read_messages`, and a `chatlytics_read` served over MCP, stay refused on every limited turn, because an MCP server's bearer may be another bot's.
-- A tool is taken for Lextrove's by its name, on any MCP server. On a limited turn another server's `list_messages` or `get_contact` gets the same refusal.
+- A tool is taken for Lextrove's by its name, on any MCP server. On a limited turn another server's `list_messages` or `get_contact` gets the same refusal. On a summon anything but the limited server's is refused whatever its arguments: see [Two keys](#two-keys).
 
 ### A conversation its chat moved past
 
@@ -441,6 +499,10 @@ What can't be decided without a real hub and real accounts. Each row says what d
 | C3 | Someone other than the owner DMs the bot. Same question, then ask about the DM itself. | The wide read is refused, and the read of this DM on the bot's session runs. The turn still has its earlier history. |
 | C4 | The owner DMs the bot from their usual device. Have the model read `session: all`. | The log has `no chat scope, the owner's own DM`, and the read runs. If it has `chat scope opened` instead, the hub delivered a form that isn't listed: compare `sender_jid` and `entity_jid` with `allow_admin_from`. |
 | D1 | A group member triggers the bot. Send `/new` in the chat. Open the old conversation in an app and ask it to read `session: all`, then to delegate that read to a subagent, then to read this chat with its session. Repeat in the owner's own DM with the bot, and on a Telegram conversation. | In the group both wide reads are refused, with `chat read refused kind=chat ... reason=session_not_summon`, and the read of this chat runs. In the owner's DM and on Telegram all of them run, with no refusal in the log. |
+| K1 | With the limited key on the host, call the limited server directly, not through a summon, with `session: all`. Then, on a summon, have the model read this chat. The hook refuses `session: all` on a summon before it reaches the server, so one call can't show both. | The direct call returns only the owner's session, and naming another session is a 403. The summon's read runs, and the log has `summon read allowed tool=mcp__lextrove_limited__...`. |
+| K2 | In the owner's own DM with the bot, have the model read `session: all`. Then have it call the same tool on the limited server. | The first returns several sessions. The second is refused with `limited_key_is_for_summons`. |
+| K3 | Take `LEXTROVE_LIMITED_API_KEY` off the host, restart, and summon. Have the model read this chat on each server. | Both are refused, the log has `limited_key_missing`, and the reply says it can't read this chat. |
+| K4 | On a summon, then on a group member's turn, have the model read the profile's env file with `execute_code` and with `terminal`, naming the file. | Refused each time with `names_the_archive_or_host_store`, and no key in the reply or the log. |
 | C5 | On a bot with no Lextrove server, a group member triggers the bot and asks what was said here. Have the model call `chatlytics_read` with the group's JID, then with another chat's id, then with a contact's name. On a gateway with several bots, repeat on an extra bot. | The first returns this group's messages and only them, and the log has `chat read allowed kind=chat tool=chatlytics_read`. The other two return no messages, and the log has `chat read refused kind=chat tool=chatlytics_read reason=chat_not_summon`. On the extra bot, record whose view of the chat came back. |
 
 ### Results so far
@@ -455,5 +517,6 @@ Run on the test host, against a live hub. Only what is listed here has run.
 | C4 (a read) | `32f7bdc` | `!sammie summarize this chat`: the scope opened for that chat, 3 reads were allowed, none outside it. |
 | Limited turn, reaction | | `chatlytics_react` returned success on the bot's own session. |
 | D1 | | **Not run.** No live detached conversation has been tried: only the host's own code driven by the tests. |
+| K1-K4 | | **Not run.** The limited key isn't on a host yet. The tests drive the host's own config reader, secret scope, registry and tool loop, with tools that stand in for Lextrove. |
 
 Not proven live: a closed reply route (R1, R2), a third-party DM (the hub's DM policy drops those before the plugin sees them), and D1.

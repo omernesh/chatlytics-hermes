@@ -26,11 +26,14 @@ from tests.test_trigger_context import ENVELOPES, OWNER, OWNER_SESSION, PEER
 
 PHONE = ENVELOPES["from_me_dm"]["chat_phone"]
 GROUP = ENVELOPES["from_me_group"]["entity_jid"]
-LM = "mcp__lextrove__list_messages"
-SM = "mcp__lextrove__search_messages"
+LM = "mcp__lextrove_limited__list_messages"
+SM = "mcp__lextrove_limited__search_messages"
 SECRET = "OTHER-ACCOUNT-BODY"
 # conftest.py replaces it for every test, after this module is imported.
 REAL_SCOPE_READY = read_scope.scope_ready
+
+
+UNLIMITED_LM = "mcp__lextrove__list_messages"
 
 
 def _call(name: str, args: Dict[str, Any], call_id: str = "c1") -> Dict[str, Any]:
@@ -131,7 +134,10 @@ def host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Any]:
     providers: List[Provider] = []
     names: List[str] = []
 
-    def tool(name: str, answer: Callable[[Dict[str, Any]], Any], toolset: str = "mcp-lextrove") -> None:
+    def tool(name: str, answer: Callable[[Dict[str, Any]], Any], toolset: Optional[str] = None) -> None:
+        # As the host names them: the server is the middle of the tool's name.
+        toolset = toolset or f"mcp-{name.split('__')[1]}"
+
         def handler(args: Dict[str, Any], **_: Any) -> str:
             served.append((name, args))
             return json.dumps({"result": json.dumps(answer(args))})
@@ -153,7 +159,7 @@ def host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Any]:
         built = run_agent.AIAgent(
             model="test-model", base_url=primary.url, api_key="x", provider="custom", platform="whatsapp",
             quiet_mode=True, skip_context_files=True, skip_memory=True, save_trajectories=False,
-            enabled_toolsets=["mcp-lextrove"], ephemeral_system_prompt=prompt, session_id=session_id,
+            enabled_toolsets=["mcp-lextrove", "mcp-lextrove_limited"], ephemeral_system_prompt=prompt, session_id=session_id,
             fallback_model={"provider": "custom", "model": "fallback-model", "base_url": fallback.url, "api_key": "y"} if fallback else None,
             max_iterations=30, **kwargs,
         )
@@ -329,10 +335,10 @@ def test_the_scope_and_the_line_survive_a_fallback_mid_turn(host: Any, caplog: p
 
 def test_the_same_call_on_an_ordinary_turn_runs(host: Any) -> None:
     # The control for everything above.
-    host.tool(LM, _everyone)
-    provider = host.provider(_tools(_call(LM, FAILED_ARGS)), _text("done"))
+    host.tool(UNLIMITED_LM, _everyone)
+    provider = host.provider(_tools(_call(UNLIMITED_LM, FAILED_ARGS)), _text("done"))
     result = host.agent(provider, prompt=None, session_id="20260101_000000_i", visible=True).run_conversation("q", conversation_history=[])
-    assert [name for name, _ in host.served] == [LM]
+    assert [name for name, _ in host.served] == [UNLIMITED_LM]
     assert any(SECRET in row for row in _tool_rows(result))
 
 
@@ -354,7 +360,7 @@ def test_the_hook_worker_sees_the_context_variable(host: Any) -> None:
     # contexts (tools/delegate_tool_dispatch.py). Neither ids nor binding here: only the variable.
     session_context = pytest.importorskip("gateway.session_context")
     scope, _ = _scope()
-    directive, message = host.plugins.get_pre_tool_call_directive(LM, FAILED_ARGS)
+    directive, message = host.plugins.get_pre_tool_call_directive(UNLIMITED_LM, FAILED_ARGS)
     assert directive is None  # the control
 
     tokens = session_context.set_session_vars(thread_id=scope.key)
@@ -439,7 +445,8 @@ def test_the_real_plugin_context_registers_what_the_probe_looks_for(monkeypatch:
 
 def test_the_mcp_tool_name_shape_is_the_real_one() -> None:
     schema = pytest.importorskip("tools.mcp_tool_schema")
-    assert schema.mcp_prefixed_tool_name("lextrove", "list_messages") == LM
+    assert schema.mcp_prefixed_tool_name("lextrove", "list_messages") == UNLIMITED_LM
+    assert schema.mcp_prefixed_tool_name("lextrove_limited", "list_messages") == LM
     assert read_scope._lextrove_tool(schema.mcp_prefixed_tool_name("lextrove", "read_resource")) == "unknown"
 
 
