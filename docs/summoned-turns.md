@@ -49,7 +49,7 @@ mcp_servers:
       include: [list_messages, search_messages, list_media, list_links, list_polls, list_locations, list_reactions, list_group_events, list_contacts, get_group, get_message, get_media_url, get_poll, list_poll_votes]
 ```
 
-And in the profile's `.env`, `LEXTROVE_LIMITED_API_KEY=<the key>`. `include` is what a summon may call: without it the limited server's 34 tools join every turn's list, for any model that lists them. The two names are the defaults, and `CHATLYTICS_LEXTROVE_LIMITED_SERVER` and `CHATLYTICS_LEXTROVE_LIMITED_KEY_NAME` change them. They name things. Neither holds a key.
+And in the profile's `.env`, `LEXTROVE_LIMITED_API_KEY=<the key>`. `include` is what a summon may call: without it the limited server's 34 tools join every turn's list, for any model that lists them. The two names are the defaults, and `CHATLYTICS_LEXTROVE_LIMITED_SERVER` and `CHATLYTICS_LEXTROVE_LIMITED_KEY_NAME` change them. They name things. Neither holds a key. Set `CHATLYTICS_LEXTROVE_LIMITED_SERVER` and `CHATLYTICS_LEXTROVE_LIMITED_KEY_NAME` in the profile's `.env`, not only in the process env: at dispatch a primary bot reads `os.environ`, and in the turn the host's `get_secret` reads only the profile's env file, so a name set only in process env makes the prompt and the hook disagree (it fails closed).
 
 It has to be its own process. The Lextrove MCP binary sends the one key it was started with on every call, and the bearer a client presents to it is only a gate, so a second connection to one running HTTP server with another bearer is not limited at all. A stdio entry like the one above, or a second HTTP server started with the limited key, both are.
 
@@ -67,7 +67,7 @@ It has to be its own process. The Lextrove MCP binary sends the one key it was s
 
 The turn still runs and can still reply with any of these, a read is refused with its code, and the refusal tells the model the archive can't be read on this turn and to say so. It names no tool. The log has an ERROR: `this summon can read nothing from the archive`.
 
-All but `limited_key_missing` are also known at dispatch, so the context line already says the archive can't be read, and names no tool. With `limited_key_missing` the line names the limited server's tools, and the model finds out on its first read. That costs one tool call on a host that isn't set up. Nothing is read.
+The codes other than `limited_key_missing` and `limited_key_check_failed` are also known at dispatch, so the context line already says the archive can't be read, and names no tool. `limited_key_check_failed` comes from the key read itself, which dispatch doesn't do, so it is found in the turn like `limited_key_missing`. With `limited_key_missing` the line names the limited server's tools, and the model finds out on its first read. That costs one tool call on a host that isn't set up. Nothing is read.
 
 What this can't see: the plugin can't tell a limited key from an unlimited one by its value, so a wrong key under the right name passes every check above. That is row K1. And the key is for one session: a summon on any other session gets Lextrove's 403 on the limited server, which also fails closed.
 

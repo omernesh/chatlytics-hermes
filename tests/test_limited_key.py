@@ -602,7 +602,8 @@ def test_a_key_refusal_is_an_error_in_the_log(real_check: Path, monkeypatch: pyt
     _summon()
     with caplog.at_level("WARNING", logger=read_scope.logger.name):
         _pre(LIMITED_LM, IN_SCOPE)
-    assert any(r.levelname == "ERROR" and "read nothing from the archive: limited_key_missing" in r.getMessage() for r in caplog.records)
+    errors = [r for r in caplog.records if r.levelname == "ERROR" and "read nothing from the archive: limited_key_missing" in r.getMessage()]
+    assert len(errors) == 1
     assert PLACEHOLDER not in caplog.text
 
 

@@ -910,10 +910,6 @@ _LIMITED_PROBLEMS = frozenset({
     "limited_key_config_invalid", "limited_server_not_configured", "limited_server_not_on_limited_key",
     "limited_key_missing", "limited_key_check_failed",
 })
-_LIMITED_PROBLEMS = frozenset({
-    "limited_key_config_invalid", "limited_server_not_configured", "limited_server_not_on_limited_key",
-    "limited_key_missing", "limited_key_check_failed",
-})
 
 
 def _host_secret(name: str) -> Optional[str]:
@@ -1453,13 +1449,6 @@ def _refusal_text(reason: str, scope: SummonScope) -> str:
             "set up on this host. Nothing was read. Do not try another tool, session or chat to get it. "
             "Say that you cannot read this chat."
         )
-    # Where a summon on a host with no key finds out: the context line can't check it. See summon_read_prefix.
-    if reason in _LIMITED_PROBLEMS:
-        return (
-            f"Refused ({reason}): the message archive can't be read on this turn, because access to it isn't "
-            "set up on this host. Nothing was read. Do not try another tool, session or chat to get it. "
-            "Say that you cannot read this chat."
-        )
     if reason == _HUB_WRITE_REFUSED:
         return (
             f"Refused ({reason}): on this turn this tool could send or act from the wrong account. Nothing was "
@@ -1488,8 +1477,6 @@ def _log_refused(refusal: Refusal, scope: SummonScope, turn_id: Any) -> None:
         "chatlytics#956: %s refused%s tool=%s reason=%s scope=%s turn=%s",
         _read_label(scope), _kind_tag(scope), refusal.tool, refusal.reason, scope.key, turn_id,
     )
-    if refusal.reason in _LIMITED_PROBLEMS:
-        logger.error("chatlytics-hermes#31: this summon can read nothing from the archive: %s", refusal.reason)
     if refusal.reason in _LIMITED_PROBLEMS:
         logger.error("chatlytics-hermes#31: this summon can read nothing from the archive: %s", refusal.reason)
 
