@@ -56,6 +56,7 @@ import asyncio
 import base64
 import contextlib
 import hashlib
+import importlib
 import inspect
 import json
 import logging
@@ -63,6 +64,8 @@ import mimetypes
 import os
 import random
 import re
+import sys
+import threading
 import time
 import uuid
 import dataclasses
@@ -79,6 +82,7 @@ from .diagnostics import (
     extract_bot_name,
     map_connect_error,
 )
+from . import inbound as _inbound_module
 from .inbound import make_health_handler, make_webhook_handler, normalize_payload
 from .stream import (
     CLOSE_SLOW_CONSUMER,
@@ -633,13 +637,19 @@ def _envelope_to_body(
     }
 
 
+# This guard does not only trip when hermes-agent is absent. The trip can be
+# transient, e.g. a plugin load racing the host's own imports, and it latches:
+# ``ChatlyticsAdapter`` below binds ``object`` as its base, so flipping a flag
+# cannot repair it. ``_create_adapter`` re-runs the module instead.
+_HERMES_IMPORT_ERROR: Optional[Exception] = None
 try:
     from gateway.platforms.base import BasePlatformAdapter, SendResult
     from gateway.config import Platform, PlatformConfig
     from gateway.session import build_session_key
 
     _HERMES_AVAILABLE = True
-except ImportError:  # hermes-agent not installed (e.g. acceptance criterion 1)
+except ImportError as _import_exc:  # hermes-agent not installed (e.g. acceptance criterion 1)
+    _HERMES_IMPORT_ERROR = _import_exc
     BasePlatformAdapter = object  # type: ignore[assignment, misc]
     SendResult = None  # type: ignore[assignment]
     Platform = None  # type: ignore[assignment]
@@ -685,6 +695,25 @@ def _summon_refusal_raw(error: Optional[str]) -> Optional[Dict[str, str]]:
     """``raw_response`` of a send refused here, so the host doesn't retry what can't change."""
     code = _SUMMON_REFUSALS.get(error or "")
     return {"code": code} if code else None
+
+
+def _hermes_is_absent(exc: Optional[Exception]) -> bool:
+    """True when ``exc`` means the host is not there at all, not half imported.
+
+    A plain ``ImportError`` can also carry ``name="gateway"`` ("cannot import
+    name 'x' from 'gateway'"), which is a host that exists, hence the type check.
+    """
+    return isinstance(exc, ModuleNotFoundError) and exc.name == "gateway"
+
+
+_host_import_error = _HERMES_IMPORT_ERROR or _inbound_module._HERMES_IMPORT_ERROR
+if _host_import_error is not None and not _hermes_is_absent(_host_import_error):
+    logger.warning(
+        "importing hermes-agent's modules failed while the chatlytics plugin "
+        "loaded: %s: %s. The import will be retried when the adapter is created.",
+        type(_host_import_error).__name__,
+        _host_import_error,
+    )
 
 
 class ChatlyticsConnectError(RuntimeError):
@@ -822,12 +851,21 @@ class ChatlyticsAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
     def __init__(self, config: "PlatformConfig", **kwargs: Any) -> None:
         if not _HERMES_AVAILABLE:
-            raise RuntimeError(
+            message = (
                 "hermes-agent>=0.14 must be installed to instantiate "
                 "ChatlyticsAdapter. Install or update hermes-agent via the "
                 "host (e.g. `hermes update`); never let pip resolve it "
                 "from this plugin."
             )
+            if _HERMES_IMPORT_ERROR is not None:
+                message += (
+                    " The import of hermes-agent's modules failed with "
+                    f"{type(_HERMES_IMPORT_ERROR).__name__}: {_HERMES_IMPORT_ERROR}."
+                    " A partial import of an installed hermes-agent is a "
+                    "different problem from a missing install, and updating "
+                    "will not fix it."
+                )
+            raise RuntimeError(message) from _HERMES_IMPORT_ERROR
 
         super().__init__(config=config, platform=Platform("chatlytics"))
 
@@ -5837,6 +5875,47 @@ def _make_tool_handler(ctx: Any, name: str, handler: Any) -> Any:
     return _bound
 
 
+# Has to survive the reload it guards, or two threads could hold different locks.
+_REIMPORT_LOCK = globals().get("_REIMPORT_LOCK") or threading.Lock()
+
+
+def _retry_host_imports() -> None:
+    """Re-run whichever guard tripped, inbound first. Caller holds the lock.
+
+    ``importlib.reload`` executes in the same module dict, so what the host
+    already holds (tool handlers, ``standalone_sender_fn``, the factory itself)
+    sees the new bindings. Nothing here can lose a live adapter: this module only
+    reloads while degraded, when none can have been built.
+    """
+    global _HERMES_AVAILABLE, _HERMES_IMPORT_ERROR
+    try:
+        if not _inbound_module._HERMES_AVAILABLE:
+            importlib.reload(_inbound_module)
+        if not _inbound_module._HERMES_AVAILABLE:
+            # An adapter built now would refuse every inbound message.
+            _HERMES_AVAILABLE = False
+            _HERMES_IMPORT_ERROR = _inbound_module._HERMES_IMPORT_ERROR
+        elif not _HERMES_AVAILABLE:
+            importlib.reload(sys.modules[__name__])
+    except Exception as exc:  # noqa: BLE001
+        # A reload that stopped halfway can leave the flag True above the old
+        # class, so force the degraded state and let __init__ report the cause.
+        _HERMES_AVAILABLE = False
+        _HERMES_IMPORT_ERROR = exc
+
+
+def _create_adapter(cfg: Any) -> "ChatlyticsAdapter":
+    """The ``adapter_factory``: heal a tripped import guard, then build the adapter.
+
+    Always takes the lock, because a reload flips ``_HERMES_AVAILABLE`` True
+    before it redefines ``ChatlyticsAdapter``.
+    """
+    with _REIMPORT_LOCK:
+        _retry_host_imports()
+        adapter_cls = ChatlyticsAdapter
+    return adapter_cls(cfg)
+
+
 def _register_impl(ctx: Any) -> None:
     """Actual registration body — see :func:`register` (the public entry
     point, which wraps this in the v4.2.0 P3 loud-failure guard).
@@ -5852,7 +5931,7 @@ def _register_impl(ctx: Any) -> None:
     ctx.register_platform(
         name="chatlytics",
         label="Chatlytics WhatsApp",
-        adapter_factory=lambda cfg: ChatlyticsAdapter(cfg),
+        adapter_factory=_create_adapter,
         # HERMES-04 forward-fix for 02-REVIEW MED-01: real PluginContext
         # requires check_fn. Adapter deps (httpx, aiohttp, PyYAML) are
         # all declared in pyproject; by the time register() runs, the

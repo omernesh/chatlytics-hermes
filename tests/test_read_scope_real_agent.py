@@ -379,8 +379,20 @@ def test_the_delegate_tool_really_copies_the_context_for_a_child() -> None:
 
 def test_the_host_turn_sets_the_thread_variable_from_the_source() -> None:
     run = pytest.importorskip("gateway.run")
-    source = Path(run.__file__).read_text("utf-8")
-    assert "thread_id=str(context.source.thread_id) if context.source.thread_id else" in source
+    from types import SimpleNamespace
+
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+    from gateway.session_context import clear_session_vars, get_session_env
+
+    # By behaviour: 0.22.6 reads the same field through a local name, session_env_source.
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="c", chat_type="dm", thread_id="summon-0")
+    context = SimpleNamespace(source=source, session_key="k", session_id="s")
+    tokens = run.GatewayRunner._set_session_env(SimpleNamespace(adapters={}), context)
+    try:
+        assert get_session_env("HERMES_SESSION_THREAD_ID", "") == "summon-0"
+    finally:
+        clear_session_vars(tokens)
 
 
 # --- readiness on the real host ----------------------------------------------------------------

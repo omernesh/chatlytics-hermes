@@ -974,8 +974,20 @@ def test_a_delegated_subagent_inherits_the_limit_by_the_context_variables(host: 
 def test_the_real_host_binds_the_platform_variable_a_child_is_found_by() -> None:
     run = pytest.importorskip("gateway.run")
     from pathlib import Path
+    from types import SimpleNamespace
 
-    assert "platform=context.source.platform.value" in Path(run.__file__).read_text("utf-8")
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+    from gateway.session_context import clear_session_vars, get_session_env
+
+    # By behaviour: 0.22.6 reads the same field through a local name, session_env_source.
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="c", chat_type="dm")
+    context = SimpleNamespace(source=source, session_key="k", session_id="s")
+    tokens = run.GatewayRunner._set_session_env(SimpleNamespace(adapters={}), context)
+    try:
+        assert get_session_env("HERMES_SESSION_PLATFORM", "") == Platform.TELEGRAM.value
+    finally:
+        clear_session_vars(tokens)
     cron = pytest.importorskip("cron.scheduler")
     assert 'platform="",' in Path(cron.__file__).read_text("utf-8")
 

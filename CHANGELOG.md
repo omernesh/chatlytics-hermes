@@ -55,6 +55,18 @@
 - **Summon and limited turns don't repeat ids to people** (chatlytics#956). Their prompt lines say to call a
   limit "this chat" and never to repeat session ids or phone numbers. A tool's refusal keeps the ids, for the
   model's next call.
+
+## [5.3.2] - 2026-11-03
+
+### Fixed
+
+- **The adapter recovers when the host's modules were not importable while the plugin
+  loaded.** hermes-agent loads plugins on a worker thread, and an import that failed at that
+  moment latched the plugin: it registered, then every adapter creation failed until the
+  process restarted, and the error wrongly asked for a hermes-agent install. The adapter now
+  retries the import when it is created, also when only the inbound module was affected, and
+  the error names the real cause.
+
 ## [5.3.1] - 2026-11-02
 
 ### Fixed
