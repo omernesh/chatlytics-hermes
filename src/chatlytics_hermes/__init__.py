@@ -35,8 +35,7 @@ BL-01, HI-01, HI-03 surfaced by the v2.0 milestone-wide review
 (``.planning/v2.0-MILESTONE-CODE-REVIEW.md``); Phase 8 fixes them and
 un-xfails the markers.
 """
+from ._version import __version__
 from .adapter import register
-
-__version__ = "5.3.2"
 
 __all__ = ["register", "__version__"]

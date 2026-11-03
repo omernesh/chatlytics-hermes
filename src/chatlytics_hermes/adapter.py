@@ -76,6 +76,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import httpx
 from aiohttp import web
 
+from ._version import __version__
 from .client import ChatlyticsClient, USER_AGENT
 from .diagnostics import (
     check_hermes_agent_version,
@@ -279,9 +280,9 @@ _BACKOFF_LADDER: Tuple[float, ...] = (1.0, 2.0, 5.0, 15.0, 30.0)
 # by base * 1.25 so tests (and operators reading logs) can reason about it.
 _BACKOFF_JITTER_FRAC: float = 0.25
 
-# Plugin version for log lines (parsed from the client User-Agent so adapter
-# does not import chatlytics_hermes.__init__ — that would be circular).
-_PLUGIN_VERSION: str = USER_AGENT.rsplit("/", 1)[-1]
+# Plugin version for log lines. From ``_version``, not ``chatlytics_hermes.__init__``, which imports
+# this module (circular).
+_PLUGIN_VERSION: str = __version__
 
 
 def _coerce_flag(value: Any, default: bool) -> bool:

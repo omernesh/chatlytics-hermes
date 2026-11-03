@@ -1,4 +1,31 @@
-## [Unreleased]
+## [5.4.0] - 2026-11-03
+
+This release limits what a conversation can read once its chat has moved on, makes the plugin report its
+real version, and fixes how a summoned turn's reads and sends are scoped. Read docs/summoned-turns.md
+before relying on it.
+
+### What is not proven live
+
+- **A closed reply route.** A summon whose reply is refused because a person messaged the bot has been
+  tested in code only (rows R1 and R2).
+- **A third person's DM.** A summon in a DM with a third party is limited by the hub's DM policy, which
+  drops those messages before the plugin sees them, so the plugin's side of that has not been seen live.
+- **A live detached conversation** (chatlytics#974, row D1). The limit on a conversation its chat moved
+  past is tested against the host's own code. No conversation of that kind has been run from an app.
+
+Reactions are proven: `chatlytics_react` returned success on the bot's own session.
+
+### Known limits, by decision
+
+- A summon can still write what it read into the agent's memory. The memory strip covers the prompt, not
+  what the model chooses to store.
+- A detached conversation's `chatlytics_send` can still reach its chat (chatlytics.ai#975). What it can
+  send is limited by what it can read.
+
+### Fixed
+
+- **The plugin reports its real version.** The User-Agent and the "plugin registered" log line said
+  `5.0.3` through four releases. Both now come from the package version.
 
 ### Security
 

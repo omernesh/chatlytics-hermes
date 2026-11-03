@@ -366,7 +366,7 @@ A few things are worth saying because they are new for an ordinary turn:
 
 From hermes-agent 0.22.6, when a chat moves on (`/new`, `/resume`, a reset), the old conversation can keep running from the apps as a detached conversation (`gateway/session_detached.py`). The host sends its replies to app viewers only. It also binds its turns as a Desktop session's: platform `local`, the session id as the chat, no thread. And a turn from an app has no context line in its prompt. So neither usual way finds the scope, and the turn and its subagents read everything until this was fixed (chatlytics#974).
 
-So a tool call whose bound route key is a detached one (`agent:<profile>:detached:<session id>`) asks the host for that conversation's source, which keeps the chat, thread and profile it came from. A subagent has the key through its copied context, in the background too. `execute_code`'s thread has the ids its request binds.
+So a tool call whose bound route key is a detached one (`agent:<profile>:detached:<session id>`) asks the host for that conversation's source, which keeps the chat, thread and profile it came from. A subagent has the key through its copied context, in the background too. `execute_code` runs in a copy of the turn's context on both hosts, so it has the key too. The ids its request binds are kept as well, because the send path finds a summon's key by them.
 
 | The conversation came from | Reads |
 |---|---|
@@ -392,7 +392,7 @@ The line and its key are the same on every turn of a chat in one process, so the
 As above: this stops a confused model, not a hostile one. [What this does not stop](#what-this-does-not-stop) applies in full, minus the send items, and:
 
 - **A host that can't run the hooks keeps the turn.** Unlike a summon, the turn isn't dropped, because that would silence the bot for everyone. Reads are as wide as they were before this scope, and the log has one ERROR: `chat read scope cannot be enforced on this host`.
-- **`execute_code` without the middleware.** Its tool calls are found by the ids that the `llm_request` middleware binds. On a host without it, only the context variables are left, which don't reach that thread.
+- **`execute_code` without the middleware.** Its tool calls run in a copy of the turn's context, so the context variables reach it. The ids that the `llm_request` middleware binds are what the send path uses to find a summon's key, and on a host without it they aren't bound.
 - **Two bots in one chat in one profile.** A subagent finds its scope by its profile and the chat, so during an overlap it can get the session of the other bot of that profile. It is still that chat. Bots in different profiles don't meet this: the host binds the profile a turn runs under to `HERMES_SESSION_PROFILE`. A host that doesn't bind it finds no entry for any profile but the primary, so there a subagent of an extra profile reads nothing, also in that profile's owner DM.
 - **A `hermes` command started by a tool during a Chatlytics turn.** A CLI child of a terminal tool inherits `HERMES_SESSION_PLATFORM=chatlytics` and has empty tables of its own, so it has no entry for the chat and its Lextrove reads are refused with `no_scope_for_this_turn`. This holds in the owner's own DM too, where the turn itself reads everything. It fails in the limiting direction: to read from such a child, use the turn's own tools instead.
 - **A send from a conversation its chat moved past.** The host keeps that turn's replies from the chat, but `chatlytics_send` and the plugin's other tools post to the hub themselves, so they still reach it. An ordinary conversation's send leaves from the bot's number, and a summon's follows the summon's account rules when it is found by its task id. What it can send is limited by what it can read (chatlytics#975).
@@ -442,3 +442,18 @@ What can't be decided without a real hub and real accounts. Each row says what d
 | C4 | The owner DMs the bot from their usual device. Have the model read `session: all`. | The log has `no chat scope, the owner's own DM`, and the read runs. If it has `chat scope opened` instead, the hub delivered a form that isn't listed: compare `sender_jid` and `entity_jid` with `allow_admin_from`. |
 | D1 | A group member triggers the bot. Send `/new` in the chat. Open the old conversation in an app and ask it to read `session: all`, then to delegate that read to a subagent, then to read this chat with its session. Repeat in the owner's own DM with the bot, and on a Telegram conversation. | In the group both wide reads are refused, with `chat read refused kind=chat ... reason=session_not_summon`, and the read of this chat runs. In the owner's DM and on Telegram all of them run, with no refusal in the log. |
 | C5 | On a bot with no Lextrove server, a group member triggers the bot and asks what was said here. Have the model call `chatlytics_read` with the group's JID, then with another chat's id, then with a contact's name. On a gateway with several bots, repeat on an extra bot. | The first returns this group's messages and only them, and the log has `chat read allowed kind=chat tool=chatlytics_read`. The other two return no messages, and the log has `chat read refused kind=chat tool=chatlytics_read reason=chat_not_summon`. On the extra bot, record whose view of the chat came back. |
+
+### Results so far
+
+Run on the test host, against a live hub. Only what is listed here has run.
+
+| Row | Build | Result |
+|---|---|---|
+| C1 (the wide read) | `5e3fca6` | In the group, a forced `session all` read was refused by the plugin: `chat read refused kind=chat reason=session_not_summon`. |
+| C1 (the send) | `5e3fca6` | `chatlytics_send` from that turn posted its PONG and DONE from the bot's number. |
+| C4 (the send) | `32f7bdc` | In the owner's DM with the bot, a `!sammie` send posted PONG and DONE from the owner's number. |
+| C4 (a read) | `32f7bdc` | `!sammie summarize this chat`: the scope opened for that chat, 3 reads were allowed, none outside it. |
+| Limited turn, reaction | | `chatlytics_react` returned success on the bot's own session. |
+| D1 | | **Not run.** No live detached conversation has been tried: only the host's own code driven by the tests. |
+
+Not proven live: a closed reply route (R1, R2), a third-party DM (the hub's DM policy drops those before the plugin sees them), and D1.

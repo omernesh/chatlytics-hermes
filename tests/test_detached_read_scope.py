@@ -342,3 +342,68 @@ def test_a_real_child_of_the_owners_dm_reads(gateway: Any, host: Any, monkeypatc
     # The control: the same child under the same script really reaches the tool when nothing limits it.
     _run_child(gateway, host, _owner_dm_turn(gateway), monkeypatch)
     assert [name for name, _ in host.served] == [LM]
+
+
+# --- a named profile, through the host's real registry -------------------------------------------
+
+
+def _real_runner(tmp_path: Any, monkeypatch: pytest.MonkeyPatch, gw: Any) -> Any:
+    """The host's real ``SessionStore`` and ``SessionAuthorities`` registry, in place of the stub store."""
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+    from gateway.session_authorities import SessionAuthorities
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = GatewayConfig()
+    config.multiplex_profiles = True
+    registry = SessionAuthorities(tmp_path)
+    gw.authority.profile_id = str(tmp_path)
+    registry.add(tmp_path, gw.authority)
+    runner = NS(
+        session_store=SessionStore(tmp_path / "sessions", config),
+        session_authorities=registry,
+        session_authority=gw.authority,
+        adapters={},
+    )
+    gw.authority.runner = runner
+    monkeypatch.setattr(gw.run, "_gateway_runner_ref", lambda: runner)
+    return runner
+
+
+def test_a_named_profiles_detached_turn_is_judged_by_that_profiles_scope(
+    gateway: Any, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The verdict must look the chat's scope up under the profile the conversation came from. A verdict
+    # that ignores the profile asks the primary's tables, where this chat has no entry.
+    from gateway.config import Platform
+    from gateway.session import SessionSource, build_session_key
+    from gateway.session_authority import LiveSession, SessionAuthority
+    from gateway.session_context import bound_session_key
+
+    runner = _real_runner(tmp_path, monkeypatch, gateway)
+    home = tmp_path / "profiles" / "foo"
+    home.mkdir(parents=True)
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: name == "foo")
+    monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", lambda name: home)
+    other = SessionAuthority.__new__(SessionAuthority)
+    other.runner, other.sessions, other.profile_id = runner, {}, str(home)
+    runner.session_authorities.add(home, other, name="foo")
+
+    def moved(platform: str, chat: str, **fields: Any) -> Any:
+        source = SessionSource(platform=Platform(platform), chat_id=chat, profile="foo", **fields)
+        route = "agent:foo:" + build_session_key(source).split(":", 2)[2]
+        live = other.sessions[TURN_ID] = LiveSession(source, route)
+        other.name_lane(route, "20260101_000000_new", source)
+        turn = contextvars.copy_context()
+        context = NS(source=live.source, session_key=live.route, session_id=TURN_ID)
+        turn.run(gateway.run.GatewayRunner._set_session_env, runner, context)
+        return turn
+
+    source = NS(chat_id=GROUP, profile="foo")
+    assert open_chat_turn(MEMBER_GROUP, NS(source=source), {}, authenticated=True) is not None
+    limited = moved("chatlytics", GROUP, chat_type="group", user_id=MEMBER)
+    assert limited.run(bound_session_key) == f"agent:foo:detached:{TURN_ID}"
+    assert _reason(limited.copy().run(_hook, LM, EVERY_ACCOUNT)) == "session_not_summon"
+    assert limited.copy().run(_hook, LM, GROUP_READ) is None
+    telegram = moved("telegram", "123", chat_type="dm", user_id="1")
+    assert telegram.copy().run(_hook, LM, EVERY_ACCOUNT) is None

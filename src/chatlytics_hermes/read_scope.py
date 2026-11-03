@@ -587,8 +587,10 @@ def note_chat_request(named: str, session_id: Any, task_id: Any) -> None:
 def note_request(summoned: bool, system_text: str, session_id: Any, task_id: Any) -> None:
     """Called for every provider request. A summoned one binds its ids; any other releases them.
 
-    DO NOT release on a detached conversation. A turn from the apps has no context line, and its
-    ``execute_code`` thread has only these ids to be found by.
+    DO NOT release on a detached conversation. A turn from the apps has no context line. Keep the ids bound:
+    ``execute_code`` runs in a copy of the turn's context (hermes-agent's ``CellAuthority`` and
+    ``propagate_context_to_thread``, in 0.22.5 and 0.22.6), so the route key reaches it too, but
+    ``turn_key_for_tool`` finds a summon's key for a send by these ids.
     """
     ids = [i for i in (session_id, task_id) if isinstance(i, str) and i]
     if summoned:
