@@ -38,6 +38,18 @@ def _memory_strip_ready(monkeypatch):
     from chatlytics_hermes import memory_strip
 
     monkeypatch.setattr(memory_strip, "strip_ready", lambda: None)
+    monkeypatch.setattr(memory_strip.read_scope, "scope_ready", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _summon_delivery_ledger(monkeypatch, tmp_path):
+    """chatlytics#956: the delivered-summons file stays per test and out of the real home."""
+    from chatlytics_hermes import read_scope
+
+    monkeypatch.setattr(read_scope, "_seen_path", lambda: tmp_path / read_scope._SEEN_FILE)
+    read_scope._seen.clear()
+    yield
+    read_scope._seen.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -75,9 +87,12 @@ def _clear_live_adapter_registry():
     """
     from chatlytics_hermes import adapter as _adapter_mod
 
-    _adapter_mod._LIVE_ADAPTERS.clear()
+    registries = (_adapter_mod._LIVE_ADAPTERS, _adapter_mod._LIVE_BY_PROFILE, _adapter_mod._SUMMON_ADAPTERS)
+    for registry in registries:
+        registry.clear()
     yield
-    _adapter_mod._LIVE_ADAPTERS.clear()
+    for registry in registries:
+        registry.clear()
 
 
 @pytest.fixture(scope="session", autouse=True)

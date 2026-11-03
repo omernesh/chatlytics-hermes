@@ -51,6 +51,11 @@ def _prompt(event: Any) -> str:
     return getattr(event, "channel_prompt", None) or ""
 
 
+def _no_summon_line(event: Any) -> bool:
+    # What it has instead, on a turn that isn't the owner's own DM: tests/test_chat_read_scope.py.
+    return _prompt(event).startswith(trigger_context.CHAT_LIMIT_MARKER) and trigger_context.TURN_CONTEXT_MARKER not in _prompt(event)
+
+
 # --- the real envelope through the real dispatch --------------------------------
 
 
@@ -235,7 +240,7 @@ async def test_normal_third_party_dm_is_not_the_owner_and_has_no_context() -> No
 
     assert event.source.user_id == PEER
     assert OWNER_REPLY_PREFIX not in event.text
-    assert _prompt(event) == ""
+    assert _no_summon_line(event)
 
 
 async def test_context_is_not_sticky_on_the_next_turn_in_the_same_chat() -> None:
@@ -246,7 +251,7 @@ async def test_context_is_not_sticky_on_the_next_turn_in_the_same_chat() -> None
     assert _prompt(first) != ""
     second = await _dispatch(adapter, dict(ENVELOPES["third_party_dm"]))
     assert second.source.chat_id == first.source.chat_id
-    assert _prompt(second) == ""
+    assert _no_summon_line(second)
 
 
 def _retry(session_id: str) -> Dict[str, Any]:
@@ -299,7 +304,7 @@ async def test_signed_webhook_renders_it_and_unsigned_does_not() -> None:
     assert "Chatlytics turn context" in _prompt(signed[0])
 
     unsigned = await _post(_wh_adapter(secret=False, allow_admin_from=[OWNER]), payload, sign=False)
-    assert _prompt(unsigned[0]) == ""
+    assert _no_summon_line(unsigned[0])
 
 
 # --- the line itself --------------------------------------------------------------

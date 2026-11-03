@@ -125,7 +125,7 @@ def test_plugin_yaml_is_valid() -> None:
 
     assert manifest["name"] == "chatlytics"
     assert manifest["kind"] == "platform"
-    assert manifest["version"] == "5.3.2"
+    assert manifest["version"] == "5.4.0"
 
     required = {entry["name"] for entry in manifest["requires_env"]}
     assert required == {"CHATLYTICS_BOT_TOKEN"}
@@ -165,7 +165,7 @@ def test_pyproject_declares_hermes_entry_point() -> None:
     assert entry_points["chatlytics"] == "chatlytics_hermes"
 
     project = data["project"]
-    assert project["version"] == "5.3.2"  # v5.3.2 (host import retry); v5.3.1 (approval keywords; v5.3.0 memory strip on summoned turns, chatlytics#952); v5.2.0 (fromMe turn context, chatlytics#956); v5.0.3 (gateway instance id, #838); v5.0.2 (hermes 0.22.5 native admission); v5.0.0 (bot stream, chatlytics#793); v4.8.2 (#5); v4.8.1 — hermes-agent dropped from deps (#4).
+    assert project["version"] == "5.4.0"  # v5.4.0 (summon read scope, detached conversations, version single-sourced); v5.3.2 (host import retry); v5.3.1 (approval keywords; v5.3.0 memory strip on summoned turns, chatlytics#952); v5.2.0 (fromMe turn context, chatlytics#956); v5.0.3 (gateway instance id, #838); v5.0.2 (hermes 0.22.5 native admission); v5.0.0 (bot stream, chatlytics#793); v4.8.2 (#5); v4.8.1 — hermes-agent dropped from deps (#4).
     assert project["name"] == "chatlytics-hermes"
 
     deps = project["dependencies"]
@@ -177,3 +177,13 @@ def test_pyproject_declares_hermes_entry_point() -> None:
     assert all(not dep.startswith("flask") for dep in deps), (
         "flask must be removed; HERMES-03 uses aiohttp for the webhook server"
     )
+
+
+def test_user_agent_and_log_version_follow_the_package_version() -> None:
+    # Both were hand-edited strings that stayed at 5.0.3 for four releases.
+    import chatlytics_hermes
+    from chatlytics_hermes import adapter
+    from chatlytics_hermes.client import USER_AGENT
+
+    assert USER_AGENT == f"chatlytics-hermes/{chatlytics_hermes.__version__}"
+    assert adapter._PLUGIN_VERSION == chatlytics_hermes.__version__

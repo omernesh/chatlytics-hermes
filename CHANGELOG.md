@@ -1,3 +1,94 @@
+## [5.4.0] - 2026-11-03
+
+This release limits what a conversation can read once its chat has moved on, makes the plugin report its
+real version, and fixes how a summoned turn's reads and sends are scoped. Read docs/summoned-turns.md
+before relying on it.
+
+### What is not proven live
+
+- **A closed reply route.** A summon whose reply is refused because a person messaged the bot has been
+  tested in code only (rows R1 and R2).
+- **A third person's DM.** A summon in a DM with a third party is limited by the hub's DM policy, which
+  drops those messages before the plugin sees them, so the plugin's side of that has not been seen live.
+- **A live detached conversation** (chatlytics#974, row D1). The limit on a conversation its chat moved
+  past is tested against the host's own code. No conversation of that kind has been run from an app.
+
+Reactions are proven: `chatlytics_react` returned success on the bot's own session.
+
+### Known limits, by decision
+
+- A summon can still write what it read into the agent's memory. The memory strip covers the prompt, not
+  what the model chooses to store.
+- A detached conversation's `chatlytics_send` can still reach its chat (chatlytics.ai#975). What it can
+  send is limited by what it can read.
+
+### Fixed
+
+- **The plugin reports its real version.** The User-Agent and the "plugin registered" log line said
+  `5.0.3` through four releases. Both now come from the package version.
+
+### Security
+
+- **A conversation its chat moved past stays under its read limit** (chatlytics#974). hermes-agent 0.22.6
+  keeps an old conversation running from the apps after `/new`. Its turns and their subagents had no way
+  to find the scope of the chat they came from, so a read with `session: all` ran. They now find it by the
+  conversation's own key and source. If that can't be read, the archive is refused. The owner's own DM
+  with the bot, Telegram, cron and other platforms stay unlimited. A send from such a turn is not changed
+  (chatlytics#975).
+- **A turn the owner summoned reads only the summoned chat on the owner's account**
+  (chatlytics#956). A `pre_tool_call` hook refuses a Lextrove read that is not exactly the
+  envelope's session and chat, sees through the `tool_call` wrapper, and refuses tools whose
+  reach can't be limited, and a `transform_tool_result` hook refuses a result that can't be
+  shown to be that chat. Also refused on such a turn: `session_search`, the hub's reads of the
+  bot's own number, shell and code tools that name the archive or the host's stores, and MCP
+  tools whose url, path, file, command or query argument points at them. A failure inside the
+  check refuses. Other turns are untouched.
+- **A summoned turn starts clean** (chatlytics#956). Each summon runs in its own Hermes
+  session, so it inherits no earlier turn of the chat, and its transcript is not in the history
+  of later turns. `session_search` on an ordinary turn and `memory` can still reach what it did:
+  see docs/summoned-turns.md. `/stop` and `/new` from the summoned session reach every running
+  summon of that chat, and a summon delivered twice runs once.
+- **Every send names the account it leaves from** (chatlytics#956). A summon's reply, media, typing
+  and tool sends name the summon's session, and every other turn's name the bot's own, so
+  overlapping turns in one chat can't reply from each other's number. When the hub refuses a summon's
+  reply because its window closed, the owner gets it in their DM with the bot. A summon's send to
+  another spelling of its chat leaves from the owner's number, and one that may be its person under an
+  id the envelope doesn't give is refused rather than sent from the bot's. A summon on an extra bot
+  uses that bot's bearer for its tools and its `/retry`, and a late retry by the host can't post an old
+  answer into a route a later summon reopened. An action the hub would run from the wrong account in
+  the summoned chat, such as a poll or a pin, is refused with a clear tool result.
+- **On a gateway with several profiles, a tool uses its own turn's bot** (chatlytics#956). Every profile's
+  `chatlytics_*` tools ran on the bearer of the profile that connected last, on ordinary turns too, so the
+  hub moved their sends to that bot's number. A summon's tools now use the adapter it arrived on, and are
+  refused if that adapter is gone. An ordinary turn's use its profile's adapter. With several adapters live
+  a turn never takes another bot's because it connected last: a profile with no adapter gets the tool's
+  not-connected error, and a turn naming no profile (a cron job, or lost context) uses the default profile's,
+  or is not connected, with a WARNING naming the tool. A gateway with one adapter is unchanged.
+- **A summon sends only through the plugin's own tools** (chatlytics#956). On a gateway with the hub's
+  MCP server connected, the hub's tools that send or act (`send_message`, `send_media`, `send_poll`,
+  `send_reaction`, `chatlytics_dispatch_action`, `manage_group`, and its access, gate, short-link and
+  operator settings tools) are refused on a summoned turn, under any server name and inside `tool_call`,
+  and the model is told to use `chatlytics_send`. A tool of the same name on another MCP server keeps
+  working, unless it describes itself as WhatsApp or its server has a `chatlytics_` tool. Ordinary turns
+  and the summon's reply are unchanged.
+- **Full read access applies only in the owner's own DM with the bot** (chatlytics#956). Every other
+  Chatlytics turn, which means someone else's DM, a group member's trigger, and the owner's own trigger in a
+  group with the bot, may read only its chat on the bot's own session, under the same checks as a summon. It
+  keeps its session, history, memory, account and send tools. The owner is the existing `allow_admin_from`
+  check, so **a bot with no `allow_admin_from` is limited on every turn**, and an owner reached under an
+  unlisted `@lid` or `@c.us` form is limited in that DM. On a limited turn the plugin's `chatlytics_read` runs
+  for this chat, by its id, so a bot with no Lextrove server still reads its own chat, and is refused for any
+  other chat, a name or no chat. It stays refused on a summon. The hub's `read_messages` and `session_search`
+  are refused, and another MCP server's tool with a Lextrove tool's name gets the same refusal. Telegram, CLI
+  and cron turns are not affected. See docs/summoned-turns.md.
+- **The chat read limit holds per profile and across a turn** (chatlytics#956). On a gateway with several
+  profiles, one bot's turn in a chat no longer changes another profile's limit on the same chat id, in either
+  direction. Another message in the chat during a turn no longer makes it forget the ids it has read, so
+  `get_message` of a row it just got still runs.
+- **Summon and limited turns don't repeat ids to people** (chatlytics#956). Their prompt lines say to call a
+  limit "this chat" and never to repeat session ids or phone numbers. A tool's refusal keeps the ids, for the
+  model's next call.
+
 ## [5.3.2] - 2026-11-03
 
 ### Fixed

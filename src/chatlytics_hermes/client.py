@@ -16,14 +16,14 @@ from typing import Any, Dict, Optional
 
 import httpx
 
+from ._version import __version__
+
 logger = logging.getLogger("chatlytics_hermes.client")
 
 DEFAULT_TIMEOUT_SECONDS: float = 30.0
-# User-Agent tracks the package version — keep in lockstep with
-# pyproject.toml / plugin.yaml / __init__.__version__ on EVERY release
-# (adapter._PLUGIN_VERSION is parsed from this string). History: stuck at
-# 2.0.0 until HERMES-V2 (Phase 336) tied it to the release cycle.
-USER_AGENT: str = "chatlytics-hermes/5.0.3"
+# User-Agent is derived from ``_version.__version__`` (the package's ``__version__``), so it cannot
+# go stale. History: stuck at 2.0.0, then at 5.0.3 through four releases, while it was hand-edited.
+USER_AGENT: str = f"chatlytics-hermes/{__version__}"
 
 
 class ChatlyticsClient:

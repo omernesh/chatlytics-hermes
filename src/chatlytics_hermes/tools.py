@@ -51,6 +51,7 @@ from urllib.parse import quote
 
 import httpx
 
+from . import read_scope
 from .adapter import NO_TOKEN_PROMPT, _coerce_success_payload
 from .client import ChatlyticsClient
 
@@ -154,6 +155,63 @@ _SEARCH_TIMEOUT: httpx.Timeout = httpx.Timeout(
 )
 
 
+# The hub's FROM_ME_ROUTE_ACTIONS: the /api/v1/actions verbs a reply route can move to the owner's
+# number. Every other verb stays on the bot's own, whatever is named.
+_ROUTE_ACTIONS = frozenset({"react", "startTyping", "stopTyping", "sendSeen"})
+
+
+def _name_outbound_session(path: str, body: Dict[str, Any]) -> None:
+    """chatlytics#956: a tool's send names the account the adapter's would. See adapter._outbound_session.
+
+    DO NOT REMOVE. A send naming no session follows the chat's live reply route, so a tool on an
+    ordinary turn would write from the owner's number while the owner's summon runs there, and a tool
+    on a summon from the bot's number once a person's message closed the route.
+    """
+    resolver = read_scope.OUTBOUND_RESOLVER.get()
+    if resolver is None:
+        return
+    if path == "/api/v1/send":
+        holder: Any = body
+    elif path == "/api/v1/actions":
+        holder = body.get("params") or {}
+        if body.get("action") not in _ROUTE_ACTIONS:
+            read_scope.refuse_off_route_action(holder)
+            return
+    else:
+        return
+    on_summon = read_scope.current_turn_key() is not None
+    if "session" in body and not on_summon:
+        return
+    if on_summon:
+        # The message id decides. The hub 403s a chatId that isn't the chat the id names, and a reaction
+        # to this chat's message with any other chatId, or none, would run from the bot's number.
+        for named in read_scope.message_id_chats(holder):
+            session, routed = resolver(named)
+            if routed:
+                body["session"] = session
+                holder["chatId"] = named
+                return
+    chat = holder.get("chatId")
+    session, routed_chat = resolver(chat) if isinstance(chat, str) and chat else (None, None)
+    if session:
+        body["session"] = session
+    if routed_chat:
+        holder["chatId"] = routed_chat
+
+
+def _chat_of_body(body: Dict[str, Any]) -> Any:
+    return body.get("chatId") or (body.get("params") or {}).get("chatId")
+
+
+def _note_summon_refusal(body: Dict[str, Any], response: httpx.Response) -> None:
+    """A 409 closes a summon's route for its later sends, as it does on the adapter's own paths."""
+    try:
+        payload = response.json()
+    except Exception:  # noqa: BLE001 -- no code, so it says nothing about the route
+        return
+    read_scope.note_route_refused(read_scope.current_turn_key(), _chat_of_body(body), payload)
+
+
 async def _post(
     client: ChatlyticsClient,
     path: str,
@@ -176,9 +234,16 @@ async def _post(
     explicit :class:`httpx.Timeout`. Bug 3 fix.
     """
     try:
+        _name_outbound_session(path, body)
+    except read_scope.SummonSendRefused as exc:
+        read_scope.log_send_refused(exc, _chat_of_body(body), read_scope.current_turn_key())
+        return {"success": False, "error": exc.error}
+    try:
         response = await client.post(path, json=body, timeout=timeout)
     except httpx.RequestError as exc:
         return _err_from_exception(exc)
+    if response.status_code == 409:
+        _note_summon_refusal(body, response)
     if response.status_code >= 400:
         return _err_from_response(response)
     try:

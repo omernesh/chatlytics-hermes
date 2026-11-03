@@ -27,6 +27,7 @@ from typing import Any, Callable, Dict, Optional
 
 from aiohttp import web
 
+from . import read_scope
 from .memory_strip import log_summon_refused, summon_refusal
 from .trigger_context import FROM_ME, with_trigger_context
 from .owner import (
@@ -268,7 +269,14 @@ def make_webhook_handler(adapter: Any) -> Callable[[web.Request], Any]:
                 or payload.get("sessionName")
                 or payload.get("waha_session")
             )
-            if isinstance(inbound_session, str) and inbound_session:
+            # chatlytics#956: same as adapter._dispatch_envelope (keep in sync): a summon names its
+            # own session, so it doesn't change what the chat's other turns send. DO NOT REMOVE.
+            _keeps_session = (
+                bool(secret)
+                and payload.get("trigger_source") == FROM_ME
+                and event.source.chat_id in adapter._chat_session_map
+            )
+            if isinstance(inbound_session, str) and inbound_session and not _keeps_session:
                 register = getattr(adapter, "register_chat_session", None)
                 if callable(register):
                     register(event.source.chat_id, inbound_session)
@@ -300,6 +308,7 @@ def make_webhook_handler(adapter: Any) -> Callable[[web.Request], Any]:
             event, _owner_extra, sender_authenticated=bool(secret)
         )
 
+        summon_scope = None
         # chatlytics#952 — same as adapter._dispatch_envelope (keep in sync). Only
         # a signed webhook can summon. Outside the try below on purpose: this one
         # must stop the turn, while prompt injection must never break dispatch.
@@ -309,6 +318,13 @@ def make_webhook_handler(adapter: Any) -> Callable[[web.Request], Any]:
                 log_summon_refused(event.source.chat_id, refusal)
                 # 200, not 5xx: a retry cannot change this answer.
                 return web.json_response({"status": "accepted"}, status=200)
+            # chatlytics#956: same as adapter._dispatch_envelope (keep in sync). DO NOT REMOVE.
+            if payload.get("trigger_source") == FROM_ME:
+                summon_scope, why = await adapter._open_summon(payload, event)
+                if summon_scope is None:
+                    if why:
+                        log_summon_refused(event.source.chat_id, why)
+                    return web.json_response({"status": "accepted"}, status=200)
         elif payload.get("trigger_source") == FROM_ME:
             # An unsigned sender is unauthenticated, so this can't be believed, and it runs
             # as an ordinary turn with full memory. If it is real, the reply reaches a third party.
@@ -356,7 +372,13 @@ def make_webhook_handler(adapter: Any) -> Callable[[web.Request], Any]:
             # chatlytics#956 — same as adapter._dispatch_envelope (keep in sync).
             # Only a signed webhook may say the owner summoned this turn.
             if secret:
-                cp = with_trigger_context(cp, payload)
+                cp = with_trigger_context(cp, payload, summon_scope.key if summon_scope else None)
+            # chatlytics#956 — same as adapter._dispatch_envelope (keep in sync). An unsigned webhook
+            # is never the owner, and reads nothing. DO NOT REMOVE.
+            if summon_scope is None:
+                cp = read_scope.with_chat_limit(cp, read_scope.open_chat_turn(
+                    payload, event, _owner_extra, authenticated=bool(secret), adapter=adapter,
+                ))
             if isinstance(cp, str) and cp.strip():
                 if hasattr(event, "channel_prompt"):
                     event.channel_prompt = cp.strip()

@@ -41,6 +41,7 @@ from chatlytics_hermes.adapter import (
     _PENDING_QUESTIONS_MAX,
     ChatlyticsAdapter,
 )
+from chatlytics_hermes.trigger_context import CHAT_LIMIT_MARKER
 from tests._fixtures import FakePlatformConfig
 from tests.test_longpoll import (
     BASE_URL,
@@ -844,7 +845,7 @@ async def test_dispatch_envelope_injects_channel_prompt_from_envelope() -> None:
     )
 
     assert len(events) == 1
-    assert events[0].channel_prompt == "Be terse."
+    assert events[0].channel_prompt.startswith(f"Be terse.\n\n{CHAT_LIMIT_MARKER}")
 
 
 async def test_dispatch_envelope_without_prompt_or_config_leaves_none() -> None:
@@ -854,7 +855,7 @@ async def test_dispatch_envelope_without_prompt_or_config_leaves_none() -> None:
     await adapter._dispatch_envelope(_msg_envelope("hi"))
 
     assert len(events) == 1
-    assert events[0].channel_prompt is None
+    assert events[0].channel_prompt.startswith(CHAT_LIMIT_MARKER)  # A group: this turn's read limit.
 
 
 async def test_dispatch_envelope_falls_back_to_config_channel_prompts() -> None:
@@ -870,7 +871,7 @@ async def test_dispatch_envelope_falls_back_to_config_channel_prompts() -> None:
     await adapter._dispatch_envelope(_msg_envelope("hi"))
 
     assert len(events) == 1
-    assert events[0].channel_prompt == "From local config."
+    assert events[0].channel_prompt.startswith(f"From local config.\n\n{CHAT_LIMIT_MARKER}")
 
 
 async def test_envelope_channel_prompt_wins_over_config_fallback() -> None:
@@ -887,7 +888,7 @@ async def test_envelope_channel_prompt_wins_over_config_fallback() -> None:
         _msg_envelope("hi", channel_prompt="Server wins.")
     )
 
-    assert events[0].channel_prompt == "Server wins."
+    assert events[0].channel_prompt.startswith(f"Server wins.\n\n{CHAT_LIMIT_MARKER}")
 
 
 # --- contract guards ----------------------------------------------------------------

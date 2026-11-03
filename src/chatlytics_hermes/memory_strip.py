@@ -57,7 +57,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, List, Mapping, Optional, Tuple
 
-from .trigger_context import FROM_ME, SUMMON_TOKEN, TURN_CONTEXT_MARKER, render_trigger_context
+from . import read_scope
+from .trigger_context import (
+    CHAT_LIMIT_MARKER,
+    CHAT_SCOPE_TOKEN,
+    FROM_ME,
+    SUMMON_TOKEN,
+    TURN_CONTEXT_MARKER,
+    render_trigger_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -454,13 +462,8 @@ def _is_rewritten(request: Mapping[str, Any]) -> bool:
 _LINE, _STALE, _TOKEN_ONLY = "line", "stale", "token only"
 
 
-def _summon_evidence(request: Mapping[str, Any]) -> Optional[str]:
-    """What says this request is summoned, or None for every other turn.
-
-    Only the system strings count: history and tool results can hold any token, including
-    this process's if the model repeated it. When no system prompt can be located the shape
-    is new to us, so the whole request is searched: a false positive costs memory, not privacy.
-    """
+def _system_strings(request: Mapping[str, Any]) -> Optional[List[str]]:
+    """Every string of the system prompt, or None when none can be located in this shape."""
     system: List[str] = []
     located = False
     for key in ("system", "instructions"):
@@ -473,7 +476,44 @@ def _summon_evidence(request: Mapping[str, Any]) -> Optional[str]:
             if isinstance(item, dict) and item.get("role") in _SYSTEM_ROLES:
                 located = True
                 system += _strings(item)
-    if not located:
+    return system if located else None
+
+
+def _note_read_scope(request: Mapping[str, Any], evidence: Optional[str], session_id: Any, task_id: Any) -> None:
+    """Tell read_scope.py this request's verdict. Only what follows the token names a scope, and
+    an entry can't write that without knowing this process's token.
+
+    DO NOT let this raise: the caller's handler is for a summoned request and locks it down, and
+    this runs on every request of every turn. A failed note leaves the context variable, which
+    is the first way a tool call finds its scope.
+    """
+    try:
+        named = ""
+        if evidence == _LINE:
+            joined = "\n\n".join(_system_strings(request) or ())
+            at = joined.rfind(SUMMON_TOKEN)
+            named = joined[at:].split("\n", 1)[0] if at >= 0 else ""
+        elif evidence is None:
+            # A chat read scope is not a summon: memory stays, and this only binds the ids.
+            joined = "\n\n".join(_system_strings(request) or ())
+            at = joined.rfind(CHAT_SCOPE_TOKEN)
+            if at >= 0 and joined.startswith(CHAT_LIMIT_MARKER, _line_start(joined, at)):
+                read_scope.note_chat_request(joined[at:].split("\n", 1)[0], session_id, task_id)
+                return
+        read_scope.note_request(evidence is not None, named, session_id, task_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("chatlytics#956: could not note the read scope of a provider request")
+
+
+def _summon_evidence(request: Mapping[str, Any]) -> Optional[str]:
+    """What says this request is summoned, or None for every other turn.
+
+    Only the system strings count: history and tool results can hold any token, including
+    this process's if the model repeated it. When no system prompt can be located the shape
+    is new to us, so the whole request is searched: a false positive costs memory, not privacy.
+    """
+    system = _system_strings(request)
+    if system is None:
         rest = _strings({k: v for k, v in request.items() if k not in _TOOL_KEYS})
         return _LINE if any(TURN_CONTEXT_MARKER in text or SUMMON_TOKEN in text for text in rest) else None
     # Joined: a provider may split the prompt into cache tiers.
@@ -687,6 +727,8 @@ def llm_request_middleware(**kwargs: Any) -> Optional[dict]:
         return None
     try:
         evidence = _summon_evidence(request)
+        if kwargs.get("turn_id") != _PROBE_TURN:
+            _note_read_scope(request, evidence, kwargs.get("session_id"), kwargs.get("task_id"))
         if evidence is None:
             return None
         if evidence != _LINE:
@@ -856,12 +898,12 @@ def summon_refusal(env: Mapping[str, Any]) -> Optional[str]:
         return None
     if render_trigger_context(env) is None:
         return "malformed chat or session id, so the turn would carry no context line"
-    return strip_ready()
+    return strip_ready() or read_scope.scope_ready()
 
 
 def log_summon_refused(chat_id: Any, reason: str) -> None:
     logger.error(
         "chatlytics#952: refused a turn the owner summoned in chat %s, because owner memory "
-        "could not be kept out of it: %s. The bot stays silent in that chat. Fix the "
+        "or its read scope could not be enforced: %s. The bot stays silent in that chat. Fix the "
         "hermes-agent/plugin pairing to restore summons.", chat_id, reason,
     )
