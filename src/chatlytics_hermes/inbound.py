@@ -36,12 +36,16 @@ from .owner import (
     tagging_enabled,
 )
 
+# Read by adapter.py, which warns about a failed import and retries it when the
+# adapter is created. See the guard there.
+_HERMES_IMPORT_ERROR: Optional[Exception] = None
 try:
     from gateway.platforms.base import MessageEvent, MessageType
     from gateway.session import SessionSource
 
     _HERMES_AVAILABLE = True
-except ImportError:  # hermes-agent missing -- module still imports cleanly
+except ImportError as _import_exc:  # hermes-agent missing -- module still imports cleanly
+    _HERMES_IMPORT_ERROR = _import_exc
     MessageEvent = None  # type: ignore[assignment]
     MessageType = None  # type: ignore[assignment]
     SessionSource = None  # type: ignore[assignment]
