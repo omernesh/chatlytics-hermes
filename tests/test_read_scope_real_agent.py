@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import types
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -377,10 +378,14 @@ def test_the_hook_worker_sees_the_context_variable(host: Any) -> None:
     assert out[0][0] == "block" and "session_not_summon" in out[0][1]
 
 
+_CONTEXT_COPY = re.compile(r"executor\.submit\(\s*contextvars\.copy_context\(\)\.run\s*,")
+
+
 def test_the_delegate_tool_really_copies_the_context_for_a_child() -> None:
     # Why the variable reaches a subagent. A source check, because driving it needs a whole child run.
     dispatch = pytest.importorskip("tools.delegate_tool_dispatch")
-    assert "executor.submit(contextvars.copy_context().run, batch.run_child" in Path(dispatch.__file__).read_text("utf-8")
+    # Version-tolerant: 0.22.x passes batch.run_child, 0.23 passes run, i, t, child. Only the copy is the claim.
+    assert _CONTEXT_COPY.search(Path(dispatch.__file__).read_text("utf-8"))
 
 
 def test_the_host_turn_sets_the_thread_variable_from_the_source() -> None:
