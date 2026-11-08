@@ -28,6 +28,8 @@ _CHATLYTICS_ENV_VARS = (
     "CHATLYTICS_SESSION",  # deprecated v4.5.8 — no-op when CHATLYTICS_BOT_TOKEN set
     "CHATLYTICS_WEBHOOK_PORT",
     "CHATLYTICS_WEBHOOK_SECRET",
+    "CHATLYTICS_LEXTROVE_LIMITED_SERVER",
+    "CHATLYTICS_LEXTROVE_LIMITED_KEY_NAME",
 )
 
 
@@ -39,6 +41,9 @@ def _memory_strip_ready(monkeypatch):
 
     monkeypatch.setattr(memory_strip, "strip_ready", lambda: None)
     monkeypatch.setattr(memory_strip.read_scope, "scope_ready", lambda: None)
+    # chatlytics-hermes#31: a summon reads only with its limited key. test_limited_key.py tests the real check.
+    monkeypatch.setattr(memory_strip.read_scope, "limited_key_problem", lambda: None)
+    monkeypatch.setattr(memory_strip.read_scope, "limited_server_problem", lambda: None)
 
 
 @pytest.fixture(autouse=True)

@@ -372,7 +372,10 @@ def make_webhook_handler(adapter: Any) -> Callable[[web.Request], Any]:
             # chatlytics#956 — same as adapter._dispatch_envelope (keep in sync).
             # Only a signed webhook may say the owner summoned this turn.
             if secret:
-                cp = with_trigger_context(cp, payload, summon_scope.key if summon_scope else None)
+                cp = with_trigger_context(
+                    cp, payload, summon_scope.key if summon_scope else None,
+                    read_scope.summon_read_prefix() if summon_scope else None,
+                )
             # chatlytics#956 — same as adapter._dispatch_envelope (keep in sync). An unsigned webhook
             # is never the owner, and reads nothing. DO NOT REMOVE.
             if summon_scope is None:

@@ -56,6 +56,8 @@ first):
 | `CHATLYTICS_INJECT_SENDER_IDS` | no | When truthy (`1`/`true`/`yes`/`on`), prefixes every inbound message's text with the sender's platform id — `[15550001111@c.us] hello` — so agent sessions can identify WHO is speaking (display names are absent/spoofable on WhatsApp; the envelope `sender_jid` is the platform truth). Per-profile opt-in; `extra.inject_sender_ids` equivalent. |
 | `CHATLYTICS_INJECT_MEDIA_MARKERS` | no | When truthy, appends `[media: document \| id: <message_id>]` to inbound messages that carry media (`has_media` on the envelope), so agent sessions know a file arrived even though the envelope carries no media URL. Per-profile opt-in; `extra.inject_media_markers` equivalent. |
 | `CHATLYTICS_OWNER_TAGGING` | no | Owner tagging (default **on** whenever `allow_admin_from` or `group_allow_admin_from` is configured). `0`/`false`/`no`/`off` disables; `extra.owner_tagging` equivalent. See [Owner tagging](#owner-tagging). |
+| `CHATLYTICS_LEXTROVE_LIMITED_SERVER` | no | The MCP server a summon reads through (default `lextrove_limited`). See [Two keys](summoned-turns.md#two-keys). A name that can't be one refuses a summon's reads rather than falling back. |
+| `CHATLYTICS_LEXTROVE_LIMITED_KEY_NAME` | no | The NAME of the variable holding that server's session-limited key, not the key (default `LEXTROVE_LIMITED_API_KEY`). The same on a bad name. |
 
 \* One of `CHATLYTICS_BOT_TOKEN` / `CHATLYTICS_API_KEY` must be set for the
 plugin to do anything useful.
