@@ -534,6 +534,9 @@ Run on the test host, against a live hub. Only what is listed here has run.
 | C4 (a read) | `32f7bdc` | `!sammie summarize this chat`: the scope opened for that chat, 3 reads were allowed, none outside it. |
 | Limited turn, reaction | | `chatlytics_react` returned success on the bot's own session. |
 | D1 | | **Not run.** No live detached conversation has been tried: only the host's own code driven by the tests. |
-| K1-K4 | | **Not run.** The limited key isn't on a host yet. The tests drive the host's own config reader, secret scope, registry and tool loop, with tools that stand in for Lextrove. |
+| K1 (the summon's read) | `1542d3b` | A summon's read of its chat went through `lextrove_limited`. The direct call with `session: all` has not been run. |
+| K2 (the limited server) | `1542d3b` | Off a summon, the limited server was refused with `limited_key_is_for_summons`. |
+| K4 | `1542d3b` | Reading the env file through `execute_code` and `terminal` was refused with `names_the_archive_or_host_store`. |
+| K3 | | **Not run.** |
 
 Not proven live: a closed reply route (R1, R2), a third-party DM (the hub's DM policy drops those before the plugin sees them), and D1.

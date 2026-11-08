@@ -1,3 +1,41 @@
+## [5.5.0] - 2026-11-08
+
+A summoned turn now reads Lextrove only through a second, limited key. Read the "Two keys" section of
+docs/summoned-turns.md before upgrading a host that summons.
+
+### Security
+
+- **A summon reads Lextrove only through a limited key** (#31). The key is limited to the owner's
+  session and is held by its own MCP server, `lextrove_limited` by default. On a summon the main
+  Lextrove server is refused (`lextrove_needs_limited_key`). On every other turn the limited server is
+  refused (`limited_key_is_for_summons`) and the main server works as before.
+- **No fallback.** If the limited server or its key isn't set up, a summon's reads are refused with a
+  code saying why (`limited_server_not_configured`, `limited_server_not_on_limited_key`,
+  `limited_key_missing`, `limited_key_config_invalid`, `limited_key_check_failed`). The turn still runs
+  and says it can't read the archive. The plugin checks the key is present, never its value, and never
+  logs it.
+- **Shell and code that name the profile's env file or the key are refused** on limited turns, with
+  `names_the_archive_or_host_store`. This is text matching, not a sandbox.
+
+### Upgrading
+
+On each host whose bot can be summoned:
+
+1. Install the Lextrove MCP binary locally. A hosted HTTP Lextrove endpoint can't serve the limited key.
+2. Add a stdio entry `lextrove_limited` under `mcp_servers` in the profile's `config.yaml`, with an empty
+   `cwd`, `LEXTROVE_API_URL`, `LEXTROVE_API_KEY: ${LEXTROVE_LIMITED_API_KEY}` and a `tools.include` list.
+   docs/summoned-turns.md has the full entry.
+3. Put the limited key in the profile's `.env` as `LEXTROVE_LIMITED_API_KEY`.
+4. Keep `lextrove` in the main server's name: that is how the plugin recognises it.
+
+`CHATLYTICS_LEXTROVE_LIMITED_SERVER` and `CHATLYTICS_LEXTROVE_LIMITED_KEY_NAME` change the two names.
+They hold names, never a key. Set them in the profile's `.env`.
+
+### Proven live
+
+A summon's read went through the limited server. Reading the env file through `execute_code` and
+`terminal` was refused. The limited server was refused on a turn that wasn't a summon.
+
 ## [5.4.0] - 2026-11-03
 
 This release limits what a conversation can read once its chat has moved on, makes the plugin report its
