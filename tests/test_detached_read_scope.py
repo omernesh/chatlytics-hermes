@@ -25,6 +25,7 @@ from tests.test_chat_read_scope import BOT, EVERY_ACCOUNT, GROUP, LM, MEMBER, ME
 from tests.test_read_scope_real_agent import Provider, _call, _everyone, _text, _tools, host  # noqa: F401
 from tests.test_summon_outbound import _adapter as _hub_adapter, _bound_tool, _deliver
 from tests.test_trigger_context import ENVELOPES, OWNER_SESSION
+from tests._fixtures import HOST_TURN_ACTOR
 
 TURN_ID = "20260101_000000_old"
 GROUP_READ = {"chat_id": GROUP, "session": BOT}
@@ -80,7 +81,7 @@ def gateway(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
         authority.name_lane(route, "20260101_000000_new", source)
         assert live.detached and live.route.endswith(f":detached:{TURN_ID}")
         assert build_session_key(live.source) == live.route  # the key the host's turn runs under
-        context = NS(source=live.source, session_key=live.route, session_id=TURN_ID)
+        context = NS(source=live.source, session_key=live.route, session_id=TURN_ID, **HOST_TURN_ACTOR)
 
         def bound() -> Any:
             turn = contextvars.copy_context()
@@ -397,7 +398,7 @@ def test_a_named_profiles_detached_turn_is_judged_by_that_profiles_scope(
         live = other.sessions[TURN_ID] = LiveSession(source, route)
         other.name_lane(route, "20260101_000000_new", source)
         turn = contextvars.copy_context()
-        context = NS(source=live.source, session_key=live.route, session_id=TURN_ID)
+        context = NS(source=live.source, session_key=live.route, session_id=TURN_ID, **HOST_TURN_ACTOR)
         turn.run(gateway.run.GatewayRunner._set_session_env, runner, context)
         return turn
 

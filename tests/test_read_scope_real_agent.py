@@ -24,6 +24,7 @@ from chatlytics_hermes.read_scope import open_for_event, pre_tool_call, transfor
 from chatlytics_hermes.trigger_context import render_trigger_context
 from tests.test_owner_tagging import _dispatch, _lp_adapter
 from tests.test_trigger_context import ENVELOPES, OWNER, OWNER_SESSION, PEER
+from tests._fixtures import HOST_TURN_ACTOR
 
 PHONE = ENVELOPES["from_me_dm"]["chat_phone"]
 GROUP = ENVELOPES["from_me_group"]["entity_jid"]
@@ -398,7 +399,7 @@ def test_the_host_turn_sets_the_thread_variable_from_the_source() -> None:
 
     # By behaviour: 0.22.6 reads the same field through a local name, session_env_source.
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="c", chat_type="dm", thread_id="summon-0")
-    context = SimpleNamespace(source=source, session_key="k", session_id="s")
+    context = SimpleNamespace(source=source, session_key="k", session_id="s", **HOST_TURN_ACTOR)
     tokens = run.GatewayRunner._set_session_env(SimpleNamespace(adapters={}), context)
     try:
         assert get_session_env("HERMES_SESSION_THREAD_ID", "") == "summon-0"

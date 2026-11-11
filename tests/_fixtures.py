@@ -25,3 +25,10 @@ class FakePlatformConfig:
         self.token = None
         self.api_key = extra.get("api_key")
         self.home_channel = extra.get("home_channel")
+
+
+# Hermes 0.23.1's ``GatewayRunner._set_session_env`` reads the turn's actor off the session context
+# (``actor_user_id`` / ``actor_user_name`` / ``turn_event``, defaulting to None on the real
+# ``SessionContext``). A stand-in context handed to the real host must carry them too; ``None`` is
+# the host's own default and means "the route's user". Older hosts ignore the extra attributes.
+HOST_TURN_ACTOR = {"actor_user_id": None, "actor_user_name": None, "turn_event": None}

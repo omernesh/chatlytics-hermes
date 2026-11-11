@@ -25,6 +25,7 @@ from tests.test_owner_tagging import WEBHOOK_SECRET, _dispatch, _lp_adapter, _po
 from tests.test_read_scope_real_agent import _call, _everyone, _text, _tool_rows, _tools, host, store  # noqa: F401
 from tests.test_summon_outbound import _adapter as _hub_adapter, _bound_tool, _deliver
 from tests.test_trigger_context import ENVELOPES, OWNER, OWNER_SESSION, PEER
+from tests._fixtures import HOST_TURN_ACTOR
 
 BOT = ENVELOPES["third_party_dm"]["session_id"]
 GROUP = ENVELOPES["from_me_group"]["entity_jid"]
@@ -556,7 +557,7 @@ async def test_the_entry_is_where_the_real_host_will_look(owner_profile: Optiona
 
     def turn() -> Any:
         host = types.SimpleNamespace(adapters={})
-        context = types.SimpleNamespace(source=event.source, session_key="k", session_id="s")
+        context = types.SimpleNamespace(source=event.source, session_key="k", session_id="s", **HOST_TURN_ACTOR)
         run.GatewayRunner._set_session_env(host, context)
         return _hook(LM, EVERY_ACCOUNT, "a-child", "a-child")
 
@@ -983,7 +984,7 @@ def test_the_real_host_binds_the_platform_variable_a_child_is_found_by() -> None
 
     # By behaviour: 0.22.6 reads the same field through a local name, session_env_source.
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="c", chat_type="dm")
-    context = SimpleNamespace(source=source, session_key="k", session_id="s")
+    context = SimpleNamespace(source=source, session_key="k", session_id="s", **HOST_TURN_ACTOR)
     tokens = run.GatewayRunner._set_session_env(SimpleNamespace(adapters={}), context)
     try:
         assert get_session_env("HERMES_SESSION_PLATFORM", "") == Platform.TELEGRAM.value

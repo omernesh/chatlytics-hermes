@@ -1,3 +1,16 @@
+## [5.5.1] - 2026-11-10
+
+Test-only release for Hermes v0.23.1. No runtime change; v0.23.0 and v0.23.1 hosts are both supported.
+
+### Tests
+
+- **Stand-in session contexts carry the turn actor.** Hermes v0.23.1's
+  `GatewayRunner._set_session_env` reads `actor_user_id`, `actor_user_name` and `turn_event` off the
+  session context. The tests that drive the real host with a stand-in context now pass them
+  (`tests/_fixtures.HOST_TURN_ACTOR`, all `None`, the host's own default), so the read-scope and
+  detached-session tests run against v0.23.1 instead of failing with `AttributeError`. The plugin never
+  builds a session context itself, so production is unaffected.
+
 ## [5.5.0] - 2026-11-08
 
 A summoned turn now reads Lextrove only through a second, limited key. Read the "Two keys" section of
