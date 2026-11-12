@@ -739,6 +739,7 @@ def test_doctor_all_pass(tmp_path) -> None:
         router.get("/api/v1/bot/updates").mock(
             return_value=httpx.Response(200, json={"envelopes": [], "cursor": ""})
         )
+        router.get("/api/v1/bot/stream").mock(return_value=httpx.Response(426))
         code = doctor_mod.doctor(
             base_url=BASE_URL,
             token=BOT_TOKEN,
@@ -749,6 +750,7 @@ def test_doctor_all_pass(tmp_path) -> None:
     assert code == 0, "\n".join(lines)
     report = "\n".join(lines)
     assert "authenticated as Sammie" in report
+    assert "PASS — stream: bot stream ENABLED" in report
     assert "FAIL" not in report
     assert "all checks passed" in report
 
@@ -763,6 +765,7 @@ def test_doctor_401_token_fails_with_rotate_hint(tmp_path) -> None:
         router.get("/api/v1/bot/updates").mock(
             return_value=httpx.Response(401, json={"error": "bot_token_required"})
         )
+        router.get("/api/v1/bot/stream").mock(return_value=httpx.Response(404))
         code = doctor_mod.doctor(
             base_url=BASE_URL,
             token=BOT_TOKEN,
@@ -788,6 +791,9 @@ def test_doctor_unreachable_base_url_maps_symptom(tmp_path) -> None:
         router.get("/api/v1/bot/updates").mock(
             side_effect=httpx.ConnectError("[Errno 111] Connection refused")
         )
+        router.get("/api/v1/bot/stream").mock(
+            side_effect=httpx.ConnectError("[Errno 111] Connection refused")
+        )
         code = doctor_mod.doctor(
             base_url=BASE_URL,
             token=BOT_TOKEN,
@@ -805,6 +811,7 @@ def test_doctor_no_token_fails_config_and_skips_authed_checks(tmp_path) -> None:
     lines: List[str] = []
     with respx.mock(base_url=BASE_URL, assert_all_called=False) as router:
         router.get("/health").mock(return_value=httpx.Response(200, json={}))
+        router.get("/api/v1/bot/stream").mock(return_value=httpx.Response(404))
         code = doctor_mod.doctor(
             base_url=BASE_URL,
             token="",
@@ -818,8 +825,9 @@ def test_doctor_no_token_fails_config_and_skips_authed_checks(tmp_path) -> None:
     assert "CHATLYTICS_BOT_TOKEN" in report
     assert "FAIL — bot-me: skipped" in report
     assert "FAIL — longpoll: skipped" in report
-    # Unauthed reachability check still ran.
+    # Unauthed reachability checks still ran (the stream probe needs no token).
     assert "PASS — health" in report
+    assert "PASS — stream: bot stream not enabled" in report
 
 
 def test_doctor_missing_plugin_dir_fails_without_pip_fallback(
@@ -849,6 +857,7 @@ def test_doctor_longpoll_404_flags_old_server(tmp_path) -> None:
         router.get("/api/v1/bot/updates").mock(
             return_value=httpx.Response(404, json={"error": "not_found"})
         )
+        router.get("/api/v1/bot/stream").mock(return_value=httpx.Response(426))
         code = doctor_mod.doctor(
             base_url=BASE_URL,
             token=BOT_TOKEN,
@@ -860,3 +869,32 @@ def test_doctor_longpoll_404_flags_old_server(tmp_path) -> None:
     report = "\n".join(lines)
     assert "FAIL — longpoll" in report
     assert "predates" in report
+
+
+def test_doctor_runs_the_stream_probe(tmp_path) -> None:
+    """#11: the doctor must actually probe /api/v1/bot/stream (it used to skip it)."""
+    lines: List[str] = []
+    with respx.mock(base_url=BASE_URL, assert_all_called=False) as router:
+        router.get("/health").mock(return_value=httpx.Response(200, json={}))
+        router.get("/api/v1/bot/me").mock(
+            return_value=httpx.Response(200, json={"name": "Sammie"})
+        )
+        router.get("/api/v1/bot/updates").mock(
+            return_value=httpx.Response(200, json={"envelopes": [], "cursor": ""})
+        )
+        stream = router.get("/api/v1/bot/stream").mock(
+            return_value=httpx.Response(503)
+        )
+        code = doctor_mod.doctor(
+            base_url=BASE_URL,
+            token=BOT_TOKEN,
+            plugin_dir=_plugin_dir(tmp_path),
+            print_fn=lines.append,
+        )
+
+    assert stream.call_count == 1
+    probe = stream.calls[0].request
+    assert probe.headers.get("upgrade") == "websocket"
+    assert "sec-websocket-protocol" not in probe.headers  # non-consuming
+    assert code == 1
+    assert "FAIL — stream: stream probe returned HTTP 503" in "\n".join(lines)
