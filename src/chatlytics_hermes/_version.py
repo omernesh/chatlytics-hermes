@@ -4,4 +4,4 @@
 has to import the package ``__init__``, which imports them.
 """
 
-__version__ = "5.5.1"
+__version__ = "5.6.0"

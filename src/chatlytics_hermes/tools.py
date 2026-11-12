@@ -498,7 +498,10 @@ REACT_SCHEMA: Dict[str, Any] = {
 EDIT_SCHEMA: Dict[str, Any] = {
     "$schema": _DRAFT,
     "title": "chatlytics_edit",
-    "description": "Edit an already-sent WhatsApp message.",
+    "description": (
+        "Edit a WhatsApp message this bot already sent. messageId must be the full message id "
+        "(true_/false_<chat>_<id>); it names the chat. If the edit can't apply, success is false."
+    ),
     "type": "object",
     "properties": {
         "messageId": _message_id_field(),
@@ -964,6 +967,11 @@ async def chatlytics_react(
     return await _post(client, "/api/v1/actions", body)
 
 
+def _same_chat(a: str, b: str) -> bool:
+    fix = lambda j: j.strip().replace("@s.whatsapp.net", "@c.us")  # noqa: E731
+    return fix(a) == fix(b)
+
+
 async def chatlytics_edit(
     client: ChatlyticsClient,
     *,
@@ -971,11 +979,39 @@ async def chatlytics_edit(
     text: str,
     chatId: Optional[str] = None,
 ) -> Dict[str, Any]:
-    params: Dict[str, Any] = {"messageId": messageId, "text": text}
-    if chatId:
-        params["chatId"] = chatId
-    body: Dict[str, Any] = {"action": "edit", "params": params}
-    return await _post(client, "/api/v1/actions", body)
+    """Edit a message this bot sent, through ``POST /api/v1/send`` with ``edit_message_id``.
+
+    chatlytics.ai#1102: the ``edit`` action on ``/api/v1/actions`` always runs on the bot's own
+    session, so for a bubble sent from the connection owner's number it is refused with 409
+    ``edit_sent_from_other_session``. ``edit_message_id`` on ``/send`` edits through the session
+    that sent the bubble. DO NOT go back to ``{"action": "edit"}``.
+
+    DO NOT REMOVE the three guards. The hub falls back to a NEW message when it can't edit
+    (``edit_fallback``) or ignores the edit (``edit_ignored``) and still answers 200; reporting that as
+    an edit lets the model claim an edit that never happened. The full id names the chat, so the chat is
+    never guessed, and no ``session`` is taken from the model: ``_name_outbound_session`` chooses it.
+    """
+    named = read_scope.message_id_chats({"messageId": messageId})
+    if not named:
+        return {
+            "success": False,
+            "error": "Editing needs the full message id (true_/false_<chat>_<id>); a short id does not name its chat. Nothing was changed.",
+        }
+    if chatId and not _same_chat(chatId, named[0]):
+        return {
+            "success": False,
+            "error": "chatId is not the chat this message id names. Nothing was changed.",
+        }
+    body: Dict[str, Any] = {"chatId": named[0], "text": text, "edit_message_id": messageId}
+    result = await _post(client, "/api/v1/send", body)
+    if result.get("success") and (result.get("edit_fallback") or result.get("edit_ignored")):
+        result["success"] = False
+        result["edited"] = False
+        result["error"] = (
+            "The edit did not apply; a new message was posted instead "
+            f"({result.get('edit_fallback') or 'edit_ignored'}). Do not tell the user the message was edited."
+        )
+    return result
 
 
 async def chatlytics_unsend(
@@ -1544,6 +1580,15 @@ async def chatlytics_dispatch(
         merged["chatId"] = target
     if parameters is not None:
         merged.update(parameters)
+    if action == "edit":
+        # chatlytics.ai#1102: the hub refuses the `edit` action for a bubble sent from another
+        # session; an edit goes through /send's `edit_message_id`. Same call as chatlytics_edit.
+        return await chatlytics_edit(
+            client,
+            messageId=str(merged.get("messageId") or ""),
+            text=str(merged.get("text") if merged.get("text") is not None else ""),
+            chatId=merged.get("chatId") or None,
+        )
     body: Dict[str, Any] = {"action": action}
     if merged:
         body["params"] = merged

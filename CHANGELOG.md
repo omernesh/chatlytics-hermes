@@ -1,3 +1,24 @@
+## [5.6.0] - 2026-11-12
+
+### Fixed
+
+- **`chatlytics_edit` edits through `POST /api/v1/send` with `edit_message_id`.** It used to call the
+  `edit` action on `/api/v1/actions`, which always runs on the bot's own number: for a bubble sent from the
+  connection owner's number the hub now refuses it with `409 edit_sent_from_other_session`
+  (omernesh/chatlytics.ai#1102). `chatlytics_dispatch` with `action: "edit"` takes the same path. Works on
+  current hubs too.
+
+### Changed
+
+- **An edit that posted a new message is reported as a failure.** When the hub can't edit (the message
+  isn't the bot's on that session) it posts a NEW message and answers 200 with `edit_fallback`
+  (`edit_ignored` for a legacy caller). `chatlytics_edit` now returns `success: false`, `edited: false`
+  and a note that the edit did not apply and a new message was posted, so the model can't claim it edited.
+- `chatlytics_edit` needs the full message id (`true_/false_<chat>_<id>`); the chat is taken from it, and a
+  `chatId` that names another chat is refused. A short id is refused without sending.
+- The model can no longer pick the session of an edit (`chatlytics_dispatch` `session` is dropped for
+  `action: "edit"`); the turn's account is named as for any send.
+
 ## [5.5.1] - 2026-11-10
 
 Test-only release for Hermes v0.23.1. No runtime change; v0.23.0 and v0.23.1 hosts are both supported.
