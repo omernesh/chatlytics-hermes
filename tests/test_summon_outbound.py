@@ -1781,9 +1781,9 @@ async def test_an_edit_in_the_summoned_chat_goes_out_through_send_on_the_owners_
     adapter, hub, conn = _adapter(_ActionHub())
     summon = await _summon_on_route(adapter, hub, ENVELOPES["from_me_dm"], conn)
     for handler, name, args in (
-        (chatlytics_edit, "chatlytics_edit", {"chatId": PEER, "messageId": "ABC", "text": "t"}),
+        (chatlytics_edit, "chatlytics_edit", {"chatId": PEER, "messageId": f"true_{PEER}_ABC", "text": "t"}),
         (chatlytics_edit, "chatlytics_edit", {"messageId": f"true_{PEER}_ABC", "text": "t"}),
-        (chatlytics_dispatch, "chatlytics_dispatch", {"action": "edit", "target": PEER, "parameters": {"messageId": "ABC", "text": "t"}}),
+        (chatlytics_dispatch, "chatlytics_dispatch", {"action": "edit", "target": PEER, "session": BOT_SESSION, "parameters": {"messageId": f"true_{PEER}_ABC", "text": "t"}}),
     ):
         tool = _bound_tool(adapter, handler, name)
         hub.bodies.clear()
@@ -1793,6 +1793,24 @@ async def test_an_edit_in_the_summoned_chat_goes_out_through_send_on_the_owners_
         assert path == "/api/v1/send" and body["edit_message_id"].endswith("ABC")
         assert body["chatId"] == PEER and body["text"] == "t" and body["session"] == OWNER_SESSION
     assert hub.ran == []  # never the actions dispatcher
+
+
+async def test_a_session_a_model_names_doesnt_move_an_ordinary_turns_edit() -> None:
+    adapter, hub, conn = _adapter(_ActionHub())
+    tool = _bound_tool(adapter, chatlytics_dispatch, "chatlytics_dispatch")
+    await _in_turn("", lambda: tool(
+        {"action": "edit", "target": PEER, "session": "theirs", "parameters": {"messageId": f"true_{PEER}_ABC", "text": "t"}}))
+    (path, body), = hub.bodies
+    assert path == "/api/v1/send" and body.get("session") != "theirs"
+
+
+async def test_an_edit_after_the_route_expired_is_refused_not_sent_from_the_bots_number() -> None:
+    adapter, hub, conn = _adapter(_ActionHub())
+    summon = await _summon_on_route(adapter, hub, ENVELOPES["from_me_dm"], conn)
+    hub.routes.pop(PEER)
+    tool = _bound_tool(adapter, chatlytics_edit, "chatlytics_edit")
+    out = json.loads(await _in_turn(summon.source.thread_id, lambda: tool({"messageId": f"true_{PEER}_ABC", "text": "t"})))
+    assert out["success"] is False
 
 
 async def test_an_edit_elsewhere_than_the_summoned_chat_stays_on_the_bots_number() -> None:

@@ -585,61 +585,86 @@ async def test_actions_tools_post_hub_strict_shape(
 # chatlytics.ai#1102: an edit is NOT an /api/v1/actions call. The hub refuses `edit` on that
 # route for a bubble sent from another session; /send's edit_message_id edits through the
 # session that sent it.
+FULL_MID = f"true_{CHAT_ID}_ABC123"
+
+
+def _send_ok(**extra):
+    return httpx.Response(200, json={"ok": True, "message_id": "m1", **extra})
+
+
 async def test_edit_posts_send_with_edit_message_id(
     client: ChatlyticsClient, mock_router: respx.MockRouter
 ) -> None:
-    send = mock_router.post("/api/v1/send").mock(
-        return_value=httpx.Response(200, json={"ok": True, "edited": True, "message_id": "m1"})
-    )
+    send = mock_router.post("/api/v1/send").mock(return_value=_send_ok(edited=True))
     actions = mock_router.post("/api/v1/actions").mock(return_value=httpx.Response(200, json={"success": True}))
-    result = await chatlytics_edit(client, messageId="m1", text="t", chatId=CHAT_ID)
+    result = await chatlytics_edit(client, messageId=FULL_MID, text="t", chatId=CHAT_ID)
     assert result["success"] is True and result["edited"] is True, result
     assert _json.loads(send.calls.last.request.content) == {
-        "chatId": CHAT_ID, "text": "t", "edit_message_id": "m1",
+        "chatId": CHAT_ID, "text": "t", "edit_message_id": FULL_MID,
     }
     assert not actions.called
 
 
-async def test_edit_takes_the_chat_from_a_full_message_id(
+async def test_edit_takes_the_chat_from_the_full_message_id(
     client: ChatlyticsClient, mock_router: respx.MockRouter
 ) -> None:
-    send = mock_router.post("/api/v1/send").mock(return_value=httpx.Response(200, json={"ok": True, "edited": True}))
-    mid = f"true_{CHAT_ID}_ABC123"
-    assert (await chatlytics_edit(client, messageId=mid, text="t"))["success"] is True
-    assert _json.loads(send.calls.last.request.content) == {"chatId": CHAT_ID, "text": "t", "edit_message_id": mid}
+    send = mock_router.post("/api/v1/send").mock(return_value=_send_ok(edited=True))
+    assert (await chatlytics_edit(client, messageId=FULL_MID, text="t"))["success"] is True
+    assert _json.loads(send.calls.last.request.content)["chatId"] == CHAT_ID
 
 
-async def test_edit_with_a_short_id_and_no_chat_sends_nothing(
+async def test_edit_with_a_short_id_sends_nothing(
     client: ChatlyticsClient, mock_router: respx.MockRouter
 ) -> None:
-    send = mock_router.post("/api/v1/send").mock(return_value=httpx.Response(200, json={"ok": True}))
-    result = await chatlytics_edit(client, messageId="ABC123", text="t")
-    assert result["success"] is False and "chatId" in result["error"]
+    send = mock_router.post("/api/v1/send").mock(return_value=_send_ok())
+    for kw in ({}, {"chatId": CHAT_ID}):
+        result = await chatlytics_edit(client, messageId="ABC123", text="t", **kw)
+        assert result["success"] is False and "full message id" in result["error"]
     assert not send.called
 
 
-async def test_edit_reports_a_fallback_instead_of_hiding_the_new_bubble(
+async def test_edit_refuses_a_chat_that_disagrees_with_the_message_id(
+    client: ChatlyticsClient, mock_router: respx.MockRouter
+) -> None:
+    send = mock_router.post("/api/v1/send").mock(return_value=_send_ok())
+    result = await chatlytics_edit(client, messageId=FULL_MID, text="t", chatId="999@c.us")
+    assert result["success"] is False and "Nothing was changed" in result["error"]
+    assert not send.called
+
+
+@pytest.mark.parametrize("marker", [{"edit_fallback": "not-owned"}, {"edit_fallback": "edit-failed"}, {"edit_ignored": True}])
+async def test_edit_that_posted_a_new_message_is_not_reported_as_an_edit(
+    client: ChatlyticsClient, mock_router: respx.MockRouter, marker
+) -> None:
+    mock_router.post("/api/v1/send").mock(return_value=_send_ok(message_id="m2", **marker))
+    result = await chatlytics_edit(client, messageId=FULL_MID, text="t", chatId=CHAT_ID)
+    assert result["success"] is False and result["edited"] is False
+    assert "did not apply" in result["error"] and "new message was posted" in result["error"]
+    assert result["message_id"] == "m2"
+
+
+async def test_edit_409_route_expired_is_a_failure(
     client: ChatlyticsClient, mock_router: respx.MockRouter
 ) -> None:
     mock_router.post("/api/v1/send").mock(
-        return_value=httpx.Response(200, json={"ok": True, "message_id": "m2", "edit_fallback": "not-owned"})
+        return_value=httpx.Response(409, json={"success": False, "error": "from_me_route_expired", "code": "from_me_route_expired"})
     )
-    result = await chatlytics_edit(client, messageId="m1", text="t", chatId=CHAT_ID)
-    assert result["success"] is True and result["edit_fallback"] == "not-owned"
+    result = await chatlytics_edit(client, messageId=FULL_MID, text="t", chatId=CHAT_ID)
+    assert result["success"] is False and "edited" not in {k for k, v in result.items() if v is True}
 
 
-async def test_dispatch_edit_is_routed_to_send_with_edit_message_id(
+async def test_dispatch_edit_is_routed_to_send_and_ignores_a_model_session(
     client: ChatlyticsClient, mock_router: respx.MockRouter
 ) -> None:
-    send = mock_router.post("/api/v1/send").mock(return_value=httpx.Response(200, json={"ok": True, "edited": True}))
+    send = mock_router.post("/api/v1/send").mock(return_value=_send_ok(edited=True))
     actions = mock_router.post("/api/v1/actions").mock(return_value=httpx.Response(200, json={"success": True}))
     result = await chatlytics_dispatch(
-        client, action="edit", target=CHAT_ID, parameters={"messageId": "m1", "text": "t"}, session="s1"
+        client, action="edit", target=CHAT_ID, parameters={"messageId": FULL_MID, "text": "t"}, session="model-chose-this"
     )
     assert result["success"] is True
-    assert _json.loads(send.calls.last.request.content) == {
-        "chatId": CHAT_ID, "text": "t", "edit_message_id": "m1", "session": "s1",
-    }
+    body = _json.loads(send.calls.last.request.content)
+    assert body == {"chatId": CHAT_ID, "text": "t", "edit_message_id": FULL_MID}
+    assert "session" not in body
     assert not actions.called
 
 

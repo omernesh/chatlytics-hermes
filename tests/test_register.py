@@ -125,7 +125,7 @@ def test_plugin_yaml_is_valid() -> None:
 
     assert manifest["name"] == "chatlytics"
     assert manifest["kind"] == "platform"
-    assert manifest["version"] == "5.5.1"
+    assert manifest["version"] == "5.6.0"
 
     required = {entry["name"] for entry in manifest["requires_env"]}
     assert required == {"CHATLYTICS_BOT_TOKEN"}
@@ -165,7 +165,7 @@ def test_pyproject_declares_hermes_entry_point() -> None:
     assert entry_points["chatlytics"] == "chatlytics_hermes"
 
     project = data["project"]
-    assert project["version"] == "5.5.1"  # v5.5.1 (tests run against hermes v0.23.1); v5.5.0 (summon reads through a limited Lextrove key, #31); v5.4.0 (summon read scope, detached conversations, version single-sourced); v5.3.2 (host import retry); v5.3.1 (approval keywords; v5.3.0 memory strip on summoned turns, chatlytics#952); v5.2.0 (fromMe turn context, chatlytics#956); v5.0.3 (gateway instance id, #838); v5.0.2 (hermes 0.22.5 native admission); v5.0.0 (bot stream, chatlytics#793); v4.8.2 (#5); v4.8.1 — hermes-agent dropped from deps (#4).
+    assert project["version"] == "5.6.0"  # v5.6.0 (edits go through /send edit_message_id, omernesh/chatlytics.ai#1102); v5.5.1 (tests run against hermes v0.23.1); v5.5.0 (summon reads through a limited Lextrove key, #31); v5.4.0 (summon read scope, detached conversations, version single-sourced); v5.3.2 (host import retry); v5.3.1 (approval keywords; v5.3.0 memory strip on summoned turns, chatlytics#952); v5.2.0 (fromMe turn context, chatlytics#956); v5.0.3 (gateway instance id, #838); v5.0.2 (hermes 0.22.5 native admission); v5.0.0 (bot stream, chatlytics#793); v4.8.2 (#5); v4.8.1 — hermes-agent dropped from deps (#4).
     assert project["name"] == "chatlytics-hermes"
 
     deps = project["dependencies"]
