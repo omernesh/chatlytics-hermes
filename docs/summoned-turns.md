@@ -196,8 +196,14 @@ tool. With no route open the hub answers a named own session exactly as it answe
 with a 403, and runs the others (`pin`, `edit`, `unsend`, `delete`, ...) from the bot's number; with the
 operator key it runs them all on the default account. So on a summon, any other verb aimed at the summoned
 chat is refused in the plugin, by `chatId`, `to`, `target` or the chat in a full message id. That covers
-`chatlytics_poll`, `chatlytics_edit`, `chatlytics_unsend`, `chatlytics_delete`, `chatlytics_pin`,
+`chatlytics_poll`, `chatlytics_unsend`, `chatlytics_delete`, `chatlytics_pin`,
 `chatlytics_unpin` and `chatlytics_dispatch`. The same verbs on another chat stay on the bot's number.
+
+**An edit is a send.** `chatlytics_edit` (and `chatlytics_dispatch` with `action: "edit"`) posts
+`/api/v1/send` with `edit_message_id`, not the `edit` action: the hub refuses that action for a bubble the
+bot sent from the owner's number, and `edit_message_id` edits through the session that sent the bubble. The
+turn's account is named on it like on any send. If the hub reports `edit_fallback`, the bubble was not
+the bot's on that session and a new message went out; the tool result carries the field.
 
 **A reaction goes by its message id.** The hub refuses a route action whose `chatId` isn't the chat the
 message id names. So when a full message id names this chat, in any form the envelope knows, that form is

@@ -1,3 +1,13 @@
+## [Unreleased]
+
+### Fixed
+
+- **`chatlytics_edit` edits through `POST /api/v1/send` with `edit_message_id`.** It used to call the
+  `edit` action on `/api/v1/actions`, which always runs on the bot's own number: for a bubble sent from the
+  connection owner's number the hub now refuses it with `409 edit_sent_from_other_session`
+  (omernesh/chatlytics.ai#1102). `chatlytics_dispatch` with `action: "edit"` takes the same path. `chatId`
+  is required unless the message id is a full one (`true_/false_<chat>_<id>`). Works on current hubs too.
+
 ## [5.5.1] - 2026-11-10
 
 Test-only release for Hermes v0.23.1. No runtime change; v0.23.0 and v0.23.1 hosts are both supported.

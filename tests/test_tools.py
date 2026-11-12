@@ -535,11 +535,6 @@ def _strict_hub(request):
             {"messageId": "m1", "emoji": "x", "chatId": CHAT_ID},
         ),
         (
-            lambda c: chatlytics_edit(c, messageId="m1", text="t", chatId=CHAT_ID),
-            "edit",
-            {"messageId": "m1", "text": "t", "chatId": CHAT_ID},
-        ),
-        (
             lambda c: chatlytics_unsend(c, messageId="m1", chatId=CHAT_ID),
             "unsend",
             {"messageId": "m1", "chatId": CHAT_ID},
@@ -585,6 +580,67 @@ async def test_actions_tools_post_hub_strict_shape(
     body = _json.loads(route.calls.last.request.content)
     assert body["action"] == action
     assert body["params"] == expected
+
+
+# chatlytics.ai#1102: an edit is NOT an /api/v1/actions call. The hub refuses `edit` on that
+# route for a bubble sent from another session; /send's edit_message_id edits through the
+# session that sent it.
+async def test_edit_posts_send_with_edit_message_id(
+    client: ChatlyticsClient, mock_router: respx.MockRouter
+) -> None:
+    send = mock_router.post("/api/v1/send").mock(
+        return_value=httpx.Response(200, json={"ok": True, "edited": True, "message_id": "m1"})
+    )
+    actions = mock_router.post("/api/v1/actions").mock(return_value=httpx.Response(200, json={"success": True}))
+    result = await chatlytics_edit(client, messageId="m1", text="t", chatId=CHAT_ID)
+    assert result["success"] is True and result["edited"] is True, result
+    assert _json.loads(send.calls.last.request.content) == {
+        "chatId": CHAT_ID, "text": "t", "edit_message_id": "m1",
+    }
+    assert not actions.called
+
+
+async def test_edit_takes_the_chat_from_a_full_message_id(
+    client: ChatlyticsClient, mock_router: respx.MockRouter
+) -> None:
+    send = mock_router.post("/api/v1/send").mock(return_value=httpx.Response(200, json={"ok": True, "edited": True}))
+    mid = f"true_{CHAT_ID}_ABC123"
+    assert (await chatlytics_edit(client, messageId=mid, text="t"))["success"] is True
+    assert _json.loads(send.calls.last.request.content) == {"chatId": CHAT_ID, "text": "t", "edit_message_id": mid}
+
+
+async def test_edit_with_a_short_id_and_no_chat_sends_nothing(
+    client: ChatlyticsClient, mock_router: respx.MockRouter
+) -> None:
+    send = mock_router.post("/api/v1/send").mock(return_value=httpx.Response(200, json={"ok": True}))
+    result = await chatlytics_edit(client, messageId="ABC123", text="t")
+    assert result["success"] is False and "chatId" in result["error"]
+    assert not send.called
+
+
+async def test_edit_reports_a_fallback_instead_of_hiding_the_new_bubble(
+    client: ChatlyticsClient, mock_router: respx.MockRouter
+) -> None:
+    mock_router.post("/api/v1/send").mock(
+        return_value=httpx.Response(200, json={"ok": True, "message_id": "m2", "edit_fallback": "not-owned"})
+    )
+    result = await chatlytics_edit(client, messageId="m1", text="t", chatId=CHAT_ID)
+    assert result["success"] is True and result["edit_fallback"] == "not-owned"
+
+
+async def test_dispatch_edit_is_routed_to_send_with_edit_message_id(
+    client: ChatlyticsClient, mock_router: respx.MockRouter
+) -> None:
+    send = mock_router.post("/api/v1/send").mock(return_value=httpx.Response(200, json={"ok": True, "edited": True}))
+    actions = mock_router.post("/api/v1/actions").mock(return_value=httpx.Response(200, json={"success": True}))
+    result = await chatlytics_dispatch(
+        client, action="edit", target=CHAT_ID, parameters={"messageId": "m1", "text": "t"}, session="s1"
+    )
+    assert result["success"] is True
+    assert _json.loads(send.calls.last.request.content) == {
+        "chatId": CHAT_ID, "text": "t", "edit_message_id": "m1", "session": "s1",
+    }
+    assert not actions.called
 
 
 # Hub FIELD NAMES (channel.ts): poll reads pollQuestion/pollOption/multipleAnswers,

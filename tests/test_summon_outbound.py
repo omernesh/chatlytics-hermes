@@ -1724,13 +1724,11 @@ async def test_on_an_ordinary_turn_an_action_is_exactly_what_it_was() -> None:
 
 _OFF_ROUTE_TOOLS = [
     (chatlytics_poll, "chatlytics_poll", {"chatId": PEER, "question": "q", "options": ["a", "b"]}),
-    (chatlytics_edit, "chatlytics_edit", {"chatId": PEER, "messageId": "ABC", "text": "t"}),
     (chatlytics_unsend, "chatlytics_unsend", {"chatId": PEER, "messageId": "ABC"}),
     (chatlytics_delete, "chatlytics_delete", {"chatId": PEER, "messageId": "ABC"}),
     (chatlytics_pin, "chatlytics_pin", {"chatId": PEER, "messageId": "ABC"}),
     (chatlytics_unpin, "chatlytics_unpin", {"chatId": PEER, "messageId": "ABC"}),
     (chatlytics_pin, "chatlytics_pin", {"messageId": f"false_{PEER}_ABC"}),
-    (chatlytics_edit, "chatlytics_edit", {"messageId": f"true_{PEER}_ABC", "text": "t"}),
     (chatlytics_poll, "chatlytics_poll", {"chatId": PEER_DIGITS, "question": "q", "options": ["a", "b"]}),
     (chatlytics_dispatch, "chatlytics_dispatch", {"action": "send", "target": PEER, "parameters": {"text": "x"}}),
     (chatlytics_dispatch, "chatlytics_dispatch", {"action": "sendPoll", "parameters": {"chatId": PEER}}),
@@ -1755,7 +1753,6 @@ async def test_an_action_the_hub_cant_route_is_refused_in_the_summoned_chat(hand
 
 @pytest.mark.parametrize("handler,name,args", [
     (chatlytics_pin, "chatlytics_pin", {"chatId": "999@c.us", "messageId": "ABC"}),
-    (chatlytics_edit, "chatlytics_edit", {"messageId": "false_999@c.us_ABC", "text": "t"}),
     (chatlytics_dispatch, "chatlytics_dispatch", {"action": "muteChat", "target": OTHER_GROUP}),
     (chatlytics_dispatch, "chatlytics_dispatch", {"action": "search", "parameters": {"query": "Dana"}}),
 ])
@@ -1776,6 +1773,36 @@ async def test_on_an_ordinary_turn_those_actions_reach_the_hub_as_before(handler
     tool = _bound_tool(adapter, handler, name)
     await _in_turn("", lambda: tool(args))
     assert len(hub.bodies) == 1 and "session" not in hub.bodies[0][1]
+
+
+async def test_an_edit_in_the_summoned_chat_goes_out_through_send_on_the_owners_number() -> None:
+    # chatlytics.ai#1102: the `edit` action is refused for a bubble sent from the owner's number;
+    # edit_message_id on /send edits through the session that sent it (the live reply route).
+    adapter, hub, conn = _adapter(_ActionHub())
+    summon = await _summon_on_route(adapter, hub, ENVELOPES["from_me_dm"], conn)
+    for handler, name, args in (
+        (chatlytics_edit, "chatlytics_edit", {"chatId": PEER, "messageId": "ABC", "text": "t"}),
+        (chatlytics_edit, "chatlytics_edit", {"messageId": f"true_{PEER}_ABC", "text": "t"}),
+        (chatlytics_dispatch, "chatlytics_dispatch", {"action": "edit", "target": PEER, "parameters": {"messageId": "ABC", "text": "t"}}),
+    ):
+        tool = _bound_tool(adapter, handler, name)
+        hub.bodies.clear()
+        out = json.loads(await _in_turn(summon.source.thread_id, lambda: tool(args)))
+        assert out["success"], (name, args)
+        (path, body), = hub.bodies
+        assert path == "/api/v1/send" and body["edit_message_id"].endswith("ABC")
+        assert body["chatId"] == PEER and body["text"] == "t" and body["session"] == OWNER_SESSION
+    assert hub.ran == []  # never the actions dispatcher
+
+
+async def test_an_edit_elsewhere_than_the_summoned_chat_stays_on_the_bots_number() -> None:
+    adapter, hub, conn = _adapter(_ActionHub())
+    summon = await _summon_on_route(adapter, hub, ENVELOPES["from_me_dm"], conn)
+    tool = _bound_tool(adapter, chatlytics_edit, "chatlytics_edit")
+    out = json.loads(await _in_turn(summon.source.thread_id, lambda: tool({"messageId": "false_999@c.us_ABC", "text": "t"})))
+    assert out["success"]
+    (path, body), = hub.bodies
+    assert path == "/api/v1/send" and body["chatId"] == "999@c.us" and body["session"] == BOT_SESSION
 
 
 async def test_an_action_on_what_may_be_this_person_is_refused() -> None:
